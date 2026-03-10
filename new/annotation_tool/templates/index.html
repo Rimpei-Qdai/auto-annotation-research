@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>動画アノテーション - NEWシステム</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .video-container {
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .video-card {
+            flex: 1;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .video-card video {
+            width: 100%;
+            border-radius: 4px;
+        }
+        .sensor-info {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 15px 0;
+        }
+        .sensor-card {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .event-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .event-type-9 { background-color: #d4edda; color: #155724; }
+        .event-type-10 { background-color: #d1ecf1; color: #0c5460; }
+        .event-type-11 { background-color: #fff3cd; color: #856404; }
+        .event-type-13 { background-color: #f8d7da; color: #721c24; }
+        .event-type-15 { background-color: #dc3545; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container mt-4">
+        <!-- ヘッダー -->
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <div>
+                <h4>進捗: {{ progress.annotated }} / {{ progress.total }} (両方完了: {{ progress.annotated }})</h4>
+                <small class="text-muted">
+                    手動のみ: {{ progress.manual_done }} | 
+                    自動のみ: {{ progress.auto_done }} | 
+                    残り: {{ progress.remaining }}
+                </small>
+            </div>
+            <div>
+                <a href="/statistics" class="btn btn-success me-2">📊 統計</a>
+            </div>
+        </div>
+
+        <!-- サンプル情報 -->
+        <div class="card mb-3">
+            <div class="card-body">
+                <h5 class="card-title">サンプル #{{ sample_id }}</h5>
+                <p class="card-text">
+                    <strong>CSVのタイムスタンプ:</strong> {{ data_datetime }}<br>
+                    {% if videos.matched_timestamp %}
+                    <strong>動画ファイル名のタイムスタンプ:</strong> {{ videos.matched_timestamp.strftime('%Y-%m-%d %H:%M:%S') }}<br>
+                    <strong>動画の開始時刻:</strong> {{ videos.video_start_time.strftime('%Y-%m-%d %H:%M:%S') }} (ファイル名 - 15秒)<br>
+                    {% endif %}
+                    <strong>🎯 アノテーション対象:</strong> <span class="badge bg-danger fs-6">{{ "%.2f"|format(offset_seconds) }} 秒地点</span><br>
+                    <strong>タクシーID:</strong> {{ row.taxi_id }}<br>
+                    {% if has_event %}
+                    <strong>イベント:</strong>
+                    <span class="event-badge event-type-{{ event_info.type }}">
+                        タイプ {{ event_info.type }}
+                    </span>
+                    {% endif %}
+                </p>
+            </div>
+        </div>
+
+        <!-- センサー情報 -->
+        <div class="card mb-3">
+            <div class="card-header">
+                <h6 class="mb-0">📊 センサー情報</h6>
+            </div>
+            <div class="card-body">
+                <div class="sensor-info">
+                    <div class="sensor-card">
+                        <div><strong>速度</strong></div>
+                        <div class="fs-5">{{ "%.1f"|format(sensor_info.speed) }} km/h</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div><strong>加速度X</strong></div>
+                        <div class="fs-5">{{ "%.3f"|format(sensor_info.acc_x) }} g</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div><strong>加速度Y</strong></div>
+                        <div class="fs-5">{{ "%.3f"|format(sensor_info.acc_y) }} g</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div><strong>ブレーキ</strong></div>
+                        <div class="fs-5">{{ "ON" if sensor_info.brake else "OFF" }}</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div><strong>右ウインカー</strong></div>
+                        <div class="fs-5">{{ "ON" if sensor_info.blinker_r else "OFF" }}</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div><strong>左ウインカー</strong></div>
+                        <div class="fs-5">{{ "ON" if sensor_info.blinker_l else "OFF" }}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 質問 -->
+        <h3 class="mb-3">
+            この動画の 
+            <span class="badge bg-danger fs-5">{{ "%.2f"|format(offset_seconds) }}秒地点</span> 
+            における運転行動を選択してください
+        </h3>
+
+        <!-- 計算説明 -->
+        <div class="alert alert-secondary mb-3">
+            <small>
+                📐 <strong>秒数の計算:</strong> 
+                CSVタイムスタンプ({{ data_datetime }}) - 動画開始時刻(ファイル名 - 15秒) = {{ "%.2f"|format(offset_seconds) }}秒
+            </small>
+        </div>
+
+        <!-- キーボードショートカット -->
+        <div class="alert alert-info mb-3">
+            ⌨️ <strong>ショートカット:</strong>
+            <kbd>0-9</kbd> ラベル選択 |
+            <kbd>A</kbd> AI自動アノテーション |
+            <kbd>U</kbd> 戻る
+        </div>
+
+        <!-- 動画表示 (FRONT と INNER) -->
+        <div class="video-container">
+            {% if videos.has_front %}
+            <div class="video-card">
+                <h5>🚗 前方カメラ (FRONT)</h5>
+                <div class="alert alert-warning py-1 px-2 mb-2 small">
+                    ▶️ {{ "%.2f"|format(offset_seconds) }}秒地点から再生されます
+                </div>
+                <video id="video-front" controls>
+                    <source src="{{ videos.front }}" type="video/mp4">
+                </video>
+            </div>
+            {% endif %}
+
+            {% if videos.has_inner %}
+            <div class="video-card">
+                <h5>👤 車内カメラ (INNER)</h5>
+                <div class="alert alert-warning py-1 px-2 mb-2 small">
+                    ▶️ {{ "%.2f"|format(offset_seconds) }}秒地点から再生されます
+                </div>
+                <video id="video-inner" controls>
+                    <source src="{{ videos.inner }}" type="video/mp4">
+                </video>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- 行動ラベル選択 -->
+        <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h6 class="mb-0">運転行動の選択</h6>
+                <div>
+                    <button id="autoAnnotateBtn" class="btn btn-sm btn-primary" onclick="autoAnnotate()">
+                        🤖 AI自動アノテーション
+                    </button>
+                    <button class="btn btn-sm btn-info" data-bs-toggle="modal" data-bs-target="#batchModal">
+                        🚀 バッチ処理
+                    </button>
+                    <button class="btn btn-sm btn-success" onclick="autoAnnotateAll()">
+                        ⚡ 全自動実行
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div id="autoAnnotateStatus" class="alert alert-info" style="display: none;"></div>
+                <div class="row g-2">
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="0" class="btn btn-outline-secondary w-100 p-3">
+                                <strong>0</strong> - その他
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="1" class="btn btn-outline-primary w-100 p-3">
+                                <strong>1</strong> - 等速走行
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="2" class="btn btn-outline-success w-100 p-3">
+                                <strong>2</strong> - 加速
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="3" class="btn btn-outline-warning w-100 p-3">
+                                <strong>3</strong> - 減速
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="4" class="btn btn-outline-danger w-100 p-3">
+                                <strong>4</strong> - 停止
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="5" class="btn btn-outline-info w-100 p-3">
+                                <strong>5</strong> - 発進
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="6" class="btn btn-outline-primary w-100 p-3">
+                                <strong>6</strong> - 左折
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="7" class="btn btn-outline-primary w-100 p-3">
+                                <strong>7</strong> - 右折
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="8" class="btn btn-outline-secondary w-100 p-3">
+                                <strong>8</strong> - 車線変更（左）
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-6">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="9" class="btn btn-outline-secondary w-100 p-3">
+                                <strong>9</strong> - 車線変更（右）
+                            </button>
+                        </form>
+                    </div>
+                    <div class="col-md-12">
+                        <form action="/annotate" method="post">
+                            <input type="hidden" name="sample_id" value="{{ sample_id }}">
+                            <button type="submit" name="action_label" value="10" class="btn btn-outline-dark w-100 p-3">
+                                <strong>10</strong> - 転回（Uターン）
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 戻るボタン -->
+        <div class="d-flex justify-content-center mb-4">
+            <form action="/undo" method="post">
+                <button class="btn btn-warning btn-lg" type="submit">
+                    ↩️ 戻る <kbd>U</kbd>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- バッチ処理モーダル -->
+    <div class="modal fade" id="batchModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">🚀 バッチ自動アノテーション</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p>複数のサンプルを一括で自動アノテーションします。</p>
+                    <div class="mb-3">
+                        <label for="numSamples" class="form-label">処理するサンプル数:</label>
+                        <input type="number" class="form-control" id="numSamples" value="10" min="1" max="100">
+                    </div>
+                    <div id="batchStatus" class="alert" style="display: none;"></div>
+                    <div id="batchProgress" class="progress" style="display: none;">
+                        <div class="progress-bar" role="progressbar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">キャンセル</button>
+                    <button type="button" class="btn btn-primary" onclick="batchAnnotate()">実行</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const offsetSeconds = {{ offset_seconds }};
+
+        // 動画の初期化
+        function initVideo(videoId) {
+            const video = document.getElementById(videoId);
+            if (video) {
+                video.addEventListener('loadedmetadata', () => {
+                    video.currentTime = offsetSeconds;
+                });
+                video.addEventListener('seeked', () => {
+                    if (!video.dataset.played) {
+                        video.dataset.played = 'true';
+                        video.play();
+                    }
+                });
+            }
+        }
+
+        initVideo('video-front');
+        initVideo('video-inner');
+
+        // 自動アノテーション関数
+        async function autoAnnotate() {
+            const btn = document.getElementById('autoAnnotateBtn');
+            const status = document.getElementById('autoAnnotateStatus');
+            
+            btn.disabled = true;
+            btn.innerHTML = '🔄 処理中...';
+            status.style.display = 'block';
+            status.className = 'alert alert-info';
+            status.innerHTML = 'AI がビデオを分析しています...';
+            
+            try {
+                const formData = new FormData();
+                formData.append('sample_id', {{ sample_id }});
+                
+                const response = await fetch('/auto_annotate', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    status.className = 'alert alert-success';
+                    status.innerHTML = `✅ 予測完了: ラベル ${result.predicted_label}`;
+                    
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 1500);
+                } else {
+                    status.className = 'alert alert-danger';
+                    status.innerHTML = `❌ エラー: ${result.error || '予測に失敗しました'}`;
+                    btn.disabled = false;
+                    btn.innerHTML = '🤖 AI自動アノテーション';
+                }
+            } catch (error) {
+                status.className = 'alert alert-danger';
+                status.innerHTML = `❌ エラー: ${error.message}`;
+                btn.disabled = false;
+                btn.innerHTML = '🤖 AI自動アノテーション';
+            }
+        }
+
+        // バッチアノテーション関数
+        async function batchAnnotate() {
+            const numSamples = document.getElementById('numSamples').value;
+            const status = document.getElementById('batchStatus');
+            const progress = document.getElementById('batchProgress');
+            const progressBar = progress.querySelector('.progress-bar');
+            
+            status.style.display = 'block';
+            status.className = 'alert alert-info';
+            status.innerHTML = 'バッチ処理を開始しています...';
+            progress.style.display = 'block';
+            progressBar.style.width = '0%';
+            
+            try {
+                const formData = new FormData();
+                formData.append('num_samples', numSamples);
+                
+                const response = await fetch('/auto_annotate_batch', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    progressBar.style.width = '100%';
+                    status.className = 'alert alert-success';
+                    status.innerHTML = `✅ 完了: ${result.successful}/${result.total_processed} 件成功`;
+                    
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 2000);
+                } else {
+                    status.className = 'alert alert-danger';
+                    status.innerHTML = `❌ エラー: ${result.error || 'バッチ処理に失敗しました'}`;
+                }
+            } catch (error) {
+                status.className = 'alert alert-danger';
+                status.innerHTML = `❌ エラー: ${error.message}`;
+            }
+        }
+
+        // 全自動アノテーション実行
+        async function autoAnnotateAll() {
+            if (!confirm('全ての未アノテーションサンプルを自動アノテーションしますか？\n時間がかかる場合があります。')) {
+                return;
+            }
+
+            const status = document.getElementById('autoAnnotateStatus');
+            status.style.display = 'block';
+            status.className = 'alert alert-info';
+            status.innerHTML = '⏳ 全自動アノテーションを開始しています...';
+
+            try {
+                const response = await fetch('/auto_annotate_all', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    status.className = 'alert alert-success';
+                    status.innerHTML = `✅ 完了！<br>
+                        処理数: ${result.total_processed}<br>
+                        成功: ${result.successful}<br>
+                        失敗: ${result.failed}<br>
+                        <a href="/" class="btn btn-sm btn-primary mt-2">ページをリロード</a>`;
+                } else {
+                    status.className = 'alert alert-danger';
+                    status.innerHTML = `❌ エラー: ${result.error || '全自動アノテーションに失敗しました'}`;
+                }
+            } catch (error) {
+                status.className = 'alert alert-danger';
+                status.innerHTML = `❌ エラー: ${error.message}`;
+            }
+        }
+
+        // キーボードショートカット
+        document.addEventListener('keydown', function(event) {
+            // 入力フィールドにフォーカスがある場合は無効
+            if (document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'INPUT') return;
+            
+            const key = event.key;
+            
+            // 数字キー 0-9 でラベル選択
+            if (key >= '0' && key <= '9') {
+                event.preventDefault();
+                const label = parseInt(key);
+                // 対応するボタンをクリック
+                const button = document.querySelector(`button[name="action_label"][value="${label}"]`);
+                if (button) button.click();
+            }
+            // U - 戻る
+            else if (key.toLowerCase() === 'u') {
+                event.preventDefault();
+                document.querySelector('button[type="submit"]').closest('form[action="/undo"]').submit();
+            }
+            // A - 自動アノテーション
+            else if (key.toLowerCase() === 'a') {
+                event.preventDefault();
+                autoAnnotate();
+            }
+        });
+    </script>
+</body>
+</html>
