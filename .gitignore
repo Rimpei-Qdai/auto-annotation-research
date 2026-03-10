@@ -3,3 +3,4 @@ new/results/
 *.mp4
 .DS_Store
 gpu_manual/
+new/annotation_tool/__pycache__/
