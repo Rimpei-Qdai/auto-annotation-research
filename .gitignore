@@ -1,4 +1,5 @@
-./filterd_video/
-.mp4
+new/filterd_video/
+new/results/
+*.mp4
 .DS_Store
-./gpu_manual/
+gpu_manual/
