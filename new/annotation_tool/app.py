@@ -30,7 +30,9 @@ app = FastAPI()
 
 # パス設定
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_DIR = os.path.join(os.path.dirname(BASE_DIR), 'sample')
+# プロジェクトのルートディレクトリ (new/ の親)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
+SAMPLE_DIR = os.path.join(PROJECT_ROOT, 'sample')
 VIDEO_DIR = os.path.join(os.path.dirname(BASE_DIR), 'filterd_video')
 
 CSV_INPUT = os.path.join(SAMPLE_DIR, 'annotation_samples.csv')
