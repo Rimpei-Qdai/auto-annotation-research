@@ -7,7 +7,8 @@
 #   - プロジェクトが ~/workspace/auto-annotation-research/ に配置されていること
 #
 # 使い方:
-#   ssh -i ~/.ssh/id_rsa hata.rimpei@172.16.0.76
+#   ssh kiwi        # 研究室内WiFi から接続
+#   ssh kiwi-rmt    # 研究室外WiFi から接続
 #   cd ~/workspace/auto-annotation-research/new/annotation_tool
 #   bash setup_kiwi.sh
 
@@ -77,7 +78,8 @@ echo "ログを確認:"
 echo "  docker logs -f $CONTAINER_NAME"
 echo ""
 echo "ローカルからアクセスするには SSH ポートフォワードを使用:"
-echo "  (ローカル) ssh -L 8000:localhost:${HOST_PORT} -i ~/.ssh/id_rsa hata.rimpei@172.16.0.76"
+echo "  (研究室内) ssh -L 8000:localhost:${HOST_PORT} kiwi -N"
+echo "  (研究室外) ssh -L 8000:localhost:${HOST_PORT} kiwi-rmt -N"
 echo "  ブラウザで http://localhost:8000 を開く"
 echo ""
 echo "コンテナ操作:"
