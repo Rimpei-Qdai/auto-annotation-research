@@ -4,37 +4,34 @@ Moondream2 VLM Configuration for Automatic Annotation
 """
 
 # VLM Model Settings
-# Multi-frame video understanding models
-# Option 1: Qwen2-VL-2B (Multi-frame, 4GB VRAM, faster, good for 8GB GPU)
-# Option 2: Qwen2-VL-7B (Multi-frame, 8GB+ VRAM, better accuracy, requires more memory)
-# Note: Moondream2 is NOT supported (single-frame only)
-# Note: Heron has Windows tokenizer compatibility issues
-HERON_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+# ======== GPU サーバー設定 (kiwi: RTX 4090, 24GB VRAM) ========
+# Option 1: Qwen2-VL-2B (4GB VRAM, ローカル RTX 4060 向け)
+# Option 2: Qwen2-VL-7B (14GB VRAM, kiwi RTX 4090 向け, 高精度)
+HERON_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
 USE_MULTI_FRAME = True  # Enable multi-frame temporal understanding
-USE_GPU = True  # GPU有効（RTX 4060使用）
-TORCH_DTYPE = "float16"  # GPUではfloat16で高速化
+USE_GPU = True  # GPU有効（kiwi: RTX 4090使用）
+# bfloat16: RTX 4090 (Ada Lovelace) はネイティブサポートで float16 より安定
+TORCH_DTYPE = "bfloat16"
 DEVICE_PREFERENCE = "cuda" if USE_GPU else "cpu"  # Device preference for model loading
 
 # Video Processing Settings
-NUM_FRAMES_TO_EXTRACT = 4  # Number of frames to extract from video (reduced for 8GB VRAM)
-NUM_FRAMES_TO_USE = 4  # Number of frames to actually use (reduced to fit in memory)
+# RTX 4090 (24GB VRAM) では 8 フレームを使用可能
+NUM_FRAMES_TO_EXTRACT = 8  # Number of frames to extract from video
+NUM_FRAMES_TO_USE = 8  # Number of frames to actually use
 FRAME_EXTRACTION_METHOD = "uniform"  # "uniform" or "temporal"
 MAX_IMAGE_SIZE = 1080  # Maximum dimension (width or height) for image processing
 
 # L2M+CoT Settings
-USE_L2M_COT = True  # Enable Least-to-Most + Chain-of-Thought reasoning (experimental)
+USE_L2M_COT = True  # Enable Least-to-Most + Chain-of-Thought reasoning
 # L2M+CoTを有効にすると、1つの動画に対して3回の推論を実行します（Level 1, 2, 3）
-# より論理的で説明可能な推論が可能になりますが、推論時間が約3倍になります
+# RTX 4090 の高速推論で処理時間の問題を解消
 
-# Generation Optimization Settings (速度最適化設定)
-# これらの設定を調整することで、機能を維持しながら推論速度を向上できます
-MAX_NEW_TOKENS_STANDARD = 50  # 標準推論の最大トークン数 (デフォルト: 100 → 50に削減)
-MAX_NEW_TOKENS_L2M = 150  # L2M+CoT推論の最大トークン数 (デフォルト: 300 → 150に削減)
-# 理由: アクション分類は0-10の数字1つだけなので、長い出力は不要
-# 50トークンでも十分な推論結果が得られます
+# Generation Settings (RTX 4090 では十分な VRAM があるため上限を緩和)
+MAX_NEW_TOKENS_STANDARD = 100  # 標準推論の最大トークン数
+MAX_NEW_TOKENS_L2M = 300  # L2M+CoT 推論の最大トークン数（JSON 出力に十分な長さ）
 
 USE_KV_CACHE = True  # KVキャッシュの使用 (高速化)
-NUM_FRAMES_OPTIMIZED = 3  # フレーム数の最適化 (4 → 3に削減可能、精度とのトレードオフ)
+NUM_FRAMES_OPTIMIZED = 8  # フレーム数（RTX 4090 では削減不要）
 
 # Action Label Mapping
 ACTION_LABELS = {
@@ -100,4 +97,4 @@ Action Categories:
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds
-ENABLE_FLASH_ATTENTION = False  # Set to True if flash-attn is installed
+ENABLE_FLASH_ATTENTION = True  # RTX 4090 では flash-attn が利用可能
