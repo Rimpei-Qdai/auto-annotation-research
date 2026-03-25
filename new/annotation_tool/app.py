@@ -1,6 +1,7 @@
 # app.py
 
 import os
+import json
 import pandas as pd
 import logging
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 # Configure logging（コンソール + ファイル両方に出力）
-_log_handler_file = logging.FileHandler('/project/new/annotation_tool/annotation.log', encoding='utf-8')
+_LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'annotation.log')
+_log_handler_file = logging.FileHandler(_LOG_FILE_PATH, encoding='utf-8')
 _log_handler_file.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +41,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
 SAMPLE_DIR = os.path.join(PROJECT_ROOT, 'sample')
 VIDEO_DIR = os.path.join(os.path.dirname(BASE_DIR), 'filterd_video')
+INFERENCE_LOG_PATH = os.path.join(BASE_DIR, 'inference_process.jsonl')
 
 CSV_INPUT = os.path.join(SAMPLE_DIR, 'annotation_samples.csv')
 CSV_OUTPUT_MANUAL = os.path.join(BASE_DIR, 'annotated_samples_manual.csv')
@@ -182,6 +185,16 @@ def save_dataframe_auto():
     output_df.to_csv(CSV_OUTPUT_AUTO, index=False)
     logger.info(f"Auto-annotation results saved to {CSV_OUTPUT_AUTO}")
 
+
+def append_inference_log(event):
+    """推論過程ログをJSON Lines形式で保存する。"""
+    payload = {
+        'logged_at': datetime.now(JST).isoformat(),
+        **event,
+    }
+    with open(INFERENCE_LOG_PATH, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+
 # ============ ルーティング ============
 
 @app.get("/", response_class=HTMLResponse)
@@ -288,11 +301,27 @@ async def auto_annotate(sample_id: int = Form(...)):
     try:
         # Get sample data from auto dataframe
         row = df_auto[df_auto['sample_id'] == sample_id].iloc[0]
+        request_id = f"single-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
+        append_inference_log({
+            'request_id': request_id,
+            'endpoint': '/auto_annotate',
+            'phase': 'start',
+            'sample_id': int(sample_id),
+            'taxi_id': str(row['taxi_id']),
+            'timestamp': int(row['timestamp'])
+        })
         
         # Find matching video
         match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
         
         if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
+            append_inference_log({
+                'request_id': request_id,
+                'endpoint': '/auto_annotate',
+                'phase': 'video_not_found',
+                'sample_id': int(sample_id),
+                'taxi_id': str(row['taxi_id'])
+            })
             return JSONResponse(
                 {"error": "No video found for this sample"},
                 status_code=404
@@ -320,21 +349,39 @@ async def auto_annotate(sample_id: int = Form(...)):
             'blinker_l': int(row['blinker_l']),
             'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
         }
+        append_inference_log({
+            'request_id': request_id,
+            'endpoint': '/auto_annotate',
+            'phase': 'predicting',
+            'sample_id': int(sample_id),
+            'video_path': video_path,
+            'offset_seconds': float(match_result['offset_seconds']),
+            'sensor_data': sensor_data
+        })
 
         # Get annotator and predict
         annotator = get_annotator()
-        predicted_label = annotator.predict_action(
+        predicted_label, l2m_details = annotator.predict_action_with_details(
             video_path=video_path,
             sensor_data=sensor_data,
             start_time=match_result['offset_seconds'],
             sample_id=sample_id
         )
-        
+
         if predicted_label is not None:
             # Save prediction to auto dataframe
             idx = df_auto[df_auto['sample_id'] == sample_id].index[0]
             df_auto.at[idx, 'action_label'] = predicted_label
             save_dataframe_auto()
+            append_inference_log({
+                'request_id': request_id,
+                'endpoint': '/auto_annotate',
+                'phase': 'completed',
+                'sample_id': int(sample_id),
+                'predicted_label': int(predicted_label),
+                'status': 'success',
+                'l2m_details': l2m_details
+            })
             
             return JSONResponse({
                 "success": True,
@@ -342,12 +389,27 @@ async def auto_annotate(sample_id: int = Form(...)):
                 "predicted_label": int(predicted_label)
             })
         else:
+            append_inference_log({
+                'request_id': request_id,
+                'endpoint': '/auto_annotate',
+                'phase': 'completed',
+                'sample_id': int(sample_id),
+                'status': 'failed',
+                'error': 'Prediction failed'
+            })
             return JSONResponse(
                 {"error": "Prediction failed"},
                 status_code=500
             )
             
     except Exception as e:
+        append_inference_log({
+            'endpoint': '/auto_annotate',
+            'phase': 'exception',
+            'sample_id': int(sample_id),
+            'status': 'failed',
+            'error': str(e)
+        })
         logger.error(f"Auto-annotation error: {e}", exc_info=True)
         return JSONResponse(
             {"error": str(e)},
@@ -379,6 +441,15 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
         
         for idx, row in unannotated.iterrows():
             sample_id = row['sample_id']
+            request_id = f"batch-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
+            append_inference_log({
+                'request_id': request_id,
+                'endpoint': '/auto_annotate_batch',
+                'phase': 'start',
+                'sample_id': int(sample_id),
+                'taxi_id': str(row['taxi_id']),
+                'timestamp': int(row['timestamp'])
+            })
             
             try:
                 # Find matching video
@@ -386,6 +457,13 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_batch',
+                        'phase': 'video_not_found',
+                        'sample_id': int(sample_id),
+                        'taxi_id': str(row['taxi_id'])
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -412,24 +490,50 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     'blinker_l': int(row['blinker_l']),
                     'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
                 }
+                append_inference_log({
+                    'request_id': request_id,
+                    'endpoint': '/auto_annotate_batch',
+                    'phase': 'predicting',
+                    'sample_id': int(sample_id),
+                    'video_path': video_path,
+                    'offset_seconds': float(match_result['offset_seconds']),
+                    'sensor_data': sensor_data
+                })
 
                 # Predict
-                predicted_label = annotator.predict_action(
+                predicted_label, l2m_details = annotator.predict_action_with_details(
                     video_path=video_path,
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
                 )
-                
+
                 if predicted_label is not None:
                     # Save prediction to auto dataframe
                     df_auto.at[idx, 'action_label'] = predicted_label
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_batch',
+                        'phase': 'completed',
+                        'sample_id': int(sample_id),
+                        'predicted_label': int(predicted_label),
+                        'status': 'success',
+                        'l2m_details': l2m_details
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": True,
                         "predicted_label": int(predicted_label)
                     })
                 else:
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_batch',
+                        'phase': 'completed',
+                        'sample_id': int(sample_id),
+                        'status': 'failed',
+                        'error': 'Prediction failed'
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -438,6 +542,14 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
+                append_inference_log({
+                    'request_id': request_id,
+                    'endpoint': '/auto_annotate_batch',
+                    'phase': 'exception',
+                    'sample_id': int(sample_id),
+                    'status': 'failed',
+                    'error': str(e)
+                })
                 results.append({
                     "sample_id": sample_id,
                     "success": False,
@@ -504,6 +616,15 @@ async def auto_annotate_all():
         
         for idx, (_, row) in enumerate(unannotated.iterrows()):
             sample_id = int(row['sample_id'])
+            request_id = f"all-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
+            append_inference_log({
+                'request_id': request_id,
+                'endpoint': '/auto_annotate_all',
+                'phase': 'start',
+                'sample_id': int(sample_id),
+                'taxi_id': str(row['taxi_id']),
+                'timestamp': int(row['timestamp'])
+            })
             try:
                 # Find matching video
                 match_result = find_matching_videos(
@@ -513,6 +634,13 @@ async def auto_annotate_all():
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_all',
+                        'phase': 'video_not_found',
+                        'sample_id': int(sample_id),
+                        'taxi_id': str(row['taxi_id'])
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -538,18 +666,36 @@ async def auto_annotate_all():
                     'blinker_l': int(row['blinker_l']),
                     'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
                 }
+                append_inference_log({
+                    'request_id': request_id,
+                    'endpoint': '/auto_annotate_all',
+                    'phase': 'predicting',
+                    'sample_id': int(sample_id),
+                    'video_path': video_path,
+                    'offset_seconds': float(match_result['offset_seconds']),
+                    'sensor_data': sensor_data
+                })
 
                 # Predict action
-                predicted_label = annotator.predict_action(
+                predicted_label, l2m_details = annotator.predict_action_with_details(
                     video_path=video_path,
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
                 )
-                
+
                 if predicted_label is not None:
                     # Save to auto dataframe
                     df_auto.loc[df_auto['sample_id'] == sample_id, 'action_label'] = predicted_label
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_all',
+                        'phase': 'completed',
+                        'sample_id': int(sample_id),
+                        'predicted_label': int(predicted_label),
+                        'status': 'success',
+                        'l2m_details': l2m_details
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": True,
@@ -557,6 +703,14 @@ async def auto_annotate_all():
                     })
                     logger.info(f"Sample {sample_id}: predicted label {predicted_label}")
                 else:
+                    append_inference_log({
+                        'request_id': request_id,
+                        'endpoint': '/auto_annotate_all',
+                        'phase': 'completed',
+                        'sample_id': int(sample_id),
+                        'status': 'failed',
+                        'error': 'Prediction returned None'
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -569,6 +723,14 @@ async def auto_annotate_all():
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
+                append_inference_log({
+                    'request_id': request_id,
+                    'endpoint': '/auto_annotate_all',
+                    'phase': 'exception',
+                    'sample_id': int(sample_id),
+                    'status': 'failed',
+                    'error': str(e)
+                })
                 results.append({
                     "sample_id": sample_id,
                     "success": False,

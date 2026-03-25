@@ -54,6 +54,7 @@ class HeronAnnotatorWithTrajectory:
         self._tokenizer = None
         self._device = None
         self._is_heron = False
+        self._last_l2m_result = None  # predict_action_with_details で参照
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
@@ -433,19 +434,22 @@ class HeronAnnotatorWithTrajectory:
             # Extract final category
             final_category = result.get('final_category', 0)
             confidence = result.get('confidence', 0.5)
-            
+
             logger.info(f"[L2M+CoT] *** FINAL RESULT: category={final_category}, confidence={confidence:.2f} ***")
             logger.info(f"[L2M+CoT] Level 1: {result['level1'].get('road_shape', 'N/A')}, {result['level1'].get('trajectory_relation', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 2: {result['level2'].get('acceleration_cause', 'N/A')}, {result['level2'].get('speed_trend', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 3: {result['level3'].get('category_name', 'N/A')}")
             logger.info(f"[L2M+CoT] *** RETURNING: {final_category} ***")
-            
+
+            # 詳細結果を保持（predict_action_with_details から参照できるよう）
+            self._last_l2m_result = result
+
             return final_category
-            
+
         except Exception as e:
             logger.error(f"L2M+CoT prediction FAILED with exception: {e}", exc_info=True)
-            # フォールバック: 通常の推論を試す
             logger.warning("!!! FALLBACK to standard prediction !!!")
+            self._last_l2m_result = None
             return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
     
     def _predict_multi_frame_with_trajectory(
@@ -585,6 +589,24 @@ class HeronAnnotatorWithTrajectory:
         
         return None
     
+    def predict_action_with_details(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        start_time: float = 0.0,
+        sample_id: Optional[int] = None
+    ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+        """
+        predict_action と同じだが、L2M の中間推論結果も返す。
+
+        Returns:
+            (predicted_label, l2m_details) のタプル。
+            l2m_details は level1/level2/level3 の辞書。L2M未使用時は None。
+        """
+        self._last_l2m_result = None
+        label = self.predict_action(video_path, sensor_data, start_time, sample_id)
+        return label, self._last_l2m_result
+
     def predict_batch(
         self,
         samples: List[Dict[str, Any]],
