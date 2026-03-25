@@ -3,7 +3,9 @@
 import os
 import pandas as pd
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+JST = timezone(timedelta(hours=9))
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +43,7 @@ CSV_OUTPUT_AUTO = os.path.join(BASE_DIR, 'annotated_samples_auto.csv')
 
 # 静的ファイルとテンプレート
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+os.makedirs(VIDEO_DIR, exist_ok=True)
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
@@ -90,11 +93,19 @@ if os.path.exists(CSV_OUTPUT_AUTO):
 if 'action_label' not in df_auto.columns:
     df_auto['action_label'] = None
 
+# 速度差分を事前計算（案2-2）: タクシーIDごとに前後サンプル間の速度変化量を算出
+# timestamp でソートしてから差分計算することで加速・減速の検出精度を向上
+if 'speed' in df_auto.columns and 'taxi_id' in df_auto.columns:
+    df_auto = df_auto.sort_values(['taxi_id', 'timestamp']).reset_index(drop=True)
+    df_auto['speed_diff'] = df_auto.groupby('taxi_id')['speed'].diff()
+    df_auto['speed_diff'] = df_auto['speed_diff'].fillna(0)
+    logger.info("速度差分(speed_diff)を計算しました")
+
 # ============ ヘルパー関数 ============
 
 def unix_ms_to_datetime(unix_ms):
-    """UNIXミリ秒をdatetimeに変換"""
-    return datetime.fromtimestamp(unix_ms / 1000.0)
+    """UNIXミリ秒をJST datetimeに変換"""
+    return datetime.fromtimestamp(unix_ms / 1000.0, tz=JST).replace(tzinfo=None)
 
 def extract_video_timestamp(filename):
     """動画ファイル名からタイムスタンプを抽出"""
@@ -303,9 +314,10 @@ async def auto_annotate(sample_id: int = Form(...)):
             'gyro_z': float(row['gyro_z']),
             'brake': int(row['brake']),
             'blinker_r': int(row['blinker_r']),
-            'blinker_l': int(row['blinker_l'])
+            'blinker_l': int(row['blinker_l']),
+            'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
         }
-        
+
         # Get annotator and predict
         annotator = get_annotator()
         predicted_label = annotator.predict_action(
@@ -394,9 +406,10 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     'gyro_z': float(row['gyro_z']),
                     'brake': int(row['brake']),
                     'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l'])
+                    'blinker_l': int(row['blinker_l']),
+                    'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
                 }
-                
+
                 # Predict
                 predicted_label = annotator.predict_action(
                     video_path=video_path,
@@ -519,9 +532,10 @@ async def auto_annotate_all():
                     'gyro_z': float(row['gyro_z']),
                     'brake': int(row['brake']),
                     'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l'])
+                    'blinker_l': int(row['blinker_l']),
+                    'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
                 }
-                
+
                 # Predict action
                 predicted_label = annotator.predict_action(
                     video_path=video_path,

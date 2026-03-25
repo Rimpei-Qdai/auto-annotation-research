@@ -16,6 +16,8 @@ from PIL import Image
 import torch
 import re
 
+from config import GYRO_THRESHOLD, ACC_X_THRESHOLD, SPEED_STOP_THRESHOLD, FEW_SHOT_EXAMPLES
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,29 +52,46 @@ class L2MCoTPipeline:
         """
         logger.info("=== Starting L2M+CoT Analysis ===")
         logger.info(f"Frames: {len(frames)}, Sensor data: {sensor_data}")
-        
+
+        # センサーヒントを事前計算（案2-1）
+        sensor_hints = self._get_sensor_hints(sensor_data)
+        if sensor_hints:
+            logger.info(f"Sensor hints: {sensor_hints}")
+
         # Level 1: Geometric analysis
         logger.info("--- Level 1: Geometric Analysis ---")
         level1_result = self._level1_geometry(frames)
         logger.info(f"Level 1 完了: {level1_result}")
-        
+
         # Level 2: Physics consistency check
         logger.info("--- Level 2: Physics Consistency Check ---")
         level2_result = self._level2_physics(frames, sensor_data, level1_result)
         logger.info(f"Level 2 完了: {level2_result}")
-        
+
         # Level 3: Final classification
         logger.info("--- Level 3: Final Classification ---")
-        level3_result = self._level3_classification(frames, sensor_data, level1_result, level2_result)
+        level3_result = self._level3_classification(
+            frames, sensor_data, level1_result, level2_result, sensor_hints
+        )
         logger.info(f"Level 3 完了: {level3_result}")
-        
+
+        # 後処理ルール適用（案4）
+        raw_category = level3_result.get('category_id', 0)
+        final_category = self._post_process_label(raw_category, sensor_data)
+        if final_category is None:
+            # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
+            logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
+            final_category = raw_category
+        if final_category != raw_category:
+            logger.info(f"[PostProcess] Label corrected: {raw_category} → {final_category}")
+
         logger.info("=== L2M+CoT Analysis Complete ===")
-        
+
         return {
             'level1': level1_result,
             'level2': level2_result,
             'level3': level3_result,
-            'final_category': level3_result.get('category_id', 0),
+            'final_category': final_category,
             'confidence': level3_result.get('confidence', 0.5)
         }
     
@@ -112,6 +131,22 @@ class L2MCoTPipeline:
 - DOWNHILL（下り坂）
 - FLAT（平坦）
 
+[ステップ4: 方向転換の兆候（重要）]
+映像から、車両が方向転換している可能性を判断してください。
+
+(a) 交差点または角が前方に見えるか、または通過中ですか？
+- YES（交差点あり）
+- NO（交差点なし）
+
+(b) 車両の進行方向が直進から変化していますか？（景色の流れ方向、地平線の傾きで判断）
+- TURNING（旋回中）
+- STRAIGHT（直進）
+
+(c) フロントカメラの映像で、景色が左右にシフトしていますか？
+- SHIFT_LEFT（左へシフト）
+- SHIFT_RIGHT（右へシフト）
+- NO_SHIFT（シフトなし）
+
 【出力形式】
 以下のJSON形式でのみ回答してください。推論過程も「reasoning」フィールドに簡潔に記述してください。
 
@@ -120,7 +155,10 @@ class L2MCoTPipeline:
   "reasoning": "道路形状と軌道の関係についての分析結果を簡潔に説明",
   "road_shape": "STRAIGHT",
   "trajectory_relation": "PARALLEL",
-  "slope": "FLAT"
+  "slope": "FLAT",
+  "intersection_detected": "NO",
+  "direction_change": "STRAIGHT",
+  "visual_shift": "NO_SHIFT"
 }
 ```"""
         
@@ -132,21 +170,27 @@ class L2MCoTPipeline:
                 # Default values when parsing fails
                 logger.warning(f"Level 1 JSON parse failed. Raw output: {raw_output[:300]}")
                 return {
-                    'reasoning': raw_output[:500],  # Save partial raw output
+                    'reasoning': raw_output[:500],
                     'road_shape': 'STRAIGHT',
                     'trajectory_relation': 'PARALLEL',
-                    'slope': 'FLAT'
+                    'slope': 'FLAT',
+                    'intersection_detected': 'NO',
+                    'direction_change': 'STRAIGHT',
+                    'visual_shift': 'NO_SHIFT'
                 }
-            
+
             return parsed
-            
+
         except Exception as e:
             logger.error(f"Level 1 推論エラー: {e}", exc_info=True)
             return {
                 'reasoning': f"Error: {str(e)}",
                 'road_shape': 'STRAIGHT',
                 'trajectory_relation': 'PARALLEL',
-                'slope': 'FLAT'
+                'slope': 'FLAT',
+                'intersection_detected': 'NO',
+                'direction_change': 'STRAIGHT',
+                'visual_shift': 'NO_SHIFT'
             }
     
     def _level2_physics(
@@ -165,21 +209,43 @@ class L2MCoTPipeline:
         speed = sensor_data.get('speed', 0)
         acc_x = sensor_data.get('acc_x', 0)
         acc_y = sensor_data.get('acc_y', 0)
+        gyro_z = sensor_data.get('gyro_z', 0)
         brake = sensor_data.get('brake', 0)
-        
+        blinker_r = sensor_data.get('blinker_r', 0)
+        blinker_l = sensor_data.get('blinker_l', 0)
+
         brake_status = 'ON' if brake > 0 else 'OFF'
+        blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
+
+        # ジャイロ閾値超過時の警告メッセージ（案1-2）
+        gyro_warning = ""
+        if abs(gyro_z) > GYRO_THRESHOLD:
+            direction = "左" if gyro_z > 0 else "右"
+            gyro_warning = f"\n⚠️ ジャイロセンサーが旋回を検出しています（gyro_z={gyro_z:.3f} rad/s）。{direction}への旋回を考慮してください。"
+
+        # 横加速度による旋回の補足警告
+        acc_x_warning = ""
+        if abs(acc_x) > ACC_X_THRESHOLD:
+            direction = "左" if acc_x > 0 else "右"
+            acc_x_warning = f"\n⚠️ 横加速度あり（acc_x={acc_x:.3f} m/s²）。{direction}への旋回・車線変更の可能性があります。"
+
         prompt = f"""あなたは自動運転データの分析エキスパートです。Level 1の幾何学的分析結果と、実際の車両センサーデータを照合して、物理法則との整合性を検証してください。
 
 【Level 1の分析結果】
 - 道路形状: {level1_result.get('road_shape', 'UNKNOWN')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation', 'UNKNOWN')}
 - 道路の勾配: {level1_result.get('slope', 'UNKNOWN')}
+- 交差点検出: {level1_result.get('intersection_detected', 'UNKNOWN')}
+- 方向変化: {level1_result.get('direction_change', 'UNKNOWN')}
+- 映像シフト: {level1_result.get('visual_shift', 'UNKNOWN')}
 
 【センサーデータ】
 - 速度: {speed:.1f} km/h
 - 前後加速度: {acc_x:.2f} m/s²
 - 横加速度: {acc_y:.2f} m/s²
+- ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {brake_status}
+- ウィンカー: {blinker_status}{gyro_warning}{acc_x_warning}
 
 【タスク】
 以下の分析を段階的に行ってください。
@@ -246,7 +312,8 @@ class L2MCoTPipeline:
         frames: List[Image.Image],
         sensor_data: Dict[str, Any],
         level1_result: Dict[str, Any],
-        level2_result: Dict[str, Any]
+        level2_result: Dict[str, Any],
+        sensor_hints: str = ""
     ) -> Dict[str, Any]:
         """
         Level 3: Final action classification
@@ -268,35 +335,56 @@ class L2MCoTPipeline:
                 'confidence': 0.99
             }
         
+        gyro_z = sensor_data.get('gyro_z', 0)
+        blinker_r = sensor_data.get('blinker_r', 0)
+        blinker_l = sensor_data.get('blinker_l', 0)
+        speed_diff = sensor_data.get('speed_diff', None)
+        blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
+
+        speed_diff_text = ""
+        if speed_diff is not None:
+            if speed_diff > 0.5:
+                speed_diff_text = f"\n- 速度変化量: +{speed_diff:.1f} km/h（加速傾向）"
+            elif speed_diff < -0.5:
+                speed_diff_text = f"\n- 速度変化量: {speed_diff:.1f} km/h（減速傾向）"
+
+        sensor_hints_section = f"\n\n◆ センサーヒント（事前フィルタリング）\n{sensor_hints}" if sensor_hints else ""
+
         prompt = f"""あなたは自動運転データの分析エキスパートです。これまでの分析結果を統合して、車両の運転行動を最終的に分類してください。
 
+{FEW_SHOT_EXAMPLES}
 【これまでの分析結果】
 
 ◆ Level 1: 幾何学的分析
 - 道路形状: {level1_result.get('road_shape')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation')}
 - 道路の勾配: {level1_result.get('slope')}
+- 交差点検出: {level1_result.get('intersection_detected', 'N/A')}
+- 方向変化: {level1_result.get('direction_change', 'N/A')}
+- 映像シフト: {level1_result.get('visual_shift', 'N/A')}
 
 ◆ Level 2: 物理法則との整合性
 - 加速度の原因: {level2_result.get('acceleration_cause')}
 - 速度トレンド: {level2_result.get('speed_trend')}
 
 ◆ センサーデータ
-- 現在速度: {speed:.1f} km/h
+- 現在速度: {speed:.1f} km/h{speed_diff_text}
+- ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {'ON' if brake > 0 else 'OFF'}
+- ウィンカー: {blinker_status}{sensor_hints_section}
 
-【運転行動カテゴリ一覧】
-0: その他（Other）
-1: 等速走行（Constant speed）
-2: 加速（Acceleration）
-3: 減速（Deceleration）
-4: 停止（Stop）
-5: 発進（Start）
-6: 左折（Left turn）
-7: 右折（Right turn）
-8: 車線変更（左）（Lane change left）
-9: 車線変更（右）（Lane change right）
-10: 転回・Uターン（U-turn）
+【必ず以下の11クラスから1つ選択してください】
+0: その他
+1: 等速走行
+2: 加速
+3: 減速
+4: 停止
+5: 発進
+6: 左折
+7: 右折
+8: 車線変更（左）
+9: 車線変更（右）
+10: 転回（Uターン）
 
 【分類ルール - 必ず守ること】
 
@@ -306,20 +394,20 @@ class L2MCoTPipeline:
 2. **発進判定**:
    - 速度が5 km/h未満で速度トレンドがINCREASINGの場合 → カテゴリ5（発進）
 
-3. **カーブと車線変更の区別（重要）**:
-   - 軌道が「PARALLEL」の場合:
-     * 道路に沿って走行しているため、カテゴリは 1/2/3 のみ
-     * 軌道が曲がっていても、道路がカーブしていれば車線変更ではない
-   - 軌道が「CROSSING_LEFT」または「CROSSING_RIGHT」の場合:
-     * 車線を越える動きがあるため、カテゴリ 6/7/8/9 が可能
+3. **旋回・車線変更の判定（等速走行より優先）**:
+   - |gyro_z| > 0.1 rad/s の場合 → カテゴリ6/7/8/9/10 を積極的に検討
+   - ウィンカーONの場合 → 旋回または車線変更の強い証拠
+   - 交差点検出=YES かつ 映像シフトあり → カテゴリ6または7
+   - 交差点なし かつ 車線シフト → カテゴリ8または9
 
 4. **加速・減速の判定**:
    - 加速度の原因がDRIVER_BRAKEの場合 → カテゴリ3（減速）
-   - 速度が5 km/h未満で減速中 → カテゴリ3または4
+   - 速度変化量が大きい場合 → カテゴリ2（加速）またはカテゴリ3（減速）
 
-5. **右左折の判定**:
-   - 道路自体がカーブしており、軌道がPARALLELの場合は右左折ではない
-   - 交差点で軌道がCROSSINGしている場合は右左折の可能性
+5. **等速走行（1）は最後の手段**:
+   - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
+   - 速度変化（2,3）の可能性を除外した後に選択
+   - 停止・発進（4,5）の可能性を除外した後に選択
 
 【タスク】
 上記の分析結果とルールを総合的に考慮して、最も適切なカテゴリを1つ選択してください。
@@ -330,7 +418,7 @@ Output JSON only:
 {{
   "final_reasoning": "Brief integration of L1+L2",
   "category_id": 0,
-  "category_name": "Constant speed",
+  "category_name": "その他",
   "confidence": 0.95
 }}
 ```"""
@@ -517,6 +605,73 @@ Output JSON only:
         # Default is other
         return 0
     
+    def _get_sensor_hints(self, sensor_data: Dict[str, Any]) -> str:
+        """
+        センサー値から事前フィルタリングヒントを生成（案2-1）
+
+        VLMへのヒントとして、センサー値から絞り込んだクラス候補を返す。
+        """
+        hints = []
+        speed = sensor_data.get('speed', 0)
+        gyro_z = abs(sensor_data.get('gyro_z', 0))
+        acc_x = abs(sensor_data.get('acc_x', 0))
+        brake = sensor_data.get('brake', 0)
+        blinker_r = sensor_data.get('blinker_r', 0)
+        blinker_l = sensor_data.get('blinker_l', 0)
+
+        if speed < SPEED_STOP_THRESHOLD and brake > 0:
+            hints.append("センサー: 速度≈0かつブレーキON → 停止(4)の可能性が高い")
+        if gyro_z > GYRO_THRESHOLD:
+            raw_gyro = sensor_data.get('gyro_z', 0)
+            direction = "左" if raw_gyro > 0 else "右"
+            hints.append(
+                f"センサー: 旋回検出 (gyro_z={raw_gyro:.3f} rad/s) → "
+                f"{direction}折・車線変更(6/7/8/9)の可能性"
+            )
+        if acc_x > ACC_X_THRESHOLD:
+            raw_acc_x = sensor_data.get('acc_x', 0)
+            direction = "左" if raw_acc_x > 0 else "右"
+            hints.append(
+                f"センサー: 横加速度あり (acc_x={raw_acc_x:.3f} m/s²) → "
+                f"{direction}への旋回・車線変更の可能性"
+            )
+        if speed > 5 and brake == 0 and gyro_z < GYRO_THRESHOLD:
+            hints.append("センサー: 走行中・旋回なし → 停止(4)・発進(5)は除外")
+        if blinker_r > 0:
+            hints.append("センサー: 右ウィンカーON → 右折(7)または車線変更右(9)の可能性")
+        if blinker_l > 0:
+            hints.append("センサー: 左ウィンカーON → 左折(6)または車線変更左(8)の可能性")
+
+        return "\n".join(hints)
+
+    def _post_process_label(self, predicted_label: int, sensor_data: Dict[str, Any]) -> Optional[int]:
+        """
+        VLM予測とセンサーデータが著しく矛盾する場合にルールベースで補正（案4）
+
+        Returns:
+            補正後のラベル。矛盾検出時はNone（呼び出し側で元の予測を保持）。
+        """
+        speed = sensor_data.get('speed', 0)
+        gyro_z = abs(sensor_data.get('gyro_z', 0))
+        brake = sensor_data.get('brake', 0)
+
+        # ルール1: 速度0かつブレーキON → 停止(4)に強制補正
+        if speed < SPEED_STOP_THRESHOLD and brake > 0 and predicted_label != 4:
+            logger.info(
+                f"[PostProcess] Rule1: speed={speed:.1f}, brake={brake} → force category 4 (停止)"
+            )
+            return 4
+
+        # ルール2: 明確な旋回なのに等速走行(1)と判定 → Noneで矛盾を通知
+        if gyro_z > GYRO_THRESHOLD * 1.5 and predicted_label == 1:
+            logger.warning(
+                f"[PostProcess] Rule2: gyro_z={gyro_z:.3f} > threshold but predicted 1 (等速走行). "
+                "Contradiction detected."
+            )
+            return None
+
+        return predicted_label
+
     def _get_category_name(self, category_id: int) -> str:
         """
         Get Japanese category name from category ID
