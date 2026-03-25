@@ -17,6 +17,9 @@ set -e
 CONTAINER_NAME="hata_annotation"
 IMAGE_NAME="auto-annotation:latest"
 PROJECT_DIR="$HOME/workspace/auto-annotation-research"
+# HuggingFaceキャッシュをホスト側に永続化（コンテナ再作成時の再ダウンロードを防ぐ）
+HF_CACHE_DIR="$HOME/workspace/hf_cache"
+mkdir -p "$HF_CACHE_DIR"
 # ホストポート: 1<ユーザーID> (例: UID=1234 → ポート11234)
 HOST_PORT="1$(id -u)"
 
@@ -64,6 +67,7 @@ docker run \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
     -v "${PROJECT_DIR}:/project" \
+    -v "${HF_CACHE_DIR}:/root/.cache/huggingface" \
     -p "${HOST_PORT}:8000" \
     -dt \
     --name "$CONTAINER_NAME" \
