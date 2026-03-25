@@ -95,6 +95,22 @@ Action Categories:
 
 **Respond with ONLY the number (0-10). Nothing else.**"""
 
+# Sensor Thresholds for Turning Detection (案2-1, 案1-2)
+GYRO_THRESHOLD = 0.1        # rad/s - 旋回検出のジャイロ閾値
+ACC_X_THRESHOLD = 0.3       # m/s² - 横加速度による旋回検出閾値
+SPEED_STOP_THRESHOLD = 1.0  # km/h - 停止とみなす速度閾値
+
+# Few-shot examples for rare classes (案5-2)
+FEW_SHOT_EXAMPLES = """
+【参考例（センサー → 正解クラス）】
+例1: gyro_z=+0.25 rad/s、速度=15km/h、交差点で右に曲がっている → 7（右折）
+例2: gyro_z=+0.18 rad/s、速度=20km/h、車線が左にシフト → 8（車線変更（左））
+例3: gyro_z=0.00 rad/s、速度=0km/h、ブレーキON → 4（停止）
+例4: gyro_z=-0.20 rad/s、速度=12km/h、交差点で左に曲がっている → 6（左折）
+例5: acc_x=-1.5 m/s²、ブレーキON、速度低下 → 3（減速）
+例6: 速度=0km/h → 速度トレンドINCREASING → 5（発進）
+"""
+
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds
 ENABLE_FLASH_ATTENTION = True  # RTX 4090 では flash-attn が利用可能
