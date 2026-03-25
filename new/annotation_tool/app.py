@@ -11,10 +11,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# Configure logging
+# Configure logging（コンソール + ファイル両方に出力）
+_log_handler_file = logging.FileHandler('/project/new/annotation_tool/annotation.log', encoding='utf-8')
+_log_handler_file.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), _log_handler_file]
 )
 logger = logging.getLogger(__name__)
 
