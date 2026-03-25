@@ -413,13 +413,13 @@ class L2MCoTPipeline:
 上記の分析結果とルールを総合的に考慮して、最も適切なカテゴリを1つ選択してください。
 推論過程を「final_reasoning」に記述し、カテゴリID、カテゴリ名、信頼度を出力してください。
 
-Output JSON only:
+以下のJSON形式でのみ回答してください：
 ```json
 {{
-  "final_reasoning": "Brief integration of L1+L2",
-  "category_id": 0,
-  "category_name": "その他",
-  "confidence": 0.95
+  "final_reasoning": "推論内容",
+  "category_id": -1,
+  "category_name": "カテゴリ名",
+  "confidence": 0.0
 }}
 ```"""
         
@@ -429,7 +429,6 @@ Output JSON only:
             
             if parsed is None or 'category_id' not in parsed:
                 logger.warning(f"Level 3 JSON parse failed. Raw output: {raw_output[:300]}")
-                # If category ID cannot be obtained, estimate heuristically from output
                 category_id = self._extract_category_from_text(raw_output)
                 return {
                     'final_reasoning': raw_output[:500],
@@ -437,15 +436,26 @@ Output JSON only:
                     'category_name': self._get_category_name(category_id),
                     'confidence': 0.5
                 }
-            
+
+            # category_id=-1 はテンプレートのコピーなのでテキストから再抽出
+            if parsed.get('category_id') == -1:
+                logger.warning(f"Level 3 returned template placeholder (category_id=-1). Falling back to text extraction. Raw: {raw_output[:300]}")
+                category_id = self._extract_category_from_text(raw_output)
+                return {
+                    'final_reasoning': raw_output[:500],
+                    'category_id': category_id,
+                    'category_name': self._get_category_name(category_id),
+                    'confidence': 0.4
+                }
+
             # Supplement category name if not included
             if 'category_name' not in parsed:
                 parsed['category_name'] = self._get_category_name(parsed['category_id'])
-            
+
             # Default value if confidence not included
             if 'confidence' not in parsed:
                 parsed['confidence'] = 0.7
-            
+
             return parsed
             
         except Exception as e:
@@ -505,7 +515,7 @@ Output JSON only:
             with torch.no_grad():
                 output_ids = self.annotator.model.generate(
                     **inputs,
-                    max_new_tokens=300,  # Sufficient length for JSON output
+                    max_new_tokens=512,  # 長いプロンプト対応のため300→512に増加
                     do_sample=False  # Greedy decoding for reliability
                 )
             
