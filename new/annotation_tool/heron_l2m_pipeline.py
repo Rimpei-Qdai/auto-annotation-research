@@ -17,6 +17,7 @@ import torch
 import re
 
 from config import GYRO_THRESHOLD, ACC_X_THRESHOLD, SPEED_STOP_THRESHOLD, FEW_SHOT_EXAMPLES
+from driving_graph import DrivingConceptGraphBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class L2MCoTPipeline:
         """
         self.annotator = heron_annotator
         self.conversation_history = []
+        self.graph_builder = DrivingConceptGraphBuilder()
     
     def analyze_with_l2m(
         self,
@@ -68,16 +70,22 @@ class L2MCoTPipeline:
         level2_result = self._level2_physics(frames, sensor_data, level1_result)
         logger.info(f"Level 2 完了: {level2_result}")
 
+        # Graph: concept extraction + label support
+        logger.info("--- Graph: Concept Structuring ---")
+        graph_result = self.graph_builder.build(level1_result, level2_result, sensor_data)
+        logger.info(f"Graph concepts: {graph_result['concepts']}")
+        logger.info(f"Graph top candidates: {graph_result['top_candidates']}")
+
         # Level 3: Final classification
         logger.info("--- Level 3: Final Classification ---")
         level3_result = self._level3_classification(
-            frames, sensor_data, level1_result, level2_result, sensor_hints
+            frames, sensor_data, level1_result, level2_result, graph_result, sensor_hints
         )
         logger.info(f"Level 3 完了: {level3_result}")
 
         # 後処理ルール適用（案4）
         raw_category = level3_result.get('category_id', 0)
-        final_category = self._post_process_label(raw_category, sensor_data)
+        final_category = self._post_process_label(raw_category, sensor_data, graph_result)
         if final_category is None:
             # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
             logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
@@ -90,6 +98,7 @@ class L2MCoTPipeline:
         return {
             'level1': level1_result,
             'level2': level2_result,
+            'graph': graph_result,
             'level3': level3_result,
             'final_category': final_category,
             'confidence': level3_result.get('confidence', 0.5)
@@ -313,6 +322,7 @@ class L2MCoTPipeline:
         sensor_data: Dict[str, Any],
         level1_result: Dict[str, Any],
         level2_result: Dict[str, Any],
+        graph_result: Dict[str, Any],
         sensor_hints: str = ""
     ) -> Dict[str, Any]:
         """
@@ -349,6 +359,18 @@ class L2MCoTPipeline:
                 speed_diff_text = f"\n- 速度変化量: {speed_diff:.1f} km/h（減速傾向）"
 
         sensor_hints_section = f"\n\n◆ センサーヒント（事前フィルタリング）\n{sensor_hints}" if sensor_hints else ""
+        graph_section = (
+            f"\n\n◆ Graph 概念要約\n{graph_result.get('summary_for_prompt', '')}"
+            f"\n\n◆ Graph 上位候補\n{graph_result.get('candidate_summary', '')}"
+        )
+        strong_candidate = graph_result.get("strong_candidate")
+        strong_candidate_rule = ""
+        if strong_candidate:
+            strong_candidate_rule = (
+                f"\n- Graph の強候補: "
+                f"{strong_candidate['category_id']}（{strong_candidate['category_name']}）"
+                f" score={strong_candidate['score']:.2f}"
+            )
 
         prompt = f"""あなたは自動運転データの分析エキスパートです。これまでの分析結果を統合して、車両の運転行動を最終的に分類してください。
 
@@ -366,6 +388,7 @@ class L2MCoTPipeline:
 ◆ Level 2: 物理法則との整合性
 - 加速度の原因: {level2_result.get('acceleration_cause')}
 - 速度トレンド: {level2_result.get('speed_trend')}
+{graph_section}
 
 ◆ センサーデータ
 - 現在速度: {speed:.1f} km/h{speed_diff_text}
@@ -404,7 +427,12 @@ class L2MCoTPipeline:
    - 加速度の原因がDRIVER_BRAKEの場合 → カテゴリ3（減速）
    - 速度変化量が大きい場合 → カテゴリ2（加速）またはカテゴリ3（減速）
 
-5. **等速走行（1）は最後の手段**:
+5. **Graph 概念を必ず確認**:
+   - `Graph 上位候補` は中間概念から構成された候補である
+   - 特に、等速走行(1)や停止(4)を選ぶ前に Graph 候補との矛盾がないか確認する
+   - 右左折・車線変更・減速の候補が Graph に強く出ている場合は優先的に検討する{strong_candidate_rule}
+
+6. **等速走行（1）は最後の手段**:
    - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
    - 速度変化（2,3）の可能性を除外した後に選択
    - 停止・発進（4,5）の可能性を除外した後に選択
@@ -654,7 +682,12 @@ class L2MCoTPipeline:
 
         return "\n".join(hints)
 
-    def _post_process_label(self, predicted_label: int, sensor_data: Dict[str, Any]) -> Optional[int]:
+    def _post_process_label(
+        self,
+        predicted_label: int,
+        sensor_data: Dict[str, Any],
+        graph_result: Optional[Dict[str, Any]] = None
+    ) -> Optional[int]:
         """
         VLM予測とセンサーデータが著しく矛盾する場合にルールベースで補正（案4）
 
@@ -679,6 +712,32 @@ class L2MCoTPipeline:
                 "Contradiction detected."
             )
             return None
+
+        # ルール3: Graph が強い非 1/4 候補を示し、かつ 1/4 への偏りが疑われる場合は補正
+        if graph_result:
+            strong_candidate = graph_result.get("strong_candidate")
+            label_support = graph_result.get("label_support", {})
+            if strong_candidate:
+                strong_id = strong_candidate["category_id"]
+                strong_score = float(strong_candidate["score"])
+                predicted_score = float(label_support.get(predicted_label, 0.0))
+                margin = strong_score - predicted_score
+
+                if (
+                    predicted_label == 1
+                    and strong_id not in {1, 4}
+                    and strong_score >= 0.80
+                    and margin >= 0.25
+                ):
+                    logger.info(
+                        "[PostProcess] Rule3(Graph): correcting biased label %s -> %s "
+                        "(strong_score=%.2f, margin=%.2f)",
+                        predicted_label,
+                        strong_id,
+                        strong_score,
+                        margin,
+                    )
+                    return strong_id
 
         return predicted_label
 
