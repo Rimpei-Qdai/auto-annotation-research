@@ -4,3 +4,4 @@ new/results/
 .DS_Store
 gpu_manual/
 new/annotation_tool/__pycache__/
+new/annotation_tool/kiwi_logs/
