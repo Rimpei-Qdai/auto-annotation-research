@@ -535,8 +535,8 @@ class L2MCoTPipeline:
                     padding=True
                 )
             
-            # Move to device
-            inputs = {k: v.to(self.annotator.device) for k, v in inputs.items()}
+            # Align inputs with the model placement strategy.
+            inputs = self.annotator.prepare_inputs_for_generation(inputs)
             
             # Generate
             logger.info(f"Generating with {len(frames)} frames, prompt length: {len(prompt)} chars")

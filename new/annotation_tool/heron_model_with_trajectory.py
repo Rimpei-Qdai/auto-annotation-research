@@ -142,6 +142,32 @@ class HeronAnnotatorWithTrajectory:
     @property
     def is_loaded(self):
         return self._model is not None and self._processor is not None
+
+    @property
+    def uses_device_map(self) -> bool:
+        """Whether the loaded model is dispatched across devices by Accelerate."""
+        device_map = getattr(self._model, "hf_device_map", None)
+        return isinstance(device_map, dict) and len(device_map) > 0
+
+    def prepare_inputs_for_generation(self, inputs):
+        """
+        Align processor outputs with the model placement strategy.
+
+        When the model is loaded with `device_map`, Accelerate manages tensor
+        dispatch internally. Manually moving inputs to `self._device` can cause
+        CPU/CUDA mismatches at the embedding layer, so those inputs must remain
+        on their original device.
+        """
+        if self.uses_device_map:
+            return inputs
+
+        if hasattr(inputs, "to"):
+            return inputs.to(self._device)
+
+        return {
+            key: value.to(self._device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
     
     def load_model(self):
         """Load Heron VLM model and processor"""
@@ -193,6 +219,9 @@ class HeronAnnotatorWithTrajectory:
             
             if not USE_GPU or self._device.type == "cpu":
                 self._model = self._model.to(self._device)
+
+            if self.uses_device_map:
+                logger.info("Model uses Accelerate device_map; processor outputs will be kept on their original device")
             
             self._model.eval()
             logger.info("Model loaded successfully")
@@ -509,14 +538,16 @@ class HeronAnnotatorWithTrajectory:
                     images=frames_with_trajectory,
                     padding=True,
                     return_tensors="pt"
-                ).to(self.device)
+                )
             else:
                 # Heron format
                 inputs = self.processor(
                     text=prompt_text,
                     images=frames_with_trajectory,
                     return_tensors="pt"
-                ).to(self.device)
+                )
+
+            inputs = self.prepare_inputs_for_generation(inputs)
             
             # Generate prediction
             with torch.no_grad():
