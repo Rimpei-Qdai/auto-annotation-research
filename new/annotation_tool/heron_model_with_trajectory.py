@@ -149,23 +149,81 @@ class HeronAnnotatorWithTrajectory:
         device_map = getattr(self._model, "hf_device_map", None)
         return isinstance(device_map, dict) and len(device_map) > 0
 
+    def _resolve_device_spec(self, device_spec) -> Optional[torch.device]:
+        """Normalize device specs from Accelerate / torch into torch.device."""
+        if isinstance(device_spec, torch.device):
+            return device_spec
+
+        if isinstance(device_spec, int):
+            return torch.device(f"cuda:{device_spec}")
+
+        if isinstance(device_spec, str):
+            if device_spec in {"cpu", "mps", "cuda"}:
+                return torch.device(device_spec)
+            if device_spec.startswith(("cuda:", "mps:")):
+                return torch.device(device_spec)
+
+        return None
+
+    @property
+    def generation_device(self) -> Optional[torch.device]:
+        """
+        Device where text inputs should land before `generate()`.
+
+        For Qwen2-VL, `input_ids` must match the device of the input embedding
+        layer. When the model has been partially dispatched, `model.device` can
+        be misleading, so we inspect the embedding weights first.
+        """
+        if self._model is None:
+            return self._device
+
+        try:
+            embedding = self._model.get_input_embeddings()
+            if embedding is not None:
+                if hasattr(embedding, "weight"):
+                    return embedding.weight.device
+                first_param = next(embedding.parameters(), None)
+                if first_param is not None:
+                    return first_param.device
+        except Exception:
+            pass
+
+        device_map = getattr(self._model, "hf_device_map", None)
+        if isinstance(device_map, dict):
+            for module_name in (
+                "model.embed_tokens",
+                "embed_tokens",
+                "transformer.wte",
+                "language_model.model.embed_tokens",
+            ):
+                if module_name in device_map:
+                    resolved = self._resolve_device_spec(device_map[module_name])
+                    if resolved is not None:
+                        return resolved
+
+            for mapped_device in device_map.values():
+                resolved = self._resolve_device_spec(mapped_device)
+                if resolved is not None:
+                    return resolved
+
+        try:
+            return next(self._model.parameters()).device
+        except StopIteration:
+            return self._device
+
     def prepare_inputs_for_generation(self, inputs):
         """
-        Align processor outputs with the model placement strategy.
-
-        When the model is loaded with `device_map`, Accelerate manages tensor
-        dispatch internally. Manually moving inputs to `self._device` can cause
-        CPU/CUDA mismatches at the embedding layer, so those inputs must remain
-        on their original device.
+        Align processor outputs with the actual embedding device used by the model.
         """
-        if self.uses_device_map:
+        target_device = self.generation_device
+        if target_device is None:
             return inputs
 
         if hasattr(inputs, "to"):
-            return inputs.to(self._device)
+            return inputs.to(target_device)
 
         return {
-            key: value.to(self._device) if hasattr(value, "to") else value
+            key: value.to(target_device) if hasattr(value, "to") else value
             for key, value in inputs.items()
         }
     
@@ -191,24 +249,28 @@ class HeronAnnotatorWithTrajectory:
             
             # Check if Qwen2-VL model
             is_qwen = "qwen" in HERON_MODEL_ID.lower()
+            load_with_explicit_device = self._device.type != "cpu"
+
+            if load_with_explicit_device:
+                logger.info(
+                    "Loading model onto a single target device to avoid mixed CPU/CUDA placement during generation"
+                )
             
             if is_qwen:
                 # Qwen2-VL specific loading
                 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
                 self._model = Qwen2VLForConditionalGeneration.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=TORCH_DTYPE,
-                    device_map="auto" if USE_GPU else None
+                    torch_dtype=TORCH_DTYPE
                 )
                 self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
-                logger.info(f"Qwen2-VL model loaded with multi-frame support (memory optimized)")
+                logger.info("Qwen2-VL model loaded with multi-frame support")
             else:
                 # Standard Heron model loading
                 self._model = AutoModelForCausalLM.from_pretrained(
                     HERON_MODEL_ID,
                     torch_dtype=TORCH_DTYPE,
-                    trust_remote_code=True,
-                    device_map="auto" if USE_GPU else None
+                    trust_remote_code=True
                 )
                 self._processor = AutoProcessor.from_pretrained(
                     HERON_MODEL_ID,
@@ -217,11 +279,13 @@ class HeronAnnotatorWithTrajectory:
                 self._is_heron = True
                 logger.info(f"Heron model loaded with multi-frame support")
             
-            if not USE_GPU or self._device.type == "cpu":
+            if self._device is not None:
                 self._model = self._model.to(self._device)
 
             if self.uses_device_map:
-                logger.info("Model uses Accelerate device_map; processor outputs will be kept on their original device")
+                logger.info(f"Model uses Accelerate device_map: {self._model.hf_device_map}")
+
+            logger.info(f"Generation inputs will be placed on: {self.generation_device}")
             
             self._model.eval()
             logger.info("Model loaded successfully")
