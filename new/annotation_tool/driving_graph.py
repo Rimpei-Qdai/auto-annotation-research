@@ -19,6 +19,10 @@ class DrivingConceptGraphBuilder:
     """Build a compact concept graph for downstream driving-action reasoning."""
 
     SPEED_DIFF_THRESHOLD = 0.5
+    STRONG_SPEED_DIFF_THRESHOLD = 1.0
+    SPEED_RATE_THRESHOLD = 0.6
+    STABLE_SPEED_RATE_THRESHOLD = 0.25
+    MAX_RELIABLE_TIME_DIFF_SEC = 4.0
     START_SPEED_THRESHOLD = 5.0
     STRONG_SUPPORT_THRESHOLD = 0.75
     STRONG_MARGIN_THRESHOLD = 0.15
@@ -58,6 +62,8 @@ class DrivingConceptGraphBuilder:
     ) -> Dict[str, Any]:
         speed = float(sensor_data.get("speed", 0.0))
         speed_diff = float(sensor_data.get("speed_diff", 0.0) or 0.0)
+        timestamp_diff_sec = float(sensor_data.get("timestamp_diff_sec", 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get("speed_change_rate", 0.0) or 0.0)
         brake = int(sensor_data.get("brake", 0) or 0)
         gyro_z = float(sensor_data.get("gyro_z", 0.0) or 0.0)
         blinker_r = int(sensor_data.get("blinker_r", 0) or 0)
@@ -73,27 +79,15 @@ class DrivingConceptGraphBuilder:
         direction_change = level1_result.get("direction_change", "STRAIGHT")
         visual_shift = level1_result.get("visual_shift", "NO_SHIFT")
 
-        if speed < SPEED_STOP_THRESHOLD and brake > 0:
-            speed_state = "STOPPED"
-        elif speed < self.START_SPEED_THRESHOLD and (
-            speed_diff > self.SPEED_DIFF_THRESHOLD or speed_trend == "INCREASING"
-        ):
-            speed_state = "STARTING"
-        elif (
-            speed_diff > self.SPEED_DIFF_THRESHOLD
-            or speed_trend == "INCREASING"
-            or acceleration_cause == "DRIVER_ACCEL"
-        ):
-            speed_state = "ACCELERATING"
-        elif (
-            speed_diff < -self.SPEED_DIFF_THRESHOLD
-            or speed_trend == "DECREASING"
-            or acceleration_cause == "DRIVER_BRAKE"
-            or brake > 0
-        ):
-            speed_state = "DECELERATING"
-        else:
-            speed_state = "CONSTANT"
+        speed_state = self._infer_speed_state(
+            speed=speed,
+            speed_diff=speed_diff,
+            timestamp_diff_sec=timestamp_diff_sec,
+            speed_change_rate=speed_change_rate,
+            brake=brake,
+            speed_trend=speed_trend,
+            acceleration_cause=acceleration_cause,
+        )
 
         if blinker_l > 0:
             signal_state = "LEFT"
@@ -137,12 +131,13 @@ class DrivingConceptGraphBuilder:
         else:
             intersection_state = "UNKNOWN"
 
-        if speed < SPEED_STOP_THRESHOLD and brake > 0:
-            stop_likelihood = "HIGH"
-        elif speed < self.START_SPEED_THRESHOLD:
-            stop_likelihood = "MEDIUM"
-        else:
-            stop_likelihood = "LOW"
+        stop_likelihood = self._infer_stop_likelihood(
+            speed=speed,
+            brake=brake,
+            speed_state=speed_state,
+            speed_diff=speed_diff,
+            speed_change_rate=speed_change_rate,
+        )
 
         return {
             "speed_state": speed_state,
@@ -155,6 +150,80 @@ class DrivingConceptGraphBuilder:
             "consistency_check": consistency_check,
             "road_shape": road_shape,
         }
+
+    def _infer_speed_state(
+        self,
+        *,
+        speed: float,
+        speed_diff: float,
+        timestamp_diff_sec: float,
+        speed_change_rate: float,
+        brake: int,
+        speed_trend: str,
+        acceleration_cause: str,
+    ) -> str:
+        has_reliable_rate = 0.0 < timestamp_diff_sec <= self.MAX_RELIABLE_TIME_DIFF_SEC
+        direct_accel = (
+            speed_diff >= self.STRONG_SPEED_DIFF_THRESHOLD
+            or (has_reliable_rate and speed_change_rate >= self.SPEED_RATE_THRESHOLD)
+        )
+        direct_decel = (
+            brake > 0
+            or speed_diff <= -self.STRONG_SPEED_DIFF_THRESHOLD
+            or (has_reliable_rate and speed_change_rate <= -self.SPEED_RATE_THRESHOLD)
+        )
+        near_constant = (
+            abs(speed_diff) <= self.SPEED_DIFF_THRESHOLD
+            and (
+                not has_reliable_rate
+                or abs(speed_change_rate) <= self.STABLE_SPEED_RATE_THRESHOLD
+            )
+            and brake == 0
+        )
+
+        if speed < SPEED_STOP_THRESHOLD and brake > 0 and not direct_accel:
+            return "STOPPED"
+
+        if speed < self.START_SPEED_THRESHOLD and direct_accel and brake == 0:
+            return "STARTING"
+
+        if direct_decel and not direct_accel:
+            return "DECELERATING"
+        if direct_accel and not direct_decel:
+            return "ACCELERATING"
+        if direct_decel and direct_accel:
+            if brake > 0 or speed_diff < 0 or speed_change_rate < 0:
+                return "DECELERATING"
+            return "ACCELERATING"
+
+        if speed_trend == "DECREASING" or acceleration_cause == "DRIVER_BRAKE":
+            return "DECELERATING"
+        if speed_trend == "INCREASING" or acceleration_cause == "DRIVER_ACCEL":
+            return "ACCELERATING"
+        if near_constant:
+            return "CONSTANT"
+        return "CONSTANT"
+
+    def _infer_stop_likelihood(
+        self,
+        *,
+        speed: float,
+        brake: int,
+        speed_state: str,
+        speed_diff: float,
+        speed_change_rate: float,
+    ) -> str:
+        if speed < SPEED_STOP_THRESHOLD and brake > 0 and speed_state == "STOPPED":
+            return "HIGH"
+
+        if (
+            speed < self.START_SPEED_THRESHOLD
+            and speed_state == "DECELERATING"
+            and (brake > 0 or speed_diff < -self.SPEED_DIFF_THRESHOLD or speed_change_rate < 0)
+        ):
+            return "MEDIUM"
+
+        return "LOW"
 
     def _build_edges(self, concepts: Dict[str, Any]) -> List[Dict[str, str]]:
         edges: List[Dict[str, str]] = []
@@ -240,8 +309,8 @@ class DrivingConceptGraphBuilder:
 
         if stop_likelihood == "HIGH":
             add(4, 0.75, "速度≈0かつブレーキONで停止候補")
-        elif stop_likelihood == "MEDIUM" and brake > 0:
-            add(4, 0.35, "低速かつブレーキONで停止寄り")
+        elif stop_likelihood == "MEDIUM":
+            add(4, 0.25, "低速の減速継続で停止寄り")
 
         if speed_state == "STARTING":
             add(5, 0.75, "低速からの加速で発進候補")
@@ -253,7 +322,7 @@ class DrivingConceptGraphBuilder:
             add(3, 0.20, "ブレーキONで減速候補を補強")
 
         if speed_state == "CONSTANT" and direction == "STRAIGHT":
-            add(1, 0.65, "直進かつ速度変化が小さい")
+            add(1, 0.75, "直進かつ速度変化が小さい")
         if signal == "OFF" and lane_crossing == "NONE" and intersection != "YES":
             add(1, 0.15, "旋回・車線変更の証拠が弱い")
 

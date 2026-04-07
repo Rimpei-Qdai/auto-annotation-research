@@ -296,41 +296,110 @@ class HeronAnnotatorWithTrajectory:
         try:
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_duration = total_frames / fps if fps > 0 else 0
-            
-            # Calculate frame indices
-            start_frame = int(start_time * fps)
-            available_duration = min(duration, video_duration - start_time)
-            end_frame = min(int((start_time + available_duration) * fps), total_frames)
-            
-            if end_frame <= start_frame:
-                end_frame = min(start_frame + 2, total_frames)
-            
-            frame_indices = np.linspace(
-                start_frame, 
-                end_frame - 1, 
-                num_frames, 
-                dtype=int
+            frame_indices = self._compute_frame_indices(
+                fps=fps,
+                total_frames=total_frames,
+                start_time=start_time,
+                duration=duration,
+                num_frames=num_frames,
             )
             
             frames = []
+            actual_indices = []
             for frame_idx in frame_indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                
-                if ret:
-                    # Convert BGR to RGB
+                actual_idx, frame = self._read_frame_with_fallback(cap, frame_idx, total_frames)
+
+                if frame is not None:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_image = Image.fromarray(frame_rgb)
                     frames.append(pil_image)
+                    actual_indices.append(actual_idx)
                 else:
                     logger.warning(f"Failed to read frame {frame_idx}")
             
             logger.info(f"Extracted {len(frames)} frames from {video_path}")
-            return frames, frame_indices.tolist()
+            return frames, actual_indices
             
         finally:
             cap.release()
+
+    def _compute_frame_indices(
+        self,
+        *,
+        fps: float,
+        total_frames: int,
+        start_time: float,
+        duration: float,
+        num_frames: int,
+    ) -> List[int]:
+        if total_frames <= 0:
+            return []
+        if fps <= 0:
+            return [0] * num_frames
+
+        video_duration = total_frames / fps
+        safe_duration = max(duration, num_frames / fps)
+        window_end = min(max(start_time, 0.0) + safe_duration, video_duration)
+        window_start = max(0.0, window_end - safe_duration)
+
+        start_frame = max(0, min(int(window_start * fps), total_frames - 1))
+        end_frame = max(start_frame + 1, min(int(window_end * fps), total_frames))
+        base_indices = np.linspace(start_frame, end_frame - 1, num_frames, dtype=int).tolist()
+
+        ordered_unique: List[int] = []
+        seen = set()
+        for frame_idx in base_indices:
+            clamped = max(0, min(int(frame_idx), total_frames - 1))
+            if clamped not in seen:
+                seen.add(clamped)
+                ordered_unique.append(clamped)
+
+        radius = 1
+        while len(ordered_unique) < num_frames and len(seen) < total_frames:
+            added = False
+            for base_idx in base_indices:
+                for offset in (-radius, radius):
+                    candidate = base_idx + offset
+                    if 0 <= candidate < total_frames and candidate not in seen:
+                        seen.add(candidate)
+                        ordered_unique.append(candidate)
+                        added = True
+                        if len(ordered_unique) >= num_frames:
+                            break
+                if len(ordered_unique) >= num_frames:
+                    break
+            if not added:
+                break
+            radius += 1
+
+        ordered_unique.sort()
+        if not ordered_unique:
+            ordered_unique = [start_frame]
+        while len(ordered_unique) < num_frames:
+            ordered_unique.append(ordered_unique[-1])
+
+        return ordered_unique[:num_frames]
+
+    def _read_frame_with_fallback(
+        self,
+        cap: cv2.VideoCapture,
+        frame_idx: int,
+        total_frames: int,
+        max_offset: int = 2,
+    ) -> Tuple[int, Optional[np.ndarray]]:
+        candidate_indices = [frame_idx]
+        for offset in range(1, max_offset + 1):
+            candidate_indices.extend([frame_idx - offset, frame_idx + offset])
+
+        for candidate_idx in candidate_indices:
+            if not (0 <= candidate_idx < total_frames):
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, candidate_idx)
+            ret, frame = cap.read()
+            if ret:
+                return candidate_idx, frame
+
+        return frame_idx, None
     
     def draw_trajectory_on_frames(
         self,

@@ -27,6 +27,12 @@ class L2MCoTPipeline:
     Least-to-Most Prompting + Chain-of-Thought Pipeline for Heron
     複数回のVLM推論を組み合わせて段階的な分析を行う
     """
+
+    SPEED_DIFF_THRESHOLD = 0.5
+    STRONG_SPEED_DIFF_THRESHOLD = 1.0
+    SPEED_RATE_THRESHOLD = 0.6
+    STABLE_SPEED_RATE_THRESHOLD = 0.25
+    MAX_RELIABLE_TIME_DIFF_SEC = 4.0
     
     def __init__(self, frame_generator: FramePromptGenerator):
         """
@@ -235,9 +241,13 @@ class L2MCoTPipeline:
         brake = sensor_data.get('brake', 0)
         blinker_r = sensor_data.get('blinker_r', 0)
         blinker_l = sensor_data.get('blinker_l', 0)
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        timestamp_diff_sec = float(sensor_data.get('timestamp_diff_sec', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
 
         brake_status = 'ON' if brake > 0 else 'OFF'
         blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
+        motion_summary = self._format_motion_summary(sensor_data)
 
         # ジャイロ閾値超過時の警告メッセージ（案1-2）
         gyro_warning = ""
@@ -267,7 +277,11 @@ class L2MCoTPipeline:
 - 横加速度: {acc_y:.2f} m/s²
 - ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {brake_status}
-- ウィンカー: {blinker_status}{gyro_warning}{acc_x_warning}
+- ウィンカー: {blinker_status}
+- 直前サンプルとの差分: {speed_diff:+.1f} km/h
+- サンプル間隔: {timestamp_diff_sec:.2f} s
+- 時間正規化した速度変化率: {speed_change_rate:+.2f} km/h/s
+- センサー由来の運動要約: {motion_summary}{gyro_warning}{acc_x_warning}
 
 【タスク】
 以下の分析を段階的に行ってください。
@@ -311,14 +325,14 @@ class L2MCoTPipeline:
             
             if parsed is None:
                 logger.warning(f"Level 2 JSON parse failed. Raw output: {raw_output[:300]}")
-                return {
+                return self._normalize_level2_result(sensor_data, {
                     'reasoning': raw_output[:500],
                     'acceleration_cause': 'MIXED',
                     'speed_trend': 'STABLE',
                     'consistency_check': 'CONSISTENT'
-                }
+                })
             
-            return parsed
+            return self._normalize_level2_result(sensor_data, parsed)
             
         except Exception as e:
             logger.error(f"Level 2 推論エラー: {e}", exc_info=True)
@@ -347,9 +361,16 @@ class L2MCoTPipeline:
         # CRITICAL: Check for stopped vehicle first
         speed = sensor_data.get('speed', 0)
         brake = sensor_data.get('brake', 0)
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
+        motion_observation = self._build_motion_observation(sensor_data)
         
-        # If Speed=0 and Brake=ON, it's a STOP (category 4: 停止)
-        if speed == 0 and brake > 0:
+        # 完全停止に見えても、直前まで強い減速が続いている場合は減速との境界事例として扱う
+        if (
+            speed < SPEED_STOP_THRESHOLD
+            and brake > 0
+            and motion_observation.get('trend') != 'DECREASING'
+        ):
             logger.info("[Level 3] STOP detected: Speed=0, Brake=ON → Forcing category 4 (停止)")
             return {
                 'final_reasoning': 'Vehicle is completely stopped (Speed=0km/h) with brake engaged.',
@@ -361,7 +382,6 @@ class L2MCoTPipeline:
         gyro_z = sensor_data.get('gyro_z', 0)
         blinker_r = sensor_data.get('blinker_r', 0)
         blinker_l = sensor_data.get('blinker_l', 0)
-        speed_diff = sensor_data.get('speed_diff', None)
         blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
 
         speed_diff_text = ""
@@ -372,6 +392,12 @@ class L2MCoTPipeline:
                 speed_diff_text = f"\n- 速度変化量: {speed_diff:.1f} km/h（減速傾向）"
 
         sensor_hints_section = f"\n\n◆ センサーヒント（事前フィルタリング）\n{sensor_hints}" if sensor_hints else ""
+        motion_section = (
+            "\n\n◆ センサー由来の運動要約\n"
+            f"- direct_motion_trend: {motion_observation.get('trend', 'UNKNOWN')}\n"
+            f"- direct_motion_cause: {motion_observation.get('cause', 'UNKNOWN')}\n"
+            f"- direct_motion_reason: {motion_observation.get('reason', '情報なし')}"
+        )
         graph_section = (
             f"\n\n◆ Graph 概念要約\n{graph_result.get('summary_for_prompt', '')}"
             f"\n\n◆ Graph 上位候補\n{graph_result.get('candidate_summary', '')}"
@@ -401,10 +427,11 @@ class L2MCoTPipeline:
 ◆ Level 2: 物理法則との整合性
 - 加速度の原因: {level2_result.get('acceleration_cause')}
 - 速度トレンド: {level2_result.get('speed_trend')}
-{graph_section}
+{motion_section}{graph_section}
 
 ◆ センサーデータ
 - 現在速度: {speed:.1f} km/h{speed_diff_text}
+- 時間正規化した速度変化率: {speed_change_rate:+.2f} km/h/s
 - ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {'ON' if brake > 0 else 'OFF'}
 - ウィンカー: {blinker_status}{sensor_hints_section}
@@ -439,6 +466,7 @@ class L2MCoTPipeline:
 4. **加速・減速の判定**:
    - 加速度の原因がDRIVER_BRAKEの場合 → カテゴリ3（減速）
    - 速度変化量が大きい場合 → カテゴリ2（加速）またはカテゴリ3（減速）
+   - `direct_motion_trend` が INCREASING / DECREASING のときは、その符号を優先して整合するカテゴリを選ぶ
 
 5. **Graph 概念を必ず確認**:
    - `Graph 上位候補` は中間概念から構成された候補である
@@ -449,6 +477,10 @@ class L2MCoTPipeline:
    - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
    - 速度変化（2,3）の可能性を除外した後に選択
    - 停止・発進（4,5）の可能性を除外した後に選択
+
+7. **停止（4）の抑制ルール**:
+   - 速度が 1 km/h を超えていて、かつブレーキが OFF の場合は停止（4）を選ばない
+   - Graph や direct_motion_trend が減速・旋回を示している場合、停止よりそちらを優先する
 
 【タスク】
 上記の分析結果とルールを総合的に考慮して、最も適切なカテゴリを1つ選択してください。
@@ -628,6 +660,81 @@ class L2MCoTPipeline:
                 return f"{field_name}: {value}"
 
         return None
+
+    def _build_motion_observation(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        timestamp_diff_sec = float(sensor_data.get('timestamp_diff_sec', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
+        brake = int(sensor_data.get('brake', 0) or 0)
+
+        has_reliable_rate = 0.0 < timestamp_diff_sec <= self.MAX_RELIABLE_TIME_DIFF_SEC
+        direct_accel = (
+            speed_diff >= self.STRONG_SPEED_DIFF_THRESHOLD
+            or (has_reliable_rate and speed_change_rate >= self.SPEED_RATE_THRESHOLD)
+        )
+        direct_decel = (
+            brake > 0
+            or speed_diff <= -self.STRONG_SPEED_DIFF_THRESHOLD
+            or (has_reliable_rate and speed_change_rate <= -self.SPEED_RATE_THRESHOLD)
+        )
+
+        if direct_decel and not direct_accel:
+            cause = 'DRIVER_BRAKE' if brake > 0 else 'MIXED'
+            reason = 'brake=ON' if brake > 0 else 'negative speed delta / rate'
+            return {'trend': 'DECREASING', 'cause': cause, 'reason': reason}
+
+        if direct_accel and not direct_decel:
+            return {'trend': 'INCREASING', 'cause': 'DRIVER_ACCEL', 'reason': 'positive speed delta / rate'}
+
+        if (
+            abs(speed_diff) <= self.SPEED_DIFF_THRESHOLD
+            and (not has_reliable_rate or abs(speed_change_rate) <= self.STABLE_SPEED_RATE_THRESHOLD)
+            and brake == 0
+        ):
+            return {'trend': 'STABLE', 'cause': 'MIXED', 'reason': 'small speed delta / rate'}
+
+        return {'trend': None, 'cause': None, 'reason': 'sensor evidence weak'}
+
+    def _format_motion_summary(self, sensor_data: Dict[str, Any]) -> str:
+        motion = self._build_motion_observation(sensor_data)
+        trend = motion.get('trend') or 'UNKNOWN'
+        cause = motion.get('cause') or 'UNKNOWN'
+        reason = motion.get('reason') or 'unknown'
+        return f"{trend} / {cause} ({reason})"
+
+    def _normalize_level2_result(
+        self,
+        sensor_data: Dict[str, Any],
+        level2_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized = dict(level2_result)
+        motion = self._build_motion_observation(sensor_data)
+        overrides = []
+
+        observed_trend = motion.get('trend')
+        observed_cause = motion.get('cause')
+
+        if observed_trend in {'INCREASING', 'DECREASING', 'STABLE'}:
+            original_trend = normalized.get('speed_trend', 'STABLE')
+            if original_trend != observed_trend:
+                overrides.append(f"speed_trend {original_trend}->{observed_trend}")
+            normalized['speed_trend'] = observed_trend
+
+        if observed_cause in {'DRIVER_ACCEL', 'DRIVER_BRAKE'}:
+            original_cause = normalized.get('acceleration_cause', 'MIXED')
+            if original_cause != observed_cause:
+                overrides.append(f"acceleration_cause {original_cause}->{observed_cause}")
+            normalized['acceleration_cause'] = observed_cause
+
+        if overrides:
+            reasoning = normalized.get('reasoning', '')
+            override_text = '; '.join(overrides)
+            normalized['reasoning'] = (
+                f"{reasoning} | sensor_normalized: {override_text}"
+                if reasoning else f"sensor_normalized: {override_text}"
+            )
+
+        return normalized
     
     def _get_sensor_hints(self, sensor_data: Dict[str, Any]) -> str:
         """
@@ -683,9 +790,16 @@ class L2MCoTPipeline:
         speed = sensor_data.get('speed', 0)
         gyro_z = abs(sensor_data.get('gyro_z', 0))
         brake = sensor_data.get('brake', 0)
+        motion_observation = self._build_motion_observation(sensor_data)
+        strong_candidate = graph_result.get("strong_candidate") if graph_result else None
 
         # ルール1: 速度0かつブレーキON → 停止(4)に強制補正
-        if speed < SPEED_STOP_THRESHOLD and brake > 0 and predicted_label != 4:
+        if (
+            speed < SPEED_STOP_THRESHOLD
+            and brake > 0
+            and motion_observation.get('trend') != 'DECREASING'
+            and predicted_label != 4
+        ):
             logger.info(
                 f"[PostProcess] Rule1: speed={speed:.1f}, brake={brake} → force category 4 (停止)"
             )
@@ -701,7 +815,6 @@ class L2MCoTPipeline:
 
         # ルール3: Graph が強い非 1/4 候補を示し、かつ 1/4 への偏りが疑われる場合は補正
         if graph_result:
-            strong_candidate = graph_result.get("strong_candidate")
             label_support = graph_result.get("label_support", {})
             if strong_candidate:
                 strong_id = strong_candidate["category_id"]
@@ -724,6 +837,30 @@ class L2MCoTPipeline:
                         margin,
                     )
                     return strong_id
+
+        # ルール4: 停止予測だが停止条件を満たさない場合は stop bias を補正
+        if predicted_label == 4 and (speed > SPEED_STOP_THRESHOLD or brake == 0):
+            if strong_candidate and strong_candidate["category_id"] != 4 and strong_candidate["score"] >= 0.55:
+                logger.info(
+                    "[PostProcess] Rule4(Graph): correcting stop bias %s -> %s",
+                    predicted_label,
+                    strong_candidate["category_id"],
+                )
+                return strong_candidate["category_id"]
+            if motion_observation.get('trend') == 'DECREASING':
+                return 3
+            if motion_observation.get('trend') == 'STABLE' and gyro_z <= GYRO_THRESHOLD:
+                return 1
+
+        # ルール5: 加速/減速が direct_motion_trend と逆なら補正
+        if predicted_label == 2 and motion_observation.get('trend') == 'DECREASING':
+            if strong_candidate and strong_candidate["category_id"] != 2 and strong_candidate["score"] >= 0.55:
+                return strong_candidate["category_id"]
+            return 3
+        if predicted_label == 3 and motion_observation.get('trend') == 'INCREASING':
+            if strong_candidate and strong_candidate["category_id"] != 3 and strong_candidate["score"] >= 0.55:
+                return strong_candidate["category_id"]
+            return 2
 
         return predicted_label
 
