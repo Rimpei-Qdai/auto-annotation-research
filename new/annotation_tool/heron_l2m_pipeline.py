@@ -13,10 +13,11 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from PIL import Image
-import torch
 import re
 
 from config import GYRO_THRESHOLD, ACC_X_THRESHOLD, SPEED_STOP_THRESHOLD, FEW_SHOT_EXAMPLES
+from driving_graph import DrivingConceptGraphBuilder
+from vlm_runtime import FramePromptGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +28,16 @@ class L2MCoTPipeline:
     複数回のVLM推論を組み合わせて段階的な分析を行う
     """
     
-    def __init__(self, heron_annotator):
+    def __init__(self, frame_generator: FramePromptGenerator):
         """
         Args:
-            heron_annotator: HeronAnnotatorのインスタンス（既にモデルがロード済み）
+            frame_generator:
+                フレーム+プロンプトからテキストを返す生成器。
+                GPU/processor の詳細はこの層に隠蔽する。
         """
-        self.annotator = heron_annotator
+        self.frame_generator = frame_generator
         self.conversation_history = []
+        self.graph_builder = DrivingConceptGraphBuilder()
     
     def analyze_with_l2m(
         self,
@@ -68,31 +72,49 @@ class L2MCoTPipeline:
         level2_result = self._level2_physics(frames, sensor_data, level1_result)
         logger.info(f"Level 2 完了: {level2_result}")
 
+        # Graph: concept extraction + label support
+        logger.info("--- Graph: Concept Structuring ---")
+        graph_result = self.graph_builder.build(level1_result, level2_result, sensor_data)
+        logger.info(f"Graph concepts: {graph_result['concepts']}")
+        logger.info(f"Graph top candidates: {graph_result['top_candidates']}")
+
         # Level 3: Final classification
         logger.info("--- Level 3: Final Classification ---")
         level3_result = self._level3_classification(
-            frames, sensor_data, level1_result, level2_result, sensor_hints
+            frames, sensor_data, level1_result, level2_result, graph_result, sensor_hints
         )
         logger.info(f"Level 3 完了: {level3_result}")
 
-        # 後処理ルール適用（案4）
-        raw_category = level3_result.get('category_id', 0)
-        final_category = self._post_process_label(raw_category, sensor_data)
-        if final_category is None:
-            # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
-            logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
-            final_category = raw_category
-        if final_category != raw_category:
-            logger.info(f"[PostProcess] Label corrected: {raw_category} → {final_category}")
+        pipeline_error = self._extract_pipeline_error(
+            level1_result, level2_result, level3_result
+        )
+        if pipeline_error:
+            logger.warning("[L2M+CoT] Generation error detected in pipeline: %s", pipeline_error)
+            final_category = None
+            confidence = 0.0
+        else:
+            # 後処理ルール適用（案4）
+            raw_category = level3_result.get('category_id', 0)
+            final_category = self._post_process_label(raw_category, sensor_data, graph_result)
+            if final_category is None:
+                # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
+                logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
+                final_category = raw_category
+            if final_category != raw_category:
+                logger.info(f"[PostProcess] Label corrected: {raw_category} → {final_category}")
+            confidence = level3_result.get('confidence', 0.5)
 
         logger.info("=== L2M+CoT Analysis Complete ===")
 
         return {
             'level1': level1_result,
             'level2': level2_result,
+            'graph': graph_result,
             'level3': level3_result,
             'final_category': final_category,
-            'confidence': level3_result.get('confidence', 0.5)
+            'confidence': confidence,
+            'status': 'failed' if pipeline_error else 'success',
+            'error': pipeline_error,
         }
     
     def _level1_geometry(self, frames: List[Image.Image]) -> Dict[str, Any]:
@@ -313,6 +335,7 @@ class L2MCoTPipeline:
         sensor_data: Dict[str, Any],
         level1_result: Dict[str, Any],
         level2_result: Dict[str, Any],
+        graph_result: Dict[str, Any],
         sensor_hints: str = ""
     ) -> Dict[str, Any]:
         """
@@ -349,6 +372,18 @@ class L2MCoTPipeline:
                 speed_diff_text = f"\n- 速度変化量: {speed_diff:.1f} km/h（減速傾向）"
 
         sensor_hints_section = f"\n\n◆ センサーヒント（事前フィルタリング）\n{sensor_hints}" if sensor_hints else ""
+        graph_section = (
+            f"\n\n◆ Graph 概念要約\n{graph_result.get('summary_for_prompt', '')}"
+            f"\n\n◆ Graph 上位候補\n{graph_result.get('candidate_summary', '')}"
+        )
+        strong_candidate = graph_result.get("strong_candidate")
+        strong_candidate_rule = ""
+        if strong_candidate:
+            strong_candidate_rule = (
+                f"\n- Graph の強候補: "
+                f"{strong_candidate['category_id']}（{strong_candidate['category_name']}）"
+                f" score={strong_candidate['score']:.2f}"
+            )
 
         prompt = f"""あなたは自動運転データの分析エキスパートです。これまでの分析結果を統合して、車両の運転行動を最終的に分類してください。
 
@@ -366,6 +401,7 @@ class L2MCoTPipeline:
 ◆ Level 2: 物理法則との整合性
 - 加速度の原因: {level2_result.get('acceleration_cause')}
 - 速度トレンド: {level2_result.get('speed_trend')}
+{graph_section}
 
 ◆ センサーデータ
 - 現在速度: {speed:.1f} km/h{speed_diff_text}
@@ -404,7 +440,12 @@ class L2MCoTPipeline:
    - 加速度の原因がDRIVER_BRAKEの場合 → カテゴリ3（減速）
    - 速度変化量が大きい場合 → カテゴリ2（加速）またはカテゴリ3（減速）
 
-5. **等速走行（1）は最後の手段**:
+5. **Graph 概念を必ず確認**:
+   - `Graph 上位候補` は中間概念から構成された候補である
+   - 特に、等速走行(1)や停止(4)を選ぶ前に Graph 候補との矛盾がないか確認する
+   - 右左折・車線変更・減速の候補が Graph に強く出ている場合は優先的に検討する{strong_candidate_rule}
+
+6. **等速走行（1）は最後の手段**:
    - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
    - 速度変化（2,3）の可能性を除外した後に選択
    - 停止・発進（4,5）の可能性を除外した後に選択
@@ -474,61 +515,13 @@ class L2MCoTPipeline:
         Leverages existing HeronAnnotator internal methods
         for multi-frame input inference.
         """
-        # モデルタイプの判定
-        is_qwen = "qwen" in self.annotator.model.__class__.__name__.lower()
-        
         try:
-            if is_qwen:
-                # Qwen2-VL format
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            *[{"type": "image", "image": frame} for frame in frames],
-                            {"type": "text", "text": prompt}
-                        ]
-                    }
-                ]
-                text_prompt = self.annotator.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                inputs = self.annotator.processor(
-                    text=[text_prompt],
-                    images=frames,
-                    padding=True,
-                    return_tensors="pt"
-                )
-            else:
-                # Heron format - Processor handles text and image separately
-                inputs = self.annotator.processor(
-                    images=frames,
-                    text=[prompt],
-                    return_tensors="pt",
-                    padding=True
-                )
-            
-            # Move to device
-            inputs = {k: v.to(self.annotator.device) for k, v in inputs.items()}
-            
-            # Generate
-            logger.info(f"Generating with {len(frames)} frames, prompt length: {len(prompt)} chars")
-            with torch.no_grad():
-                output_ids = self.annotator.model.generate(
-                    **inputs,
-                    max_new_tokens=512,  # 長いプロンプト対応のため300→512に増加
-                    do_sample=False  # Greedy decoding for reliability
-                )
-            
-            # Decode
-            output_text = self.annotator.processor.batch_decode(
-                output_ids,
-                skip_special_tokens=True
-            )[0]
-            
-            # Remove prompt part (some models include the prompt)
-            if prompt in output_text:
-                output_text = output_text.replace(prompt, "").strip()
-            
+            output_text = self.frame_generator.generate_text(
+                frames,
+                prompt,
+                max_new_tokens=512,  # 長いプロンプト対応のため300→512に増加
+                do_sample=False,  # Greedy decoding for reliability
+            )
             logger.debug(f"Generated output (first 200 chars): {output_text[:200]}")
             
             return output_text
@@ -614,6 +607,27 @@ class L2MCoTPipeline:
         
         # Default is other
         return 0
+
+    def _extract_pipeline_error(
+        self,
+        level1_result: Dict[str, Any],
+        level2_result: Dict[str, Any],
+        level3_result: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Detect hard generation failures that were converted into default values.
+        """
+        checks = [
+            ("level1.reasoning", level1_result.get("reasoning")),
+            ("level2.reasoning", level2_result.get("reasoning")),
+            ("level3.final_reasoning", level3_result.get("final_reasoning")),
+        ]
+
+        for field_name, value in checks:
+            if isinstance(value, str) and value.startswith("Error:"):
+                return f"{field_name}: {value}"
+
+        return None
     
     def _get_sensor_hints(self, sensor_data: Dict[str, Any]) -> str:
         """
@@ -654,7 +668,12 @@ class L2MCoTPipeline:
 
         return "\n".join(hints)
 
-    def _post_process_label(self, predicted_label: int, sensor_data: Dict[str, Any]) -> Optional[int]:
+    def _post_process_label(
+        self,
+        predicted_label: int,
+        sensor_data: Dict[str, Any],
+        graph_result: Optional[Dict[str, Any]] = None
+    ) -> Optional[int]:
         """
         VLM予測とセンサーデータが著しく矛盾する場合にルールベースで補正（案4）
 
@@ -679,6 +698,32 @@ class L2MCoTPipeline:
                 "Contradiction detected."
             )
             return None
+
+        # ルール3: Graph が強い非 1/4 候補を示し、かつ 1/4 への偏りが疑われる場合は補正
+        if graph_result:
+            strong_candidate = graph_result.get("strong_candidate")
+            label_support = graph_result.get("label_support", {})
+            if strong_candidate:
+                strong_id = strong_candidate["category_id"]
+                strong_score = float(strong_candidate["score"])
+                predicted_score = float(label_support.get(predicted_label, 0.0))
+                margin = strong_score - predicted_score
+
+                if (
+                    predicted_label == 1
+                    and strong_id not in {1, 4}
+                    and strong_score >= 0.80
+                    and margin >= 0.25
+                ):
+                    logger.info(
+                        "[PostProcess] Rule3(Graph): correcting biased label %s -> %s "
+                        "(strong_score=%.2f, margin=%.2f)",
+                        predicted_label,
+                        strong_id,
+                        strong_score,
+                        margin,
+                    )
+                    return strong_id
 
         return predicted_label
 

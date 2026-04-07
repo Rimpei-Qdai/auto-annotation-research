@@ -2,6 +2,8 @@
 
 import os
 import json
+import bisect
+import time
 import pandas as pd
 import logging
 from datetime import datetime, timedelta, timezone
@@ -121,49 +123,119 @@ def extract_video_timestamp(filename):
         return datetime.strptime(timestamp_str, '%Y%m%d%H%M%S')
     return None
 
+
+# taxi_idごとの動画インデックスをキャッシュして、ページ表示の待ち時間を削減
+_video_index_cache = {}
+
+
+def _build_video_index_for_taxi(taxi_id):
+    """指定タクシーの動画インデックスを構築して返す。"""
+    taxi_id = str(taxi_id)
+    taxi_folder = os.path.join(VIDEO_DIR, taxi_id)
+    if not os.path.isdir(taxi_folder):
+        return None
+
+    indexed = []
+    try:
+        for entry in os.scandir(taxi_folder):
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if not name.startswith('EVT_') or not name.endswith('.mp4'):
+                continue
+
+            if name.endswith('_FRONT.mp4'):
+                base_name = name[:-10]
+            elif name.endswith('_INNER.mp4'):
+                base_name = name[:-10]
+            else:
+                continue
+
+            video_timestamp = extract_video_timestamp(name)
+            if video_timestamp is None:
+                continue
+            indexed.append((video_timestamp, base_name))
+    except OSError as e:
+        logger.warning(f"Failed to scan taxi folder {taxi_folder}: {e}")
+        return None
+
+    if not indexed:
+        return None
+
+    # 同一base_nameが重複するため、timestamp+base_nameでユニーク化
+    indexed = sorted(set(indexed), key=lambda x: x[0])
+    timestamps = [item[0] for item in indexed]
+    base_names = [item[1] for item in indexed]
+
+    result = {
+        'taxi_folder': taxi_folder,
+        'timestamps': timestamps,
+        'base_names': base_names,
+    }
+    _video_index_cache[taxi_id] = result
+    logger.info(f"Built video index for taxi_id={taxi_id}: {len(base_names)} entries")
+    return result
+
+
+def _get_video_index_for_taxi(taxi_id):
+    taxi_id = str(taxi_id)
+    if taxi_id in _video_index_cache:
+        return _video_index_cache[taxi_id]
+    return _build_video_index_for_taxi(taxi_id)
+
 def find_matching_videos(taxi_id, data_timestamp_unix_ms):
     """データのタイムスタンプに対応する動画を検索"""
+    taxi_id = str(taxi_id)
     data_time = unix_ms_to_datetime(data_timestamp_unix_ms)
-    taxi_folder = os.path.join(VIDEO_DIR, taxi_id)
-    
-    if not os.path.exists(taxi_folder):
+
+    video_index = _get_video_index_for_taxi(taxi_id)
+    if video_index is None:
         return None
-    
-    files = sorted([f for f in os.listdir(taxi_folder) 
-                    if f.endswith('.mp4') and f.startswith('EVT')])
-    
-    for filename in files:
-        video_timestamp = extract_video_timestamp(filename)
-        if video_timestamp is None:
-            continue
-        
+
+    taxi_folder = video_index['taxi_folder']
+    timestamps = video_index['timestamps']
+    base_names = video_index['base_names']
+    if not timestamps:
+        return None
+
+    # 条件: data_time が [video_timestamp-15s, video_timestamp+15s] に入る
+    lower = data_time - timedelta(seconds=15)
+    upper = data_time + timedelta(seconds=15)
+    left = bisect.bisect_left(timestamps, lower)
+    right = bisect.bisect_right(timestamps, upper)
+
+    for i in range(left, right):
+        video_timestamp = timestamps[i]
+        base_name = base_names[i]
+
         # 動画開始時刻 = タイムスタンプ - 15秒
         video_start = video_timestamp - timedelta(seconds=15)
         video_end = video_start + timedelta(seconds=30)  # Extended from 20 to 30 seconds
-        
+
         if video_start <= data_time <= video_end:
             offset = (data_time - video_start).total_seconds()
-            
-            base_name = filename.replace('_FRONT.mp4', '').replace('_INNER.mp4', '')
+
             front_file = f"{base_name}_FRONT.mp4"
             inner_file = f"{base_name}_INNER.mp4"
-            
+
             front_path = os.path.join(taxi_folder, front_file)
             inner_path = os.path.join(taxi_folder, inner_file)
-            
+
+            has_front = os.path.exists(front_path)
+            has_inner = os.path.exists(inner_path)
             result = {
                 'offset_seconds': offset,
                 'video_start_time': video_start,
                 'matched_timestamp': video_timestamp,
-                'front': f"/videos/{taxi_id}/{front_file}" if os.path.exists(front_path) else None,
-                'inner': f"/videos/{taxi_id}/{inner_file}" if os.path.exists(inner_path) else None,
-                'has_front': os.path.exists(front_path),
-                'has_inner': os.path.exists(inner_path)
+                'front': f"/videos/{taxi_id}/{front_file}" if has_front else None,
+                'inner': f"/videos/{taxi_id}/{inner_file}" if has_inner else None,
+                'has_front': has_front,
+                'has_inner': has_inner
             }
-            
+
             if result['front'] or result['inner']:
                 return result
-    
+
     return None
 
 def get_next_unannotated_sample():
@@ -195,18 +267,32 @@ def append_inference_log(event):
     with open(INFERENCE_LOG_PATH, 'a', encoding='utf-8') as f:
         f.write(json.dumps(payload, ensure_ascii=False) + '\n')
 
+
+def get_prediction_failure_reason(predicted_label, l2m_details):
+    """推論結果が保存可能かを判定し、失敗理由を返す。"""
+    if predicted_label is None:
+        return "Prediction returned None"
+
+    if isinstance(l2m_details, dict) and l2m_details.get('status') == 'failed':
+        return l2m_details.get('error') or 'L2M inference failed'
+
+    return None
+
 # ============ ルーティング ============
 
 @app.get("/", response_class=HTMLResponse)
 async def main_page(request: Request):
     """メインアノテーション画面"""
+    req_start = time.perf_counter()
     sample_id, row = get_next_unannotated_sample()
     
     if sample_id is None:
         return templates.TemplateResponse("completed.html", {"request": request})
     
     # 動画マッチング
+    match_start = time.perf_counter()
     match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
+    logger.info(f"main_page: video_match_elapsed={time.perf_counter() - match_start:.3f}s sample_id={sample_id}")
     
     if match_result is None:
         match_result = {
@@ -255,7 +341,7 @@ async def main_page(request: Request):
         'blinker_l': int(row['blinker_l'])
     }
     
-    return templates.TemplateResponse("index.html", {
+    response = templates.TemplateResponse("index.html", {
         "request": request,
         "sample_id": sample_id,
         "row": row.to_dict(),
@@ -267,6 +353,8 @@ async def main_page(request: Request):
         "event_info": event_info,
         "sensor_info": sensor_info
     })
+    logger.info(f"main_page: total_elapsed={time.perf_counter() - req_start:.3f}s sample_id={sample_id}")
+    return response
 
 @app.post("/annotate")
 async def annotate(
@@ -368,7 +456,9 @@ async def auto_annotate(sample_id: int = Form(...)):
             sample_id=sample_id
         )
 
-        if predicted_label is not None:
+        failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
+
+        if failure_reason is None:
             # Save prediction to auto dataframe
             idx = df_auto[df_auto['sample_id'] == sample_id].index[0]
             df_auto.at[idx, 'action_label'] = predicted_label
@@ -395,10 +485,10 @@ async def auto_annotate(sample_id: int = Form(...)):
                 'phase': 'completed',
                 'sample_id': int(sample_id),
                 'status': 'failed',
-                'error': 'Prediction failed'
+                'error': failure_reason
             })
             return JSONResponse(
-                {"error": "Prediction failed"},
+                {"error": failure_reason},
                 status_code=500
             )
             
@@ -508,7 +598,9 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     sample_id=sample_id
                 )
 
-                if predicted_label is not None:
+                failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
+
+                if failure_reason is None:
                     # Save prediction to auto dataframe
                     df_auto.at[idx, 'action_label'] = predicted_label
                     append_inference_log({
@@ -532,12 +624,12 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                         'phase': 'completed',
                         'sample_id': int(sample_id),
                         'status': 'failed',
-                        'error': 'Prediction failed'
+                        'error': failure_reason
                     })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": "Prediction failed"
+                        "error": failure_reason
                     })
                     
             except Exception as e:
@@ -684,7 +776,9 @@ async def auto_annotate_all():
                     sample_id=sample_id
                 )
 
-                if predicted_label is not None:
+                failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
+
+                if failure_reason is None:
                     # Save to auto dataframe
                     df_auto.loc[df_auto['sample_id'] == sample_id, 'action_label'] = predicted_label
                     append_inference_log({
@@ -709,12 +803,12 @@ async def auto_annotate_all():
                         'phase': 'completed',
                         'sample_id': int(sample_id),
                         'status': 'failed',
-                        'error': 'Prediction returned None'
+                        'error': failure_reason
                     })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": "Prediction returned None"
+                        "error": failure_reason
                     })
                 
                 # Progress logging

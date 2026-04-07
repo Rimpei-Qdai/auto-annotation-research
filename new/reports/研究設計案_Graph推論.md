@@ -256,7 +256,58 @@ VLM が最終ラベルと、使用したノード関係を出力する。
 
 ---
 
-## 9. リスク
+## 9. 根拠となる既存研究
+
+本設計案の根拠として、以下の論文を主に参照する。
+
+### 9.1 中核となる論文
+
+- `DriveLM: Driving with Graph Visual Question Answering`  
+  本設計案で最も重要な参照元である。運転シーンを単純な 1 回の分類ではなく、`perception → prediction → planning` の関係構造として扱う発想を示している。  
+  今回の `Driving Behavior Graph` は、この考え方を運転行動ラベル付与へ応用し、`speed_state`、`trajectory_shape`、`intersection_state`、`signal_state` などの中間概念ノードを介して最終ラベルを決めるよう再構成したものである。  
+  論文: https://arxiv.org/abs/2312.14150
+
+### 9.2 設計を補強する論文
+
+- `DriveVLM: The Convergence of Autonomous Driving and Large Vision-Language Models`  
+  VLM 単独では自動運転タスクの空間理解や構造的判断に限界があり、外部の中間表現や従来モジュールとの組み合わせが重要であることを示している。  
+  本プロジェクトで、画像から直接 11 クラス分類を行わず、中間概念を明示して推論する方針の背景として使える。  
+  論文: https://arxiv.org/abs/2402.12289
+
+- `Concept Bottleneck Models Without Predefined Concepts`  
+  最終ラベルの手前に意味的な中間概念を置く設計の一般論として参考にしている。  
+  今回の `speed_state`、`turn_direction`、`lane_change_state`、`intersection_state` などを「推論のための部品」として扱う考え方の理論的な支えになる。  
+  論文: https://arxiv.org/abs/2407.03921
+
+- `SpatialVLM: Endowing Vision-Language Models with Spatial Reasoning Capabilities`  
+  一般 VLM の空間推論能力が十分ではないことを示し、位置関係や方向関係を明示的に扱う必要性を補強する。  
+  本プロジェクトで `右折/左折` や `車線変更/旋回` の混同が起きている状況とも整合しており、グラフによる関係表現の必要性を説明しやすい。  
+  論文: https://arxiv.org/abs/2401.12168
+
+- `DriveGPT4: Interpretable End-to-end Autonomous Driving via Large Language Model`  
+  多段推論や説明可能性を持つ運転 VLM の流れを把握するための参考文献である。  
+  本設計案は単なる CoT の延長ではなく、説明をグラフ構造に昇格させ、関係の整合性を使ってラベル決定する点で差別化できる。  
+  論文: https://arxiv.org/abs/2310.01412
+
+### 9.3 将来的な拡張の参考
+
+- `G-Retriever: Retrieval-Augmented Generation for Textual Graph Understanding and Question Answering`  
+  将来的に `Graph + RAG` を統合する場合の参考文献である。  
+  現時点では Graph 単独実装を優先するが、今後「概念グラフを検索キーにした類似事例検索」へ発展させる際の基礎として位置づけられる。  
+  論文: https://arxiv.org/abs/2402.07630
+
+### 9.4 このプロジェクトとの対応関係
+
+本プロジェクトにおける Graph 推論案は、上記研究をそのまま流用するのではなく、以下のように接続する。
+
+- `DriveLM` のグラフ発想を、運転行動アノテーションのラベル分類へ再定式化する
+- `DriveVLM` と `SpatialVLM` の問題意識を踏まえ、VLM 単独の曖昧な判断を中間概念で構造化する
+- `Concept Bottleneck` の考え方を利用し、右左・停止・速度変化などを明示的な概念ノードとして扱う
+- 将来的には `G-Retriever` 的な検索機構を追加し、グラフを検索キーにした事例参照へ拡張できる
+
+---
+
+## 10. リスク
 
 - 小規模データではノード設計が過学習的になる可能性
 - 交差点・車線境界の推定が不安定だと逆効果
@@ -264,7 +315,7 @@ VLM が最終ラベルと、使用したノード関係を出力する。
 
 ---
 
-## 10. 最小実装の提案
+## 11. 最小実装の提案
 
 最初は大きく作らず、以下に絞る。
 
