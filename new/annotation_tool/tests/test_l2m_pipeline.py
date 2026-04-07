@@ -275,6 +275,7 @@ class DrivingConceptGraphBuilderTests(unittest.TestCase):
             {
                 "road_shape": "STRAIGHT",
                 "trajectory_relation": "PARALLEL",
+                "trajectory_motion_cue": "STRAIGHT_CUE",
                 "intersection_detected": "NO",
                 "direction_change": "STRAIGHT",
                 "visual_shift": "NO_SHIFT",
@@ -297,6 +298,37 @@ class DrivingConceptGraphBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(result["concepts"]["stop_likelihood"], "LOW")
+
+    def test_trajectory_motion_cue_directly_supports_lane_change(self):
+        result = self.builder.build(
+            {
+                "road_shape": "STRAIGHT",
+                "trajectory_relation": "PARALLEL",
+                "trajectory_motion_cue": "LEFT_LANE_CHANGE_CUE",
+                "intersection_detected": "NO",
+                "direction_change": "STRAIGHT",
+                "visual_shift": "NO_SHIFT",
+            },
+            {
+                "acceleration_cause": "MIXED",
+                "speed_trend": "STABLE",
+                "consistency_check": "CONSISTENT",
+            },
+            {
+                "speed": 20.0,
+                "speed_diff": 0.0,
+                "timestamp_diff_sec": 1.0,
+                "speed_change_rate": 0.0,
+                "gyro_z": 0.0,
+                "brake": 0,
+                "blinker_r": 0,
+                "blinker_l": 1,
+            },
+        )
+
+        self.assertEqual(result["concepts"]["trajectory_motion_cue"], "LEFT_LANE_CHANGE_CUE")
+        self.assertEqual(result["concepts"]["lane_crossing_state"], "LEFT")
+        self.assertEqual(result["top_candidates"][0]["category_id"], 8)
 
 
 if __name__ == "__main__":

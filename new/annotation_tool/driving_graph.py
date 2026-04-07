@@ -75,6 +75,7 @@ class DrivingConceptGraphBuilder:
 
         road_shape = level1_result.get("road_shape", "STRAIGHT")
         trajectory_relation = level1_result.get("trajectory_relation", "PARALLEL")
+        trajectory_motion_cue = level1_result.get("trajectory_motion_cue", "AMBIGUOUS")
         intersection_detected = level1_result.get("intersection_detected", "NO")
         direction_change = level1_result.get("direction_change", "STRAIGHT")
         visual_shift = level1_result.get("visual_shift", "NO_SHIFT")
@@ -96,7 +97,11 @@ class DrivingConceptGraphBuilder:
         else:
             signal_state = "OFF"
 
-        if gyro_z > GYRO_THRESHOLD or visual_shift == "SHIFT_LEFT":
+        if trajectory_motion_cue in {"LEFT_TURN_CUE", "LEFT_LANE_CHANGE_CUE"}:
+            trajectory_direction = "LEFT"
+        elif trajectory_motion_cue in {"RIGHT_TURN_CUE", "RIGHT_LANE_CHANGE_CUE"}:
+            trajectory_direction = "RIGHT"
+        elif gyro_z > GYRO_THRESHOLD or visual_shift == "SHIFT_LEFT":
             trajectory_direction = "LEFT"
         elif gyro_z < -GYRO_THRESHOLD or visual_shift == "SHIFT_RIGHT":
             trajectory_direction = "RIGHT"
@@ -110,14 +115,20 @@ class DrivingConceptGraphBuilder:
         else:
             trajectory_direction = "STRAIGHT"
 
-        if abs(gyro_z) > GYRO_THRESHOLD * 1.8 or direction_change == "TURNING":
+        if trajectory_motion_cue in {"LEFT_TURN_CUE", "RIGHT_TURN_CUE"}:
+            turn_intensity = "HIGH"
+        elif abs(gyro_z) > GYRO_THRESHOLD * 1.8 or direction_change == "TURNING":
             turn_intensity = "HIGH"
         elif abs(gyro_z) > GYRO_THRESHOLD * 0.8 or visual_shift != "NO_SHIFT":
             turn_intensity = "MEDIUM"
         else:
             turn_intensity = "LOW"
 
-        if trajectory_relation == "CROSSING_LEFT":
+        if trajectory_motion_cue == "LEFT_LANE_CHANGE_CUE":
+            lane_crossing_state = "LEFT"
+        elif trajectory_motion_cue == "RIGHT_LANE_CHANGE_CUE":
+            lane_crossing_state = "RIGHT"
+        elif trajectory_relation == "CROSSING_LEFT":
             lane_crossing_state = "LEFT"
         elif trajectory_relation == "CROSSING_RIGHT":
             lane_crossing_state = "RIGHT"
@@ -142,6 +153,7 @@ class DrivingConceptGraphBuilder:
         return {
             "speed_state": speed_state,
             "signal_state": signal_state,
+            "trajectory_motion_cue": trajectory_motion_cue,
             "trajectory_direction": trajectory_direction,
             "turn_intensity": turn_intensity,
             "lane_crossing_state": lane_crossing_state,
@@ -228,6 +240,25 @@ class DrivingConceptGraphBuilder:
     def _build_edges(self, concepts: Dict[str, Any]) -> List[Dict[str, str]]:
         edges: List[Dict[str, str]] = []
 
+        if concepts["trajectory_motion_cue"] in {"LEFT_TURN_CUE", "RIGHT_TURN_CUE"}:
+            edges.append(
+                {
+                    "source": "trajectory_motion_cue",
+                    "target": "trajectory_direction",
+                    "type": "supports_turn",
+                    "reason": "赤い軌道が将来の回頭を直接示している",
+                }
+            )
+        elif concepts["trajectory_motion_cue"] in {"LEFT_LANE_CHANGE_CUE", "RIGHT_LANE_CHANGE_CUE"}:
+            edges.append(
+                {
+                    "source": "trajectory_motion_cue",
+                    "target": "lane_crossing_state",
+                    "type": "supports_lane_change",
+                    "reason": "赤い軌道が横方向移動を直接示している",
+                }
+            )
+
         if concepts["signal_state"] == concepts["trajectory_direction"] and concepts["signal_state"] != "OFF":
             edges.append(
                 {
@@ -304,6 +335,7 @@ class DrivingConceptGraphBuilder:
         lane_crossing = concepts["lane_crossing_state"]
         intersection = concepts["intersection_state"]
         signal = concepts["signal_state"]
+        trajectory_motion_cue = concepts["trajectory_motion_cue"]
         turn_intensity = concepts["turn_intensity"]
         stop_likelihood = concepts["stop_likelihood"]
 
@@ -332,6 +364,15 @@ class DrivingConceptGraphBuilder:
         elif direction == "RIGHT":
             add(7, 0.35, "進行方向が右")
             add(9, 0.20, "右方向変化は右車線変更候補にもなる")
+
+        if trajectory_motion_cue == "LEFT_TURN_CUE":
+            add(6, 0.20, "赤い軌道が左折キューを示す")
+        elif trajectory_motion_cue == "RIGHT_TURN_CUE":
+            add(7, 0.20, "赤い軌道が右折キューを示す")
+        elif trajectory_motion_cue == "LEFT_LANE_CHANGE_CUE":
+            add(8, 0.25, "赤い軌道が左車線変更キューを示す")
+        elif trajectory_motion_cue == "RIGHT_LANE_CHANGE_CUE":
+            add(9, 0.25, "赤い軌道が右車線変更キューを示す")
 
         if turn_intensity == "HIGH" and direction == "LEFT":
             add(6, 0.20, "旋回強度が高く左折寄り")
@@ -419,6 +460,7 @@ class DrivingConceptGraphBuilder:
     ) -> str:
         lines = [
             f"- speed_state: {concepts['speed_state']}",
+            f"- trajectory_motion_cue: {concepts['trajectory_motion_cue']}",
             f"- trajectory_direction: {concepts['trajectory_direction']}",
             f"- turn_intensity: {concepts['turn_intensity']}",
             f"- lane_crossing_state: {concepts['lane_crossing_state']}",

@@ -44,6 +44,15 @@ class L2MCoTPipeline:
         self.frame_generator = frame_generator
         self.conversation_history = []
         self.graph_builder = DrivingConceptGraphBuilder()
+
+    def _trajectory_overlay_guidelines(self) -> str:
+        return """【軌道オーバーレイの読み方】
+- 赤い点と線は、自車の今から3秒先までの予測軌道です。
+- 赤い点は近い未来から遠い未来へ時間順に並んでいます。
+- まず赤い軌道だけを見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれに近いかを判断してください。
+- 次に、緑の参照線との相対位置から、同一車線内の追従か横方向逸脱かを判断してください。
+- 背景映像は交差点・道路形状・車線文脈の確認に使い、運動の向きそのものは赤い軌道を優先してください。
+- 4フレーム全体で一貫する解釈を選んでください。"""
     
     def analyze_with_l2m(
         self,
@@ -130,14 +139,25 @@ class L2MCoTPipeline:
         This step analyzes only visual geometric features.
         No sensor data is used, only objective facts are extracted.
         """
-        prompt = """あなたは自動運転データの分析エキスパートです。以下の画像は車両の前方カメラから撮影された4枚の連続フレームです。
+        prompt = f"""あなたは自動運転データの分析エキスパートです。以下の画像は車両の前方カメラから撮影された4枚の連続フレームです。
 
 【画像の説明】
 - 赤い線: 車両の予測軌道（これから進む予定の経路）
 - 緑の線: 現在の車線区分線または車線中心
 
+{self._trajectory_overlay_guidelines()}
+
 【タスク】
-以下の3つの質問に段階的に答えてください。
+以下の質問に段階的に答えてください。
+
+[ステップ0: 軌道そのものの将来運動キュー]
+赤い軌道だけを見て、将来の運動キューを分類してください。
+- STRAIGHT_CUE: 赤い軌道が前方へほぼ直進し、横方向のずれが小さい
+- LEFT_TURN_CUE: 赤い軌道が連続的に左へ曲がる
+- RIGHT_TURN_CUE: 赤い軌道が連続的に右へ曲がる
+- LEFT_LANE_CHANGE_CUE: 赤い軌道が左へ横移動するが、交差点での回頭ほどは曲がらない
+- RIGHT_LANE_CHANGE_CUE: 赤い軌道が右へ横移動するが、交差点での回頭ほどは曲がらない
+- AMBIGUOUS: どれとも言い切れない
 
 [ステップ1: 道路形状の特定]
 道路は直線ですか、それとも左右にカーブしていますか？
@@ -179,15 +199,16 @@ class L2MCoTPipeline:
 以下のJSON形式でのみ回答してください。推論過程も「reasoning」フィールドに簡潔に記述してください。
 
 ```json
-{
+{{
   "reasoning": "道路形状と軌道の関係についての分析結果を簡潔に説明",
+  "trajectory_motion_cue": "RIGHT_TURN_CUE",
   "road_shape": "STRAIGHT",
   "trajectory_relation": "PARALLEL",
   "slope": "FLAT",
   "intersection_detected": "NO",
   "direction_change": "STRAIGHT",
   "visual_shift": "NO_SHIFT"
-}
+}}
 ```"""
         
         try:
@@ -199,6 +220,7 @@ class L2MCoTPipeline:
                 logger.warning(f"Level 1 JSON parse failed. Raw output: {raw_output[:300]}")
                 return {
                     'reasoning': raw_output[:500],
+                    'trajectory_motion_cue': 'AMBIGUOUS',
                     'road_shape': 'STRAIGHT',
                     'trajectory_relation': 'PARALLEL',
                     'slope': 'FLAT',
@@ -207,12 +229,13 @@ class L2MCoTPipeline:
                     'visual_shift': 'NO_SHIFT'
                 }
 
-            return parsed
+            return self._normalize_level1_result(parsed)
 
         except Exception as e:
             logger.error(f"Level 1 推論エラー: {e}", exc_info=True)
             return {
                 'reasoning': f"Error: {str(e)}",
+                'trajectory_motion_cue': 'AMBIGUOUS',
                 'road_shape': 'STRAIGHT',
                 'trajectory_relation': 'PARALLEL',
                 'slope': 'FLAT',
@@ -264,6 +287,7 @@ class L2MCoTPipeline:
         prompt = f"""あなたは自動運転データの分析エキスパートです。Level 1の幾何学的分析結果と、実際の車両センサーデータを照合して、物理法則との整合性を検証してください。
 
 【Level 1の分析結果】
+- 軌道の将来運動キュー: {level1_result.get('trajectory_motion_cue', 'UNKNOWN')}
 - 道路形状: {level1_result.get('road_shape', 'UNKNOWN')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation', 'UNKNOWN')}
 - 道路の勾配: {level1_result.get('slope', 'UNKNOWN')}
@@ -282,6 +306,8 @@ class L2MCoTPipeline:
 - サンプル間隔: {timestamp_diff_sec:.2f} s
 - 時間正規化した速度変化率: {speed_change_rate:+.2f} km/h/s
 - センサー由来の運動要約: {motion_summary}{gyro_warning}{acc_x_warning}
+
+{self._trajectory_overlay_guidelines()}
 
 【タスク】
 以下の分析を段階的に行ってください。
@@ -417,6 +443,7 @@ class L2MCoTPipeline:
 【これまでの分析結果】
 
 ◆ Level 1: 幾何学的分析
+- 軌道の将来運動キュー: {level1_result.get('trajectory_motion_cue', 'N/A')}
 - 道路形状: {level1_result.get('road_shape')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation')}
 - 道路の勾配: {level1_result.get('slope')}
@@ -435,6 +462,8 @@ class L2MCoTPipeline:
 - ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {'ON' if brake > 0 else 'OFF'}
 - ウィンカー: {blinker_status}{sensor_hints_section}
+
+{self._trajectory_overlay_guidelines()}
 
 【必ず以下の11クラスから1つ選択してください】
 0: その他
@@ -481,6 +510,12 @@ class L2MCoTPipeline:
 7. **停止（4）の抑制ルール**:
    - 速度が 1 km/h を超えていて、かつブレーキが OFF の場合は停止（4）を選ばない
    - Graph や direct_motion_trend が減速・旋回を示している場合、停止よりそちらを優先する
+
+8. **軌道オーバーレイ優先ルール**:
+   - まず `trajectory_motion_cue` を見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれかを決める
+   - 赤い軌道が連続的に曲がるなら TURN を優先する
+   - 赤い軌道が横移動主体で交差点が弱いなら LANE CHANGE を優先する
+   - 背景だけで曲がって見えても、赤い軌道が直進なら TURN にしない
 
 【タスク】
 上記の分析結果とルールを総合的に考慮して、最も適切なカテゴリを1つ選択してください。
@@ -660,6 +695,31 @@ class L2MCoTPipeline:
                 return f"{field_name}: {value}"
 
         return None
+
+    def _normalize_level1_result(self, level1_result: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(level1_result)
+        if normalized.get('trajectory_motion_cue'):
+            return normalized
+
+        trajectory_relation = normalized.get('trajectory_relation', 'PARALLEL')
+        visual_shift = normalized.get('visual_shift', 'NO_SHIFT')
+        direction_change = normalized.get('direction_change', 'STRAIGHT')
+
+        if trajectory_relation == 'CROSSING_LEFT':
+            cue = 'LEFT_LANE_CHANGE_CUE'
+        elif trajectory_relation == 'CROSSING_RIGHT':
+            cue = 'RIGHT_LANE_CHANGE_CUE'
+        elif direction_change == 'TURNING' and visual_shift == 'SHIFT_LEFT':
+            cue = 'LEFT_TURN_CUE'
+        elif direction_change == 'TURNING' and visual_shift == 'SHIFT_RIGHT':
+            cue = 'RIGHT_TURN_CUE'
+        elif trajectory_relation == 'PARALLEL':
+            cue = 'STRAIGHT_CUE'
+        else:
+            cue = 'AMBIGUOUS'
+
+        normalized['trajectory_motion_cue'] = cue
+        return normalized
 
     def _build_motion_observation(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
         speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
