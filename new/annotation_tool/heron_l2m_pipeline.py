@@ -13,11 +13,11 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from PIL import Image
-import torch
 import re
 
 from config import GYRO_THRESHOLD, ACC_X_THRESHOLD, SPEED_STOP_THRESHOLD, FEW_SHOT_EXAMPLES
 from driving_graph import DrivingConceptGraphBuilder
+from vlm_runtime import FramePromptGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +28,14 @@ class L2MCoTPipeline:
     複数回のVLM推論を組み合わせて段階的な分析を行う
     """
     
-    def __init__(self, heron_annotator):
+    def __init__(self, frame_generator: FramePromptGenerator):
         """
         Args:
-            heron_annotator: HeronAnnotatorのインスタンス（既にモデルがロード済み）
+            frame_generator:
+                フレーム+プロンプトからテキストを返す生成器。
+                GPU/processor の詳細はこの層に隠蔽する。
         """
-        self.annotator = heron_annotator
+        self.frame_generator = frame_generator
         self.conversation_history = []
         self.graph_builder = DrivingConceptGraphBuilder()
     
@@ -83,15 +85,24 @@ class L2MCoTPipeline:
         )
         logger.info(f"Level 3 完了: {level3_result}")
 
-        # 後処理ルール適用（案4）
-        raw_category = level3_result.get('category_id', 0)
-        final_category = self._post_process_label(raw_category, sensor_data, graph_result)
-        if final_category is None:
-            # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
-            logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
-            final_category = raw_category
-        if final_category != raw_category:
-            logger.info(f"[PostProcess] Label corrected: {raw_category} → {final_category}")
+        pipeline_error = self._extract_pipeline_error(
+            level1_result, level2_result, level3_result
+        )
+        if pipeline_error:
+            logger.warning("[L2M+CoT] Generation error detected in pipeline: %s", pipeline_error)
+            final_category = None
+            confidence = 0.0
+        else:
+            # 後処理ルール適用（案4）
+            raw_category = level3_result.get('category_id', 0)
+            final_category = self._post_process_label(raw_category, sensor_data, graph_result)
+            if final_category is None:
+                # 旋回検出の矛盾 → 保守的に元の予測を維持（再推論は実装コスト高のため）
+                logger.warning("[PostProcess] Contradiction detected (gyro>threshold but predicted constant speed). Keeping original.")
+                final_category = raw_category
+            if final_category != raw_category:
+                logger.info(f"[PostProcess] Label corrected: {raw_category} → {final_category}")
+            confidence = level3_result.get('confidence', 0.5)
 
         logger.info("=== L2M+CoT Analysis Complete ===")
 
@@ -101,7 +112,9 @@ class L2MCoTPipeline:
             'graph': graph_result,
             'level3': level3_result,
             'final_category': final_category,
-            'confidence': level3_result.get('confidence', 0.5)
+            'confidence': confidence,
+            'status': 'failed' if pipeline_error else 'success',
+            'error': pipeline_error,
         }
     
     def _level1_geometry(self, frames: List[Image.Image]) -> Dict[str, Any]:
@@ -502,61 +515,13 @@ class L2MCoTPipeline:
         Leverages existing HeronAnnotator internal methods
         for multi-frame input inference.
         """
-        # モデルタイプの判定
-        is_qwen = "qwen" in self.annotator.model.__class__.__name__.lower()
-        
         try:
-            if is_qwen:
-                # Qwen2-VL format
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            *[{"type": "image", "image": frame} for frame in frames],
-                            {"type": "text", "text": prompt}
-                        ]
-                    }
-                ]
-                text_prompt = self.annotator.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                inputs = self.annotator.processor(
-                    text=[text_prompt],
-                    images=frames,
-                    padding=True,
-                    return_tensors="pt"
-                )
-            else:
-                # Heron format - Processor handles text and image separately
-                inputs = self.annotator.processor(
-                    images=frames,
-                    text=[prompt],
-                    return_tensors="pt",
-                    padding=True
-                )
-            
-            # Align inputs with the model placement strategy.
-            inputs = self.annotator.prepare_inputs_for_generation(inputs)
-            
-            # Generate
-            logger.info(f"Generating with {len(frames)} frames, prompt length: {len(prompt)} chars")
-            with torch.no_grad():
-                output_ids = self.annotator.model.generate(
-                    **inputs,
-                    max_new_tokens=512,  # 長いプロンプト対応のため300→512に増加
-                    do_sample=False  # Greedy decoding for reliability
-                )
-            
-            # Decode
-            output_text = self.annotator.processor.batch_decode(
-                output_ids,
-                skip_special_tokens=True
-            )[0]
-            
-            # Remove prompt part (some models include the prompt)
-            if prompt in output_text:
-                output_text = output_text.replace(prompt, "").strip()
-            
+            output_text = self.frame_generator.generate_text(
+                frames,
+                prompt,
+                max_new_tokens=512,  # 長いプロンプト対応のため300→512に増加
+                do_sample=False,  # Greedy decoding for reliability
+            )
             logger.debug(f"Generated output (first 200 chars): {output_text[:200]}")
             
             return output_text
@@ -642,6 +607,27 @@ class L2MCoTPipeline:
         
         # Default is other
         return 0
+
+    def _extract_pipeline_error(
+        self,
+        level1_result: Dict[str, Any],
+        level2_result: Dict[str, Any],
+        level3_result: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Detect hard generation failures that were converted into default values.
+        """
+        checks = [
+            ("level1.reasoning", level1_result.get("reasoning")),
+            ("level2.reasoning", level2_result.get("reasoning")),
+            ("level3.final_reasoning", level3_result.get("final_reasoning")),
+        ]
+
+        for field_name, value in checks:
+            if isinstance(value, str) and value.startswith("Error:"):
+                return f"{field_name}: {value}"
+
+        return None
     
     def _get_sensor_hints(self, sensor_data: Dict[str, Any]) -> str:
         """
