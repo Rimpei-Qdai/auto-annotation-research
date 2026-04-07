@@ -128,20 +128,24 @@ def _augment_motion_features(dataframe: pd.DataFrame) -> pd.DataFrame:
     ordered.loc[valid_delta, 'speed_change_rate'] = (
         ordered.loc[valid_delta, 'speed_diff'] / ordered.loc[valid_delta, 'timestamp_diff_sec']
     )
+    ordered['motion_feature_reliable'] = (
+        (ordered['timestamp_diff_sec'] > 0.0) & (ordered['timestamp_diff_sec'] <= 10.0)
+    )
 
     feature_columns = ordered[
-        ['sample_id', 'speed_diff', 'timestamp_diff_sec', 'speed_change_rate']
+        ['sample_id', 'speed_diff', 'timestamp_diff_sec', 'speed_change_rate', 'motion_feature_reliable']
     ]
     merged = dataframe.merge(feature_columns, on='sample_id', how='left')
     merged['speed_diff'] = merged['speed_diff'].fillna(0.0)
     merged['timestamp_diff_sec'] = merged['timestamp_diff_sec'].fillna(0.0)
     merged['speed_change_rate'] = merged['speed_change_rate'].fillna(0.0)
+    merged['motion_feature_reliable'] = merged['motion_feature_reliable'].fillna(False).astype(bool)
     return merged
 
 
 df_auto = _augment_motion_features(df_auto)
-if {'speed_diff', 'timestamp_diff_sec', 'speed_change_rate'}.issubset(df_auto.columns):
-    logger.info("運動特徴を計算しました (speed_diff / timestamp_diff_sec / speed_change_rate)")
+if {'speed_diff', 'timestamp_diff_sec', 'speed_change_rate', 'motion_feature_reliable'}.issubset(df_auto.columns):
+    logger.info("運動特徴を計算しました (speed_diff / timestamp_diff_sec / speed_change_rate / motion_feature_reliable)")
 
 # ============ ヘルパー関数 ============
 
@@ -375,6 +379,7 @@ async def main_page(request: Request):
         'blinker_l': int(row['blinker_l']),
         'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0,
         'speed_change_rate': float(row['speed_change_rate']) if 'speed_change_rate' in row.index else 0.0,
+        'motion_feature_reliable': bool(row['motion_feature_reliable']) if 'motion_feature_reliable' in row.index else False,
     }
     
     response = templates.TemplateResponse("index.html", {
@@ -474,6 +479,7 @@ async def auto_annotate(sample_id: int = Form(...)):
             'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0,
             'timestamp_diff_sec': float(row['timestamp_diff_sec']) if 'timestamp_diff_sec' in row.index else 0.0,
             'speed_change_rate': float(row['speed_change_rate']) if 'speed_change_rate' in row.index else 0.0,
+            'motion_feature_reliable': bool(row['motion_feature_reliable']) if 'motion_feature_reliable' in row.index else False,
         }
         append_inference_log({
             'request_id': request_id,
@@ -619,6 +625,7 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0,
                     'timestamp_diff_sec': float(row['timestamp_diff_sec']) if 'timestamp_diff_sec' in row.index else 0.0,
                     'speed_change_rate': float(row['speed_change_rate']) if 'speed_change_rate' in row.index else 0.0,
+                    'motion_feature_reliable': bool(row['motion_feature_reliable']) if 'motion_feature_reliable' in row.index else False,
                 }
                 append_inference_log({
                     'request_id': request_id,
@@ -799,6 +806,7 @@ async def auto_annotate_all():
                     'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0,
                     'timestamp_diff_sec': float(row['timestamp_diff_sec']) if 'timestamp_diff_sec' in row.index else 0.0,
                     'speed_change_rate': float(row['speed_change_rate']) if 'speed_change_rate' in row.index else 0.0,
+                    'motion_feature_reliable': bool(row['motion_feature_reliable']) if 'motion_feature_reliable' in row.index else False,
                 }
                 append_inference_log({
                     'request_id': request_id,

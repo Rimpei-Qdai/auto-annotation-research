@@ -237,6 +237,41 @@ class L2MCoTPipelineTests(unittest.TestCase):
 
         self.assertEqual(result["final_category"], 1)
 
+    def test_level1_contradicted_motion_cue_is_downgraded(self):
+        pipeline = L2MCoTPipeline(FakeFramePromptGenerator([]))
+        normalized = pipeline._normalize_level1_result(
+            {
+                "trajectory_motion_cue": "LEFT_TURN_CUE",
+                "road_shape": "STRAIGHT",
+                "trajectory_relation": "PARALLEL",
+                "intersection_detected": "NO",
+                "direction_change": "STRAIGHT",
+                "visual_shift": "NO_SHIFT",
+            }
+        )
+
+        self.assertEqual(normalized["trajectory_motion_cue"], "AMBIGUOUS")
+        self.assertEqual(normalized["raw_trajectory_motion_cue"], "LEFT_TURN_CUE")
+        self.assertEqual(normalized["trajectory_motion_cue_consistency"], "CONTRADICTED")
+        self.assertLess(normalized["trajectory_motion_cue_confidence"], 0.35)
+
+    def test_long_lookback_disables_speed_delta_evidence(self):
+        pipeline = L2MCoTPipeline(FakeFramePromptGenerator([]))
+        motion = pipeline._build_motion_observation(
+            {
+                "speed": 20.0,
+                "speed_diff": 15.0,
+                "timestamp_diff_sec": 1800.0,
+                "speed_change_rate": 0.008,
+                "brake": 0,
+                "motion_feature_reliable": False,
+            }
+        )
+
+        self.assertFalse(motion["reliable"])
+        self.assertEqual(motion["trend"], "STABLE")
+        self.assertNotEqual(motion["trend"], "INCREASING")
+
 
 class DrivingConceptGraphBuilderTests(unittest.TestCase):
     def setUp(self):
@@ -329,6 +364,44 @@ class DrivingConceptGraphBuilderTests(unittest.TestCase):
         self.assertEqual(result["concepts"]["trajectory_motion_cue"], "LEFT_LANE_CHANGE_CUE")
         self.assertEqual(result["concepts"]["lane_crossing_state"], "LEFT")
         self.assertEqual(result["top_candidates"][0]["category_id"], 8)
+
+    def test_graph_ignores_contradicted_turn_cue(self):
+        result = self.builder.build(
+            {
+                "road_shape": "STRAIGHT",
+                "trajectory_relation": "PARALLEL",
+                "trajectory_motion_cue": "AMBIGUOUS",
+                "raw_trajectory_motion_cue": "LEFT_TURN_CUE",
+                "trajectory_motion_cue_confidence": 0.0,
+                "trajectory_motion_cue_consistency": "CONTRADICTED",
+                "intersection_detected": "NO",
+                "direction_change": "STRAIGHT",
+                "visual_shift": "NO_SHIFT",
+            },
+            {
+                "acceleration_cause": "MIXED",
+                "speed_trend": "STABLE",
+                "consistency_check": "CONSISTENT",
+            },
+            {
+                "speed": 18.0,
+                "speed_diff": 0.0,
+                "timestamp_diff_sec": 1.0,
+                "speed_change_rate": 0.0,
+                "motion_feature_reliable": True,
+                "gyro_z": 0.0,
+                "brake": 0,
+                "blinker_r": 0,
+                "blinker_l": 0,
+            },
+        )
+
+        self.assertEqual(result["concepts"]["trajectory_direction"], "STRAIGHT")
+        self.assertEqual(result["top_candidates"][0]["category_id"], 1)
+        self.assertTrue(
+            any(edge["type"] == "contradicts" for edge in result["edges"]),
+            "contradicted trajectory cue should appear in graph edges",
+        )
 
 
 if __name__ == "__main__":
