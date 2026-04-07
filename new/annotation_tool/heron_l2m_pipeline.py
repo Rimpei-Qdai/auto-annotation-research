@@ -27,6 +27,13 @@ class L2MCoTPipeline:
     Least-to-Most Prompting + Chain-of-Thought Pipeline for Heron
     複数回のVLM推論を組み合わせて段階的な分析を行う
     """
+
+    SPEED_DIFF_THRESHOLD = 0.5
+    STRONG_SPEED_DIFF_THRESHOLD = 1.0
+    SPEED_RATE_THRESHOLD = 0.6
+    STABLE_SPEED_RATE_THRESHOLD = 0.25
+    MAX_RELIABLE_TIME_DIFF_SEC = 4.0
+    MAX_RELIABLE_MOTION_LOOKBACK_SEC = 10.0
     
     def __init__(self, frame_generator: FramePromptGenerator):
         """
@@ -38,6 +45,23 @@ class L2MCoTPipeline:
         self.frame_generator = frame_generator
         self.conversation_history = []
         self.graph_builder = DrivingConceptGraphBuilder()
+
+    def _trajectory_overlay_guidelines(self) -> str:
+        return """【軌道オーバーレイの読み方】
+- 赤い点と線は、自車の今から3秒先までの予測軌道です。
+- 赤い点は近い未来から遠い未来へ時間順に並んでいます。
+- まず赤い軌道だけを見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれに近いかを判断してください。
+- 次に、緑の参照線との相対位置から、同一車線内の追従か横方向逸脱かを判断してください。
+- 背景映像は交差点・道路形状・車線文脈の確認に使い、運動の向きそのものは赤い軌道を優先してください。
+- 4フレーム全体で一貫する解釈を選んでください。"""
+
+    def _is_motion_feature_reliable(self, sensor_data: Dict[str, Any]) -> bool:
+        explicit = sensor_data.get('motion_feature_reliable')
+        if explicit is not None:
+            return bool(explicit)
+
+        timestamp_diff_sec = float(sensor_data.get('timestamp_diff_sec', 0.0) or 0.0)
+        return 0.0 < timestamp_diff_sec <= self.MAX_RELIABLE_MOTION_LOOKBACK_SEC
     
     def analyze_with_l2m(
         self,
@@ -124,14 +148,30 @@ class L2MCoTPipeline:
         This step analyzes only visual geometric features.
         No sensor data is used, only objective facts are extracted.
         """
-        prompt = """あなたは自動運転データの分析エキスパートです。以下の画像は車両の前方カメラから撮影された4枚の連続フレームです。
+        prompt = f"""あなたは自動運転データの分析エキスパートです。以下の画像は車両の前方カメラから撮影された4枚の連続フレームです。
 
 【画像の説明】
 - 赤い線: 車両の予測軌道（これから進む予定の経路）
 - 緑の線: 現在の車線区分線または車線中心
 
+{self._trajectory_overlay_guidelines()}
+
 【タスク】
-以下の3つの質問に段階的に答えてください。
+以下の質問に段階的に答えてください。
+
+[ステップ0: 軌道そのものの将来運動キュー]
+赤い軌道だけを見て、将来の運動キューを分類してください。
+- STRAIGHT_CUE: 赤い軌道が前方へほぼ直進し、横方向のずれが小さい
+- LEFT_TURN_CUE: 赤い軌道が連続的に左へ曲がる
+- RIGHT_TURN_CUE: 赤い軌道が連続的に右へ曲がる
+- LEFT_LANE_CHANGE_CUE: 赤い軌道が左へ横移動するが、交差点での回頭ほどは曲がらない
+- RIGHT_LANE_CHANGE_CUE: 赤い軌道が右へ横移動するが、交差点での回頭ほどは曲がらない
+- AMBIGUOUS: どれとも言い切れない
+
+重要:
+- 背景の遠近感や道路の見え方だけで LEFT_TURN_CUE / RIGHT_TURN_CUE を選ばないでください。赤い軌道の形そのものだけを見てください。
+- 4フレームで一貫していない、または赤い軌道がほぼ直進に見える場合は、無理に旋回・車線変更を選ばず AMBIGUOUS または STRAIGHT_CUE を選んでください。
+- 左右の判断根拠が弱い場合は AMBIGUOUS を優先してください。
 
 [ステップ1: 道路形状の特定]
 道路は直線ですか、それとも左右にカーブしていますか？
@@ -173,15 +213,16 @@ class L2MCoTPipeline:
 以下のJSON形式でのみ回答してください。推論過程も「reasoning」フィールドに簡潔に記述してください。
 
 ```json
-{
+{{
   "reasoning": "道路形状と軌道の関係についての分析結果を簡潔に説明",
+  "trajectory_motion_cue": "RIGHT_TURN_CUE",
   "road_shape": "STRAIGHT",
   "trajectory_relation": "PARALLEL",
   "slope": "FLAT",
   "intersection_detected": "NO",
   "direction_change": "STRAIGHT",
   "visual_shift": "NO_SHIFT"
-}
+}}
 ```"""
         
         try:
@@ -193,6 +234,7 @@ class L2MCoTPipeline:
                 logger.warning(f"Level 1 JSON parse failed. Raw output: {raw_output[:300]}")
                 return {
                     'reasoning': raw_output[:500],
+                    'trajectory_motion_cue': 'AMBIGUOUS',
                     'road_shape': 'STRAIGHT',
                     'trajectory_relation': 'PARALLEL',
                     'slope': 'FLAT',
@@ -201,12 +243,13 @@ class L2MCoTPipeline:
                     'visual_shift': 'NO_SHIFT'
                 }
 
-            return parsed
+            return self._normalize_level1_result(parsed)
 
         except Exception as e:
             logger.error(f"Level 1 推論エラー: {e}", exc_info=True)
             return {
                 'reasoning': f"Error: {str(e)}",
+                'trajectory_motion_cue': 'AMBIGUOUS',
                 'road_shape': 'STRAIGHT',
                 'trajectory_relation': 'PARALLEL',
                 'slope': 'FLAT',
@@ -235,9 +278,19 @@ class L2MCoTPipeline:
         brake = sensor_data.get('brake', 0)
         blinker_r = sensor_data.get('blinker_r', 0)
         blinker_l = sensor_data.get('blinker_l', 0)
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        timestamp_diff_sec = float(sensor_data.get('timestamp_diff_sec', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
+        motion_feature_reliable = self._is_motion_feature_reliable(sensor_data)
 
         brake_status = 'ON' if brake > 0 else 'OFF'
         blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
+        motion_summary = self._format_motion_summary(sensor_data)
+        motion_reliability_summary = (
+            "直前サンプルとの差分は信頼できる"
+            if motion_feature_reliable else
+            f"直前サンプルとの差分は {timestamp_diff_sec:.2f} 秒離れており、加減速判断では弱い evidence とみなす"
+        )
 
         # ジャイロ閾値超過時の警告メッセージ（案1-2）
         gyro_warning = ""
@@ -254,6 +307,7 @@ class L2MCoTPipeline:
         prompt = f"""あなたは自動運転データの分析エキスパートです。Level 1の幾何学的分析結果と、実際の車両センサーデータを照合して、物理法則との整合性を検証してください。
 
 【Level 1の分析結果】
+- 軌道の将来運動キュー: {level1_result.get('trajectory_motion_cue', 'UNKNOWN')}
 - 道路形状: {level1_result.get('road_shape', 'UNKNOWN')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation', 'UNKNOWN')}
 - 道路の勾配: {level1_result.get('slope', 'UNKNOWN')}
@@ -267,7 +321,14 @@ class L2MCoTPipeline:
 - 横加速度: {acc_y:.2f} m/s²
 - ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {brake_status}
-- ウィンカー: {blinker_status}{gyro_warning}{acc_x_warning}
+- ウィンカー: {blinker_status}
+- 直前サンプルとの差分: {speed_diff:+.1f} km/h
+- サンプル間隔: {timestamp_diff_sec:.2f} s
+- 時間正規化した速度変化率: {speed_change_rate:+.2f} km/h/s
+- 差分特徴の信頼性: {motion_reliability_summary}
+- センサー由来の運動要約: {motion_summary}{gyro_warning}{acc_x_warning}
+
+{self._trajectory_overlay_guidelines()}
 
 【タスク】
 以下の分析を段階的に行ってください。
@@ -311,14 +372,14 @@ class L2MCoTPipeline:
             
             if parsed is None:
                 logger.warning(f"Level 2 JSON parse failed. Raw output: {raw_output[:300]}")
-                return {
+                return self._normalize_level2_result(sensor_data, {
                     'reasoning': raw_output[:500],
                     'acceleration_cause': 'MIXED',
                     'speed_trend': 'STABLE',
                     'consistency_check': 'CONSISTENT'
-                }
+                })
             
-            return parsed
+            return self._normalize_level2_result(sensor_data, parsed)
             
         except Exception as e:
             logger.error(f"Level 2 推論エラー: {e}", exc_info=True)
@@ -347,9 +408,16 @@ class L2MCoTPipeline:
         # CRITICAL: Check for stopped vehicle first
         speed = sensor_data.get('speed', 0)
         brake = sensor_data.get('brake', 0)
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
+        motion_observation = self._build_motion_observation(sensor_data)
         
-        # If Speed=0 and Brake=ON, it's a STOP (category 4: 停止)
-        if speed == 0 and brake > 0:
+        # 完全停止に見えても、直前まで強い減速が続いている場合は減速との境界事例として扱う
+        if (
+            speed < SPEED_STOP_THRESHOLD
+            and brake > 0
+            and motion_observation.get('trend') != 'DECREASING'
+        ):
             logger.info("[Level 3] STOP detected: Speed=0, Brake=ON → Forcing category 4 (停止)")
             return {
                 'final_reasoning': 'Vehicle is completely stopped (Speed=0km/h) with brake engaged.',
@@ -361,7 +429,6 @@ class L2MCoTPipeline:
         gyro_z = sensor_data.get('gyro_z', 0)
         blinker_r = sensor_data.get('blinker_r', 0)
         blinker_l = sensor_data.get('blinker_l', 0)
-        speed_diff = sensor_data.get('speed_diff', None)
         blinker_status = '右ウィンカーON' if blinker_r > 0 else ('左ウィンカーON' if blinker_l > 0 else 'OFF')
 
         speed_diff_text = ""
@@ -372,6 +439,13 @@ class L2MCoTPipeline:
                 speed_diff_text = f"\n- 速度変化量: {speed_diff:.1f} km/h（減速傾向）"
 
         sensor_hints_section = f"\n\n◆ センサーヒント（事前フィルタリング）\n{sensor_hints}" if sensor_hints else ""
+        motion_section = (
+            "\n\n◆ センサー由来の運動要約\n"
+            f"- direct_motion_trend: {motion_observation.get('trend', 'UNKNOWN')}\n"
+            f"- direct_motion_cause: {motion_observation.get('cause', 'UNKNOWN')}\n"
+            f"- direct_motion_reason: {motion_observation.get('reason', '情報なし')}\n"
+            f"- motion_feature_reliable: {motion_observation.get('reliable', False)}"
+        )
         graph_section = (
             f"\n\n◆ Graph 概念要約\n{graph_result.get('summary_for_prompt', '')}"
             f"\n\n◆ Graph 上位候補\n{graph_result.get('candidate_summary', '')}"
@@ -391,6 +465,10 @@ class L2MCoTPipeline:
 【これまでの分析結果】
 
 ◆ Level 1: 幾何学的分析
+- 軌道の将来運動キュー: {level1_result.get('trajectory_motion_cue', 'N/A')}
+- 軌道キュー整合性: {level1_result.get('trajectory_motion_cue_consistency', 'N/A')}
+- 軌道キュー信頼度: {level1_result.get('trajectory_motion_cue_confidence', 0.0):.2f}
+- 軌道キュー生値: {level1_result.get('raw_trajectory_motion_cue', 'N/A')}
 - 道路形状: {level1_result.get('road_shape')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation')}
 - 道路の勾配: {level1_result.get('slope')}
@@ -401,13 +479,16 @@ class L2MCoTPipeline:
 ◆ Level 2: 物理法則との整合性
 - 加速度の原因: {level2_result.get('acceleration_cause')}
 - 速度トレンド: {level2_result.get('speed_trend')}
-{graph_section}
+{motion_section}{graph_section}
 
 ◆ センサーデータ
 - 現在速度: {speed:.1f} km/h{speed_diff_text}
+- 時間正規化した速度変化率: {speed_change_rate:+.2f} km/h/s
 - ジャイロ（旋回速度）: {gyro_z:.3f} rad/s（正=左旋回、負=右旋回）
 - ブレーキ: {'ON' if brake > 0 else 'OFF'}
 - ウィンカー: {blinker_status}{sensor_hints_section}
+
+{self._trajectory_overlay_guidelines()}
 
 【必ず以下の11クラスから1つ選択してください】
 0: その他
@@ -439,6 +520,7 @@ class L2MCoTPipeline:
 4. **加速・減速の判定**:
    - 加速度の原因がDRIVER_BRAKEの場合 → カテゴリ3（減速）
    - 速度変化量が大きい場合 → カテゴリ2（加速）またはカテゴリ3（減速）
+   - `direct_motion_trend` が INCREASING / DECREASING のときは、その符号を優先して整合するカテゴリを選ぶ
 
 5. **Graph 概念を必ず確認**:
    - `Graph 上位候補` は中間概念から構成された候補である
@@ -449,6 +531,17 @@ class L2MCoTPipeline:
    - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
    - 速度変化（2,3）の可能性を除外した後に選択
    - 停止・発進（4,5）の可能性を除外した後に選択
+
+7. **停止（4）の抑制ルール**:
+   - 速度が 1 km/h を超えていて、かつブレーキが OFF の場合は停止（4）を選ばない
+   - Graph や direct_motion_trend が減速・旋回を示している場合、停止よりそちらを優先する
+
+8. **軌道オーバーレイ優先ルール**:
+   - まず `trajectory_motion_cue` を見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれかを決める
+   - 赤い軌道が連続的に曲がるなら TURN を優先する
+   - 赤い軌道が横移動主体で交差点が弱いなら LANE CHANGE を優先する
+   - 背景だけで曲がって見えても、赤い軌道が直進なら TURN にしない
+   - `trajectory_motion_cue_consistency=CONTRADICTED` または `trajectory_motion_cue_confidence<0.5` の場合、その cue を単独で信用しない
 
 【タスク】
 上記の分析結果とルールを総合的に考慮して、最も適切なカテゴリを1つ選択してください。
@@ -628,6 +721,212 @@ class L2MCoTPipeline:
                 return f"{field_name}: {value}"
 
         return None
+
+    def _normalize_level1_result(self, level1_result: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(level1_result)
+        raw_cue = normalized.get('trajectory_motion_cue')
+        trajectory_relation = normalized.get('trajectory_relation', 'PARALLEL')
+        visual_shift = normalized.get('visual_shift', 'NO_SHIFT')
+        direction_change = normalized.get('direction_change', 'STRAIGHT')
+        intersection_detected = normalized.get('intersection_detected', 'NO')
+
+        fallback_cue = self._infer_fallback_trajectory_motion_cue(
+            trajectory_relation=trajectory_relation,
+            visual_shift=visual_shift,
+            direction_change=direction_change,
+        )
+        raw_cue = raw_cue or fallback_cue
+        validated_cue, cue_confidence, cue_consistency = self._validate_trajectory_motion_cue(
+            cue=raw_cue,
+            trajectory_relation=trajectory_relation,
+            visual_shift=visual_shift,
+            direction_change=direction_change,
+            intersection_detected=intersection_detected,
+        )
+
+        normalized['raw_trajectory_motion_cue'] = raw_cue
+        normalized['trajectory_motion_cue'] = validated_cue
+        normalized['trajectory_motion_cue_confidence'] = cue_confidence
+        normalized['trajectory_motion_cue_consistency'] = cue_consistency
+        return normalized
+
+    def _infer_fallback_trajectory_motion_cue(
+        self,
+        *,
+        trajectory_relation: str,
+        visual_shift: str,
+        direction_change: str,
+    ) -> str:
+        if trajectory_relation == 'CROSSING_LEFT':
+            return 'LEFT_LANE_CHANGE_CUE'
+        if trajectory_relation == 'CROSSING_RIGHT':
+            return 'RIGHT_LANE_CHANGE_CUE'
+        if direction_change == 'TURNING' and visual_shift == 'SHIFT_LEFT':
+            return 'LEFT_TURN_CUE'
+        if direction_change == 'TURNING' and visual_shift == 'SHIFT_RIGHT':
+            return 'RIGHT_TURN_CUE'
+        if trajectory_relation == 'PARALLEL':
+            return 'STRAIGHT_CUE'
+        return 'AMBIGUOUS'
+
+    def _validate_trajectory_motion_cue(
+        self,
+        *,
+        cue: str,
+        trajectory_relation: str,
+        visual_shift: str,
+        direction_change: str,
+        intersection_detected: str,
+    ) -> tuple[str, float, str]:
+        if not cue or cue == 'AMBIGUOUS':
+            return 'AMBIGUOUS', 0.0, 'UNKNOWN'
+
+        supports = 0
+        contradictions = 0
+
+        if cue == 'STRAIGHT_CUE':
+            if trajectory_relation == 'PARALLEL':
+                supports += 1
+            if direction_change == 'STRAIGHT':
+                supports += 1
+            if visual_shift == 'NO_SHIFT':
+                supports += 1
+            if intersection_detected == 'NO':
+                supports += 1
+        elif cue in {'LEFT_TURN_CUE', 'RIGHT_TURN_CUE'}:
+            expected_shift = 'SHIFT_LEFT' if cue == 'LEFT_TURN_CUE' else 'SHIFT_RIGHT'
+            if direction_change == 'TURNING':
+                supports += 1
+            else:
+                contradictions += 1
+            if visual_shift == expected_shift:
+                supports += 1
+            elif visual_shift == 'NO_SHIFT':
+                contradictions += 1
+            if intersection_detected == 'YES':
+                supports += 1
+            elif intersection_detected == 'NO':
+                contradictions += 1
+            if trajectory_relation != 'PARALLEL':
+                supports += 1
+            else:
+                contradictions += 1
+        elif cue in {'LEFT_LANE_CHANGE_CUE', 'RIGHT_LANE_CHANGE_CUE'}:
+            expected_relation = 'CROSSING_LEFT' if cue == 'LEFT_LANE_CHANGE_CUE' else 'CROSSING_RIGHT'
+            if trajectory_relation == expected_relation:
+                supports += 2
+            elif trajectory_relation == 'PARALLEL':
+                contradictions += 1
+            if intersection_detected == 'NO':
+                supports += 1
+            elif intersection_detected == 'YES':
+                contradictions += 1
+            if direction_change == 'STRAIGHT':
+                supports += 1
+            elif direction_change == 'TURNING':
+                contradictions += 1
+
+        total = supports + contradictions
+        confidence = 0.0 if total == 0 else round(supports / total, 2)
+
+        if contradictions >= 3 and supports == 0:
+            return 'AMBIGUOUS', 0.0, 'CONTRADICTED'
+        if confidence < 0.35:
+            return 'AMBIGUOUS', confidence, 'CONTRADICTED'
+        if confidence < 0.6:
+            return cue, confidence, 'WEAK'
+        return cue, confidence, 'CONSISTENT'
+
+    def _build_motion_observation(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        speed_diff = float(sensor_data.get('speed_diff', 0.0) or 0.0)
+        timestamp_diff_sec = float(sensor_data.get('timestamp_diff_sec', 0.0) or 0.0)
+        speed_change_rate = float(sensor_data.get('speed_change_rate', 0.0) or 0.0)
+        brake = int(sensor_data.get('brake', 0) or 0)
+        motion_feature_reliable = self._is_motion_feature_reliable(sensor_data)
+
+        has_reliable_rate = motion_feature_reliable and 0.0 < timestamp_diff_sec <= self.MAX_RELIABLE_TIME_DIFF_SEC
+        direct_accel = (
+            (motion_feature_reliable and speed_diff >= self.STRONG_SPEED_DIFF_THRESHOLD)
+            or (has_reliable_rate and speed_change_rate >= self.SPEED_RATE_THRESHOLD)
+        )
+        direct_decel = (
+            brake > 0
+            or (motion_feature_reliable and speed_diff <= -self.STRONG_SPEED_DIFF_THRESHOLD)
+            or (has_reliable_rate and speed_change_rate <= -self.SPEED_RATE_THRESHOLD)
+        )
+
+        if direct_decel and not direct_accel:
+            cause = 'DRIVER_BRAKE' if brake > 0 else 'MIXED'
+            reason = 'brake=ON' if brake > 0 else 'negative speed delta / rate'
+            return {'trend': 'DECREASING', 'cause': cause, 'reason': reason, 'reliable': motion_feature_reliable}
+
+        if direct_accel and not direct_decel:
+            return {
+                'trend': 'INCREASING',
+                'cause': 'DRIVER_ACCEL',
+                'reason': 'positive speed delta / rate',
+                'reliable': motion_feature_reliable,
+            }
+
+        if (
+            ((motion_feature_reliable and abs(speed_diff) <= self.SPEED_DIFF_THRESHOLD) or not motion_feature_reliable)
+            and (not has_reliable_rate or abs(speed_change_rate) <= self.STABLE_SPEED_RATE_THRESHOLD)
+            and brake == 0
+        ):
+            reason = 'small speed delta / rate' if motion_feature_reliable else 'speed delta ignored due to long lookback'
+            return {'trend': 'STABLE', 'cause': 'MIXED', 'reason': reason, 'reliable': motion_feature_reliable}
+
+        reason = 'sensor evidence weak'
+        if not motion_feature_reliable and brake == 0:
+            reason = f'ignored speed delta because lookback={timestamp_diff_sec:.2f}s'
+        return {'trend': None, 'cause': None, 'reason': reason, 'reliable': motion_feature_reliable}
+
+    def _format_motion_summary(self, sensor_data: Dict[str, Any]) -> str:
+        motion = self._build_motion_observation(sensor_data)
+        trend = motion.get('trend') or 'UNKNOWN'
+        cause = motion.get('cause') or 'UNKNOWN'
+        reason = motion.get('reason') or 'unknown'
+        return f"{trend} / {cause} ({reason})"
+
+    def _normalize_level2_result(
+        self,
+        sensor_data: Dict[str, Any],
+        level2_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized = dict(level2_result)
+        motion = self._build_motion_observation(sensor_data)
+        overrides = []
+        motion_feature_reliable = self._is_motion_feature_reliable(sensor_data)
+
+        observed_trend = motion.get('trend')
+        observed_cause = motion.get('cause')
+
+        if observed_trend in {'INCREASING', 'DECREASING', 'STABLE'}:
+            original_trend = normalized.get('speed_trend', 'STABLE')
+            if original_trend != observed_trend:
+                overrides.append(f"speed_trend {original_trend}->{observed_trend}")
+            normalized['speed_trend'] = observed_trend
+
+        if observed_cause in {'DRIVER_ACCEL', 'DRIVER_BRAKE'}:
+            original_cause = normalized.get('acceleration_cause', 'MIXED')
+            if original_cause != observed_cause:
+                overrides.append(f"acceleration_cause {original_cause}->{observed_cause}")
+            normalized['acceleration_cause'] = observed_cause
+        elif not motion_feature_reliable:
+            original_cause = normalized.get('acceleration_cause', 'MIXED')
+            if original_cause in {'DRIVER_ACCEL', 'DRIVER_BRAKE'}:
+                overrides.append(f"acceleration_cause {original_cause}->MIXED")
+                normalized['acceleration_cause'] = 'MIXED'
+
+        if overrides:
+            reasoning = normalized.get('reasoning', '')
+            override_text = '; '.join(overrides)
+            normalized['reasoning'] = (
+                f"{reasoning} | sensor_normalized: {override_text}"
+                if reasoning else f"sensor_normalized: {override_text}"
+            )
+
+        return normalized
     
     def _get_sensor_hints(self, sensor_data: Dict[str, Any]) -> str:
         """
@@ -683,9 +982,16 @@ class L2MCoTPipeline:
         speed = sensor_data.get('speed', 0)
         gyro_z = abs(sensor_data.get('gyro_z', 0))
         brake = sensor_data.get('brake', 0)
+        motion_observation = self._build_motion_observation(sensor_data)
+        strong_candidate = graph_result.get("strong_candidate") if graph_result else None
 
         # ルール1: 速度0かつブレーキON → 停止(4)に強制補正
-        if speed < SPEED_STOP_THRESHOLD and brake > 0 and predicted_label != 4:
+        if (
+            speed < SPEED_STOP_THRESHOLD
+            and brake > 0
+            and motion_observation.get('trend') != 'DECREASING'
+            and predicted_label != 4
+        ):
             logger.info(
                 f"[PostProcess] Rule1: speed={speed:.1f}, brake={brake} → force category 4 (停止)"
             )
@@ -701,7 +1007,6 @@ class L2MCoTPipeline:
 
         # ルール3: Graph が強い非 1/4 候補を示し、かつ 1/4 への偏りが疑われる場合は補正
         if graph_result:
-            strong_candidate = graph_result.get("strong_candidate")
             label_support = graph_result.get("label_support", {})
             if strong_candidate:
                 strong_id = strong_candidate["category_id"]
@@ -724,6 +1029,30 @@ class L2MCoTPipeline:
                         margin,
                     )
                     return strong_id
+
+        # ルール4: 停止予測だが停止条件を満たさない場合は stop bias を補正
+        if predicted_label == 4 and (speed > SPEED_STOP_THRESHOLD or brake == 0):
+            if strong_candidate and strong_candidate["category_id"] != 4 and strong_candidate["score"] >= 0.55:
+                logger.info(
+                    "[PostProcess] Rule4(Graph): correcting stop bias %s -> %s",
+                    predicted_label,
+                    strong_candidate["category_id"],
+                )
+                return strong_candidate["category_id"]
+            if motion_observation.get('trend') == 'DECREASING':
+                return 3
+            if motion_observation.get('trend') == 'STABLE' and gyro_z <= GYRO_THRESHOLD:
+                return 1
+
+        # ルール5: 加速/減速が direct_motion_trend と逆なら補正
+        if predicted_label == 2 and motion_observation.get('trend') == 'DECREASING':
+            if strong_candidate and strong_candidate["category_id"] != 2 and strong_candidate["score"] >= 0.55:
+                return strong_candidate["category_id"]
+            return 3
+        if predicted_label == 3 and motion_observation.get('trend') == 'INCREASING':
+            if strong_candidate and strong_candidate["category_id"] != 3 and strong_candidate["score"] >= 0.55:
+                return strong_candidate["category_id"]
+            return 2
 
         return predicted_label
 

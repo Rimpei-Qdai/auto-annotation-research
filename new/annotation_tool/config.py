@@ -52,15 +52,25 @@ ACTION_LABELS = {
 PROMPT_TEMPLATE = """You are an AI assistant analyzing taxi driving behavior.
 Classify the driver's action from the provided video frames and sensor data.
 
-**CRITICAL**: Analyze the RED trajectory line primarily to determine the vehicle's action.
+**CRITICAL**: Treat the RED trajectory overlay as the primary motion prompt.
+It visualizes the ego vehicle's predicted path for the next 3 seconds.
+Read the red points from near to far as time-ordered future positions, then use the road scene only to interpret lane/intersection context.
 
 Visual Indicators in the frames:
 - RED LINE/DOTS: Predicted trajectory of the vehicle for the next 3 seconds
   * Each red dot represents a future position
-  * If RED trajectory curves significantly LEFT → Consider "6" (Left turn)
-  * If RED trajectory curves significantly RIGHT → Consider "7" (Right turn)
+  * First decide whether the red trajectory indicates STRAIGHT / LEFT TURN CUE / RIGHT TURN CUE / LEFT LANE CHANGE CUE / RIGHT LANE CHANGE CUE
+  * If RED trajectory curves significantly LEFT at an intersection → Consider "6" (Left turn)
+  * If RED trajectory curves significantly RIGHT at an intersection → Consider "7" (Right turn)
+  * If RED trajectory shifts laterally without intersection context → Consider "8"/"9" (Lane change)
   * If RED trajectory follows GREEN line (straight) → Consider "1", "2", "3", "5" based on speed
 - GREEN LINE: Straight-ahead reference line
+
+Decision protocol:
+1. Read the red trajectory alone and summarize the future motion cue.
+2. Compare the red trajectory against the green reference line.
+3. Use the background only to decide whether the cue happens in lane-following or intersection context.
+4. Verify that the chosen label is consistent across all visible frames.
 
 Reference Sensor Data (supplementary):
 - Speed: {speed} km/h
