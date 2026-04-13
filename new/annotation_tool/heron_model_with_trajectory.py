@@ -405,7 +405,8 @@ class HeronAnnotatorWithTrajectory:
         self,
         frames: List[Image.Image],
         sensor_data: Dict[str, Any],
-        sample_id: Optional[int] = None
+        sample_id: Optional[int] = None,
+        trajectory_bundle: Optional[Dict[str, Any]] = None,
     ) -> List[Image.Image]:
         """
         Draw trajectory on all frames
@@ -421,25 +422,16 @@ class HeronAnnotatorWithTrajectory:
         if not frames:
             logger.warning("No frames to draw trajectory on")
             return frames
-        
-        # Extract sensor data for trajectory calculation
-        speed = sensor_data.get('speed', 0.0)  # km/h
-        gyro_z = sensor_data.get('gyro_z', 0.0)  # rad/s (yaw rate)
-        
-        # Convert speed to m/s
-        speed_ms = speed / 3.6
-        
-        # Create speed and yaw rate sequences for 3 seconds (30 steps * 0.1s)
-        num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
-        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        
-        # Calculate 3D trajectory using Bicycle Model
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
-        
-        # Project to 2D image coordinates
-        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
-        
+
+        if trajectory_bundle is None:
+            trajectory_bundle = self._build_trajectory_bundle(sensor_data)
+
+        speed = float(sensor_data.get('speed', 0.0) or 0.0)  # km/h
+        gyro_z = float(sensor_data.get('gyro_z', 0.0) or 0.0)  # rad/s (yaw rate)
+        trajectory_3d = trajectory_bundle["trajectory_3d"]
+        image_points = trajectory_bundle["image_points"]
+        valid_mask = trajectory_bundle["valid_mask"]
+
         visible_count = np.sum(valid_mask)
         logger.info(f"Trajectory: {visible_count}/{len(valid_mask)} points visible")
         
@@ -488,6 +480,40 @@ class HeronAnnotatorWithTrajectory:
         
         logger.info(f"Drew trajectory on {len(frames_with_trajectory)} frames")
         return frames_with_trajectory
+
+    def _build_trajectory_bundle(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate trajectory and deterministic red-line features from the same data used for drawing."""
+        speed = float(sensor_data.get('speed', 0.0) or 0.0)  # km/h
+        gyro_z = float(sensor_data.get('gyro_z', 0.0) or 0.0)  # rad/s
+
+        speed_ms = speed / 3.6
+        num_steps = 30
+        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+
+        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+        trajectory_features = self.trajectory_visualizer.extract_trajectory_features(
+            trajectory_3d=trajectory_3d,
+            image_points=image_points,
+            valid_mask=valid_mask,
+            speed_kmh=speed,
+        )
+        logger.info("Deterministic trajectory features: %s", trajectory_features)
+
+        return {
+            "trajectory_3d": trajectory_3d,
+            "image_points": image_points,
+            "valid_mask": valid_mask,
+            "features": trajectory_features,
+        }
+
+    def _augment_sensor_data_with_trajectory_features(self, sensor_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Attach deterministic red-line features to sensor_data for downstream reasoning."""
+        trajectory_bundle = self._build_trajectory_bundle(sensor_data)
+        enriched_sensor_data = dict(sensor_data)
+        enriched_sensor_data.update(trajectory_bundle["features"])
+        return enriched_sensor_data, trajectory_bundle
     
     def predict_action(
         self,
@@ -555,15 +581,22 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[L2M+CoT] Extracted {len(frames)} frames at indices {frame_indices}")
-            
+
+            enriched_sensor_data, trajectory_bundle = self._augment_sensor_data_with_trajectory_features(sensor_data)
+
             # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
+            frames_with_trajectory = self.draw_trajectory_on_frames(
+                frames,
+                enriched_sensor_data,
+                sample_id,
+                trajectory_bundle=trajectory_bundle,
+            )
             
             # Create L2M pipeline
             pipeline = L2MCoTPipeline(self.generation_runtime)
             
             # Run L2M analysis with trajectory-enhanced frames
-            result = pipeline.analyze_with_l2m(frames_with_trajectory, sensor_data)
+            result = pipeline.analyze_with_l2m(frames_with_trajectory, enriched_sensor_data)
 
             # 詳細結果を保持（predict_action_with_details から参照できるよう）
             self._last_l2m_result = result
@@ -617,17 +650,24 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[Multi-frame with trajectory] Using {len(frames)} frames at indices {frame_indices}")
-            
+
+            enriched_sensor_data, trajectory_bundle = self._augment_sensor_data_with_trajectory_features(sensor_data)
+
             # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
+            frames_with_trajectory = self.draw_trajectory_on_frames(
+                frames,
+                enriched_sensor_data,
+                sample_id,
+                trajectory_bundle=trajectory_bundle,
+            )
             
             # Format prompt with sensor data
             prompt_text = PROMPT_TEMPLATE.format(
-                speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
-                brake=sensor_data.get('brake', 0)
+                speed=enriched_sensor_data.get('speed', 0),
+                acc_x=enriched_sensor_data.get('acc_x', 0),
+                acc_y=enriched_sensor_data.get('acc_y', 0),
+                acc_z=enriched_sensor_data.get('acc_z', 0),
+                brake=enriched_sensor_data.get('brake', 0)
             )
             
             generated_text = self.generation_runtime.generate_text(

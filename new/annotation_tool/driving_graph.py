@@ -25,6 +25,7 @@ class DrivingConceptGraphBuilder:
     MAX_RELIABLE_TIME_DIFF_SEC = 4.0
     MAX_RELIABLE_MOTION_LOOKBACK_SEC = 10.0
     START_SPEED_THRESHOLD = 5.0
+    STOPLIKE_SPEED_THRESHOLD = 12.0
     STRONG_SUPPORT_THRESHOLD = 0.75
     STRONG_MARGIN_THRESHOLD = 0.15
 
@@ -70,6 +71,12 @@ class DrivingConceptGraphBuilder:
         blinker_r = int(sensor_data.get("blinker_r", 0) or 0)
         blinker_l = int(sensor_data.get("blinker_l", 0) or 0)
         motion_feature_reliable = self._is_motion_feature_reliable(sensor_data)
+        trajectory_point_like = bool(sensor_data.get("trajectory_point_like", False))
+        trajectory_visual_speed_state = sensor_data.get("trajectory_visual_speed_state", "UNKNOWN")
+        trajectory_length_state = sensor_data.get("trajectory_length_state", "UNKNOWN")
+        trajectory_lateral_offset_m = float(sensor_data.get("trajectory_lateral_offset_m", 0.0) or 0.0)
+        trajectory_heading_delta_rad = float(sensor_data.get("trajectory_heading_delta_rad", 0.0) or 0.0)
+        trajectory_curvature_score = float(sensor_data.get("trajectory_curvature_score", 0.0) or 0.0)
 
         speed_trend = level2_result.get("speed_trend", "STABLE")
         acceleration_cause = level2_result.get("acceleration_cause", "MIXED")
@@ -98,6 +105,8 @@ class DrivingConceptGraphBuilder:
             speed_change_rate=speed_change_rate,
             brake=brake,
             motion_feature_reliable=motion_feature_reliable,
+            trajectory_point_like=trajectory_point_like,
+            trajectory_visual_speed_state=trajectory_visual_speed_state,
             speed_trend=speed_trend,
             acceleration_cause=acceleration_cause,
         )
@@ -122,6 +131,10 @@ class DrivingConceptGraphBuilder:
             trajectory_direction = "LEFT"
         elif gyro_z < -GYRO_THRESHOLD or visual_shift == "SHIFT_RIGHT":
             trajectory_direction = "RIGHT"
+        elif trajectory_lateral_offset_m > 0.45:
+            trajectory_direction = "LEFT"
+        elif trajectory_lateral_offset_m < -0.45:
+            trajectory_direction = "RIGHT"
         elif direction_change == "TURNING":
             if road_shape == "CURVE_LEFT":
                 trajectory_direction = "LEFT"
@@ -134,9 +147,17 @@ class DrivingConceptGraphBuilder:
 
         if trusted_motion_cue and trajectory_motion_cue in {"LEFT_TURN_CUE", "RIGHT_TURN_CUE"}:
             turn_intensity = "HIGH"
-        elif abs(gyro_z) > GYRO_THRESHOLD * 1.8 or direction_change == "TURNING":
+        elif (
+            abs(gyro_z) > GYRO_THRESHOLD * 1.8
+            or direction_change == "TURNING"
+            or trajectory_curvature_score >= 0.28
+        ):
             turn_intensity = "HIGH"
-        elif abs(gyro_z) > GYRO_THRESHOLD * 0.8 or visual_shift != "NO_SHIFT":
+        elif (
+            abs(gyro_z) > GYRO_THRESHOLD * 0.8
+            or visual_shift != "NO_SHIFT"
+            or trajectory_curvature_score >= 0.14
+        ):
             turn_intensity = "MEDIUM"
         else:
             turn_intensity = "LOW"
@@ -156,6 +177,8 @@ class DrivingConceptGraphBuilder:
             intersection_state = "YES"
         elif intersection_detected == "NO":
             intersection_state = "NO"
+        elif intersection_detected == "UNCERTAIN":
+            intersection_state = "UNCERTAIN"
         else:
             intersection_state = "UNKNOWN"
 
@@ -166,6 +189,8 @@ class DrivingConceptGraphBuilder:
             speed_diff=speed_diff,
             speed_change_rate=speed_change_rate,
             motion_feature_reliable=motion_feature_reliable,
+            trajectory_point_like=trajectory_point_like,
+            trajectory_visual_speed_state=trajectory_visual_speed_state,
         )
 
         return {
@@ -183,6 +208,12 @@ class DrivingConceptGraphBuilder:
             "consistency_check": consistency_check,
             "road_shape": road_shape,
             "motion_feature_reliable": motion_feature_reliable,
+            "trajectory_point_like": trajectory_point_like,
+            "trajectory_visual_speed_state": trajectory_visual_speed_state,
+            "trajectory_length_state": trajectory_length_state,
+            "trajectory_lateral_offset_m": trajectory_lateral_offset_m,
+            "trajectory_heading_delta_rad": trajectory_heading_delta_rad,
+            "trajectory_curvature_score": trajectory_curvature_score,
         }
 
     def _is_motion_feature_reliable(self, sensor_data: Dict[str, Any]) -> bool:
@@ -202,6 +233,8 @@ class DrivingConceptGraphBuilder:
         speed_change_rate: float,
         brake: int,
         motion_feature_reliable: bool,
+        trajectory_point_like: bool,
+        trajectory_visual_speed_state: str,
         speed_trend: str,
         acceleration_cause: str,
     ) -> str:
@@ -224,10 +257,25 @@ class DrivingConceptGraphBuilder:
             and brake == 0
         )
 
+        if (
+            trajectory_point_like
+            and trajectory_visual_speed_state == "STOPPED"
+            and speed < self.STOPLIKE_SPEED_THRESHOLD
+        ):
+            if direct_accel and brake == 0:
+                return "STARTING"
+            if brake > 0 or (speed < self.START_SPEED_THRESHOLD and direct_decel):
+                return "STOPPED"
+
         if speed < SPEED_STOP_THRESHOLD and brake > 0 and not direct_accel:
             return "STOPPED"
 
-        if speed < self.START_SPEED_THRESHOLD and direct_accel and brake == 0:
+        if (
+            speed < self.STOPLIKE_SPEED_THRESHOLD
+            and direct_accel
+            and brake == 0
+            and trajectory_visual_speed_state in {"STOPPED", "SLOW"}
+        ):
             return "STARTING"
 
         if direct_decel and not direct_accel:
@@ -256,12 +304,30 @@ class DrivingConceptGraphBuilder:
         speed_diff: float,
         speed_change_rate: float,
         motion_feature_reliable: bool,
+        trajectory_point_like: bool,
+        trajectory_visual_speed_state: str,
     ) -> str:
+        if (
+            trajectory_point_like
+            and trajectory_visual_speed_state == "STOPPED"
+            and speed < self.STOPLIKE_SPEED_THRESHOLD
+        ):
+            if brake > 0 or (speed_state in {"STOPPED", "DECELERATING"} and speed < SPEED_STOP_THRESHOLD):
+                return "HIGH"
+            return "MEDIUM"
+
         if speed < SPEED_STOP_THRESHOLD and brake > 0 and speed_state == "STOPPED":
             return "HIGH"
 
         if (
-            speed < self.START_SPEED_THRESHOLD
+            speed < self.STOPLIKE_SPEED_THRESHOLD
+            and trajectory_visual_speed_state in {"STOPPED", "SLOW"}
+            and speed_state in {"STOPPED", "DECELERATING", "CONSTANT"}
+        ):
+            return "MEDIUM" if brake == 0 else "HIGH"
+
+        if (
+            speed < self.STOPLIKE_SPEED_THRESHOLD
             and speed_state == "DECELERATING"
             and (
                 brake > 0
@@ -355,6 +421,15 @@ class DrivingConceptGraphBuilder:
                     "reason": "交差点あり + 左右方向変化",
                 }
             )
+        elif concepts["intersection_state"] == "UNCERTAIN" and concepts["trajectory_direction"] in {"LEFT", "RIGHT"}:
+            edges.append(
+                {
+                    "source": "intersection_state",
+                    "target": "trajectory_direction",
+                    "type": "weak_turn_context",
+                    "reason": "交差点文脈は不確実だが左右方向変化あり",
+                }
+            )
 
         if concepts["intersection_state"] == "NO" and concepts["lane_crossing_state"] in {"LEFT", "RIGHT"}:
             edges.append(
@@ -405,6 +480,8 @@ class DrivingConceptGraphBuilder:
         trajectory_motion_cue_consistency = concepts["trajectory_motion_cue_consistency"]
         turn_intensity = concepts["turn_intensity"]
         stop_likelihood = concepts["stop_likelihood"]
+        trajectory_point_like = bool(concepts.get("trajectory_point_like", False))
+        trajectory_visual_speed_state = concepts.get("trajectory_visual_speed_state", "UNKNOWN")
         trusted_cue = (
             trajectory_motion_cue_consistency == "CONSISTENT"
             and trajectory_motion_cue_confidence >= 0.6
@@ -414,12 +491,17 @@ class DrivingConceptGraphBuilder:
         cue_lane_bonus = round(0.25 * trajectory_motion_cue_confidence, 3)
 
         if stop_likelihood == "HIGH":
-            add(4, 0.75, "速度≈0かつブレーキONで停止候補")
+            add(4, 0.80, "停止寄りの証拠が強い")
         elif stop_likelihood == "MEDIUM":
-            add(4, 0.25, "低速の減速継続で停止寄り")
+            add(4, 0.18, "低速で停止寄り")
+        if trajectory_point_like and trajectory_visual_speed_state == "STOPPED":
+            point_bonus = 0.12 if brake > 0 or speed < SPEED_STOP_THRESHOLD else 0.06
+            add(4, point_bonus, "赤い軌道が点状で停止寄り")
+            if speed < self.STOPLIKE_SPEED_THRESHOLD and brake > 0:
+                add(4, 0.12, "低速かつブレーキONで停止候補を補強")
 
         if speed_state == "STARTING":
-            add(5, 0.75, "低速からの加速で発進候補")
+            add(5, 0.85, "停止寄り状態からの立ち上がりで発進候補")
         if speed_state == "ACCELERATING":
             add(2, 0.70, "速度差分またはトレンドが加速")
         if speed_state == "DECELERATING":
@@ -428,8 +510,9 @@ class DrivingConceptGraphBuilder:
             add(3, 0.20, "ブレーキONで減速候補を補強")
 
         if speed_state == "CONSTANT" and direction == "STRAIGHT":
-            add(1, 0.75, "直進かつ速度変化が小さい")
-        if signal == "OFF" and lane_crossing == "NONE" and intersection != "YES":
+            constant_bonus = 0.35 if stop_likelihood in {"HIGH", "MEDIUM"} else 0.75
+            add(1, constant_bonus, "直進かつ速度変化が小さい")
+        if signal == "OFF" and lane_crossing == "NONE" and intersection != "YES" and stop_likelihood == "LOW":
             add(1, 0.15, "旋回・車線変更の証拠が弱い")
 
         if direction == "LEFT":
@@ -485,6 +568,10 @@ class DrivingConceptGraphBuilder:
         elif intersection == "YES" and direction == "RIGHT":
             add(7, 0.25, "交差点あり + 右方向変化で右折寄り")
             add(9, -0.15, "交差点ありのため右車線変更候補を減衰")
+        elif intersection == "UNCERTAIN" and direction == "LEFT":
+            add(6, 0.10, "交差点文脈は不確実だが左折候補を弱く支持")
+        elif intersection == "UNCERTAIN" and direction == "RIGHT":
+            add(7, 0.10, "交差点文脈は不確実だが右折候補を弱く支持")
 
         if intersection == "NO" and lane_crossing == "LEFT":
             add(8, 0.20, "交差点なし + 左車線横断で左車線変更寄り")
@@ -499,6 +586,12 @@ class DrivingConceptGraphBuilder:
         elif signal == "RIGHT":
             add(7, 0.15, "右ウィンカーON")
             add(9, 0.10, "右ウィンカーは右車線変更候補も補強")
+
+        if signal == "OFF" and speed_state == "CONSTANT" and intersection != "YES":
+            if direction == "LEFT":
+                add(6, -0.15, "交差点確証とウィンカーが弱く左折候補を減衰")
+            elif direction == "RIGHT":
+                add(7, -0.15, "交差点確証とウィンカーが弱く右折候補を減衰")
 
         # Keep scores in [0, 1]
         for label_id in label_support:
@@ -560,6 +653,11 @@ class DrivingConceptGraphBuilder:
             f"- trajectory_motion_cue: {concepts['trajectory_motion_cue']}",
             f"- trajectory_motion_cue_confidence: {concepts['trajectory_motion_cue_confidence']:.2f}",
             f"- trajectory_motion_cue_consistency: {concepts['trajectory_motion_cue_consistency']}",
+            f"- trajectory_visual_speed_state: {concepts.get('trajectory_visual_speed_state', 'UNKNOWN')}",
+            f"- trajectory_point_like: {concepts.get('trajectory_point_like', False)}",
+            f"- trajectory_length_state: {concepts.get('trajectory_length_state', 'UNKNOWN')}",
+            f"- trajectory_lateral_offset_m: {concepts.get('trajectory_lateral_offset_m', 0.0):.2f}",
+            f"- trajectory_heading_delta_rad: {concepts.get('trajectory_heading_delta_rad', 0.0):.2f}",
             f"- trajectory_direction: {concepts['trajectory_direction']}",
             f"- turn_intensity: {concepts['turn_intensity']}",
             f"- lane_crossing_state: {concepts['lane_crossing_state']}",

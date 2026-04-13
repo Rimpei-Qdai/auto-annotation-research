@@ -34,6 +34,9 @@ class L2MCoTPipeline:
     STABLE_SPEED_RATE_THRESHOLD = 0.25
     MAX_RELIABLE_TIME_DIFF_SEC = 4.0
     MAX_RELIABLE_MOTION_LOOKBACK_SEC = 10.0
+    STOPLIKE_SPEED_THRESHOLD = 12.0
+    LEVEL3_TOP_MARGIN_THRESHOLD = 0.10
+    LEVEL3_STRONG_SCORE_THRESHOLD = 0.78
     
     def __init__(self, frame_generator: FramePromptGenerator):
         """
@@ -51,6 +54,8 @@ class L2MCoTPipeline:
 - 赤い点と線は、自車の今から3秒先までの予測軌道です。
 - 赤い点は近い未来から遠い未来へ時間順に並んでいます。
 - まず赤い軌道だけを見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれに近いかを判断してください。
+- 赤い軌道の曲がり具合は左右旋回の主要 evidence です。
+- 赤い軌道の長さは速度の主要 evidence です。ほぼ点に見える場合は停止寄りに解釈してください。
 - 次に、緑の参照線との相対位置から、同一車線内の追従か横方向逸脱かを判断してください。
 - 背景映像は交差点・道路形状・車線文脈の確認に使い、運動の向きそのものは赤い軌道を優先してください。
 - 4フレーム全体で一貫する解釈を選んでください。"""
@@ -88,7 +93,7 @@ class L2MCoTPipeline:
 
         # Level 1: Geometric analysis
         logger.info("--- Level 1: Geometric Analysis ---")
-        level1_result = self._level1_geometry(frames)
+        level1_result = self._level1_geometry(frames, sensor_data)
         logger.info(f"Level 1 完了: {level1_result}")
 
         # Level 2: Physics consistency check
@@ -141,7 +146,7 @@ class L2MCoTPipeline:
             'error': pipeline_error,
         }
     
-    def _level1_geometry(self, frames: List[Image.Image]) -> Dict[str, Any]:
+    def _level1_geometry(self, frames: List[Image.Image], sensor_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Level 1: Analyze road geometry and trajectory relationship
         
@@ -199,6 +204,7 @@ class L2MCoTPipeline:
 (a) 交差点または角が前方に見えるか、または通過中ですか？
 - YES（交差点あり）
 - NO（交差点なし）
+- UNCERTAIN（映像だけでは断定できない）
 
 (b) 車両の進行方向が直進から変化していますか？（景色の流れ方向、地平線の傾きで判断）
 - TURNING（旋回中）
@@ -219,7 +225,7 @@ class L2MCoTPipeline:
   "road_shape": "STRAIGHT",
   "trajectory_relation": "PARALLEL",
   "slope": "FLAT",
-  "intersection_detected": "NO",
+  "intersection_detected": "UNCERTAIN",
   "direction_change": "STRAIGHT",
   "visual_shift": "NO_SHIFT"
 }}
@@ -232,7 +238,7 @@ class L2MCoTPipeline:
             if parsed is None:
                 # Default values when parsing fails
                 logger.warning(f"Level 1 JSON parse failed. Raw output: {raw_output[:300]}")
-                return {
+                parsed = {
                     'reasoning': raw_output[:500],
                     'trajectory_motion_cue': 'AMBIGUOUS',
                     'road_shape': 'STRAIGHT',
@@ -242,12 +248,12 @@ class L2MCoTPipeline:
                     'direction_change': 'STRAIGHT',
                     'visual_shift': 'NO_SHIFT'
                 }
-
+            parsed = self._apply_deterministic_trajectory_features(parsed, sensor_data)
             return self._normalize_level1_result(parsed)
 
         except Exception as e:
             logger.error(f"Level 1 推論エラー: {e}", exc_info=True)
-            return {
+            fallback = {
                 'reasoning': f"Error: {str(e)}",
                 'trajectory_motion_cue': 'AMBIGUOUS',
                 'road_shape': 'STRAIGHT',
@@ -257,6 +263,8 @@ class L2MCoTPipeline:
                 'direction_change': 'STRAIGHT',
                 'visual_shift': 'NO_SHIFT'
             }
+            fallback = self._apply_deterministic_trajectory_features(fallback, sensor_data)
+            return self._normalize_level1_result(fallback)
     
     def _level2_physics(
         self,
@@ -469,6 +477,12 @@ class L2MCoTPipeline:
 - 軌道キュー整合性: {level1_result.get('trajectory_motion_cue_consistency', 'N/A')}
 - 軌道キュー信頼度: {level1_result.get('trajectory_motion_cue_confidence', 0.0):.2f}
 - 軌道キュー生値: {level1_result.get('raw_trajectory_motion_cue', 'N/A')}
+- 軌道特徴ソース: {level1_result.get('trajectory_feature_source', 'N/A')}
+- 軌道の見え方による速度状態: {level1_result.get('trajectory_visual_speed_state', 'N/A')}
+- 軌道が点状か: {level1_result.get('trajectory_point_like', 'N/A')}
+- 軌道の長さ状態: {level1_result.get('trajectory_length_state', 'N/A')}
+- 軌道の横偏位[m]: {level1_result.get('trajectory_lateral_offset_m', 0.0):.2f}
+- 軌道の曲がり量[rad]: {level1_result.get('trajectory_heading_delta_rad', 0.0):.2f}
 - 道路形状: {level1_result.get('road_shape')}
 - 軌道と車線の関係: {level1_result.get('trajectory_relation')}
 - 道路の勾配: {level1_result.get('slope')}
@@ -510,11 +524,13 @@ class L2MCoTPipeline:
 
 2. **発進判定**:
    - 速度が5 km/h未満で速度トレンドがINCREASINGの場合 → カテゴリ5（発進）
+   - または、低速かつ stop-like な軌道から加速へ移る場合も発進候補として扱う
 
 3. **旋回・車線変更の判定（等速走行より優先）**:
    - |gyro_z| > 0.1 rad/s の場合 → カテゴリ6/7/8/9/10 を積極的に検討
    - ウィンカーONの場合 → 旋回または車線変更の強い証拠
    - 交差点検出=YES かつ 映像シフトあり → カテゴリ6または7
+   - 交差点検出=UNCERTAIN の場合、左右折と車線変更の両方を候補に残しつつ Graph の順位を優先する
    - 交差点なし かつ 車線シフト → カテゴリ8または9
 
 4. **加速・減速の判定**:
@@ -526,6 +542,8 @@ class L2MCoTPipeline:
    - `Graph 上位候補` は中間概念から構成された候補である
    - 特に、等速走行(1)や停止(4)を選ぶ前に Graph 候補との矛盾がないか確認する
    - 右左折・車線変更・減速の候補が Graph に強く出ている場合は優先的に検討する{strong_candidate_rule}
+   - Graph 1位と2位の score 差が明確な場合は、1位を不用意に覆さない
+   - Graph 1位が車線変更で intersection_detected が NO または UNCERTAIN のときは、左右折へ戻さない
 
 6. **等速走行（1）は最後の手段**:
    - 旋回・車線変更（6,7,8,9,10）の可能性を除外した後に選択
@@ -538,6 +556,8 @@ class L2MCoTPipeline:
 
 8. **軌道オーバーレイ優先ルール**:
    - まず `trajectory_motion_cue` を見て、将来運動が TURN / LANE CHANGE / STRAIGHT のどれかを決める
+   - `trajectory_feature_source=PROJECTED_RED_TRAJECTORY` のときは、赤い軌道の曲がり具合を左右旋回の主要 evidence とみなす
+   - `trajectory_point_like=True` のときは、赤い軌道は停止寄りの visual evidence とみなす
    - 赤い軌道が連続的に曲がるなら TURN を優先する
    - 赤い軌道が横移動主体で交差点が弱いなら LANE CHANGE を優先する
    - 背景だけで曲がって見えても、赤い軌道が直進なら TURN にしない
@@ -590,7 +610,12 @@ class L2MCoTPipeline:
             if 'confidence' not in parsed:
                 parsed['confidence'] = 0.7
 
-            return parsed
+            return self._apply_level3_graph_constraints(
+                parsed,
+                sensor_data=sensor_data,
+                level1_result=level1_result,
+                graph_result=graph_result,
+            )
             
         except Exception as e:
             logger.error(f"Level 3 推論エラー: {e}", exc_info=True)
@@ -600,6 +625,140 @@ class L2MCoTPipeline:
                 'category_name': 'その他',
                 'confidence': 0.0
             }
+
+    def _apply_level3_graph_constraints(
+        self,
+        parsed: Dict[str, Any],
+        *,
+        sensor_data: Dict[str, Any],
+        level1_result: Dict[str, Any],
+        graph_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        constrained = dict(parsed)
+        top_candidates = graph_result.get('top_candidates', []) if graph_result else []
+        if not top_candidates:
+            return constrained
+
+        concepts = graph_result.get('concepts', {}) if graph_result else {}
+        label_support = graph_result.get('label_support', {}) if graph_result else {}
+        predicted_label = int(constrained.get('category_id', 0))
+        top = top_candidates[0]
+        top_label = int(top['category_id'])
+        top_score = float(top['score'])
+        second_score = float(top_candidates[1]['score']) if len(top_candidates) > 1 else 0.0
+        predicted_score = float(label_support.get(predicted_label, 0.0))
+        margin = top_score - second_score
+        intersection_state = concepts.get('intersection_state', level1_result.get('intersection_detected', 'UNKNOWN'))
+        stop_likelihood = concepts.get('stop_likelihood', 'LOW')
+        trajectory_point_like = bool(concepts.get('trajectory_point_like', False))
+        motion_feature_reliable = bool(concepts.get('motion_feature_reliable', False))
+        speed = float(sensor_data.get('speed', 0.0) or 0.0)
+
+        if (
+            top_label != predicted_label
+            and top_score >= self.LEVEL3_STRONG_SCORE_THRESHOLD
+            and margin >= 0.18
+        ):
+            return self._override_level3_result(
+                constrained,
+                top_label,
+                reason=(
+                    f"Graph strong candidate {top_label}:{top['category_name']} "
+                    f"(score={top_score:.2f}, margin={margin:.2f})"
+                ),
+                confidence=max(float(constrained.get('confidence', 0.0) or 0.0), min(0.99, top_score)),
+            )
+
+        if (
+            predicted_label in {6, 7}
+            and top_label in {8, 9}
+            and intersection_state in {'NO', 'UNCERTAIN'}
+            and top_score >= 0.65
+            and (top_score - predicted_score) >= self.LEVEL3_TOP_MARGIN_THRESHOLD
+        ):
+            return self._override_level3_result(
+                constrained,
+                top_label,
+                reason=(
+                    f"lane-change constraint: intersection={intersection_state}, "
+                    f"Graph prefers {top_label}:{top['category_name']} over turn"
+                ),
+                confidence=max(float(constrained.get('confidence', 0.0) or 0.0), min(0.95, top_score)),
+            )
+
+        if (
+            predicted_label == 1
+            and top_label in {3, 4}
+            and speed <= self.STOPLIKE_SPEED_THRESHOLD
+            and stop_likelihood in {'HIGH', 'MEDIUM'}
+            and trajectory_point_like
+            and top_score >= 0.55
+        ):
+            target_label = 4 if stop_likelihood == 'HIGH' else top_label
+            return self._override_level3_result(
+                constrained,
+                target_label,
+                reason=(
+                    f"low-speed stop-like trajectory: stop_likelihood={stop_likelihood}, "
+                    f"Graph top={top_label}:{top['category_name']}"
+                ),
+                confidence=max(float(constrained.get('confidence', 0.0) or 0.0), min(0.95, top_score)),
+            )
+
+        if (
+            predicted_label in {1, 2}
+            and top_label == 5
+            and top_score >= 0.60
+        ):
+            return self._override_level3_result(
+                constrained,
+                5,
+                reason=f"Graph prefers start event (score={top_score:.2f})",
+                confidence=max(float(constrained.get('confidence', 0.0) or 0.0), min(0.95, top_score)),
+            )
+
+        if (
+            predicted_label in {6, 7}
+            and top_label in {1, 2, 3, 4, 5}
+            and top_score >= 0.65
+            and (top_score - predicted_score) >= self.LEVEL3_TOP_MARGIN_THRESHOLD
+        ):
+            if top_label in {2, 3} or not motion_feature_reliable or intersection_state != 'YES':
+                return self._override_level3_result(
+                    constrained,
+                    top_label,
+                    reason=(
+                        f"Graph prefers non-turn event {top_label}:{top['category_name']} "
+                        f"over turn (intersection={intersection_state}, motion_reliable={motion_feature_reliable})"
+                    ),
+                    confidence=max(float(constrained.get('confidence', 0.0) or 0.0), min(0.95, top_score)),
+                )
+
+        return constrained
+
+    def _override_level3_result(
+        self,
+        parsed: Dict[str, Any],
+        category_id: int,
+        *,
+        reason: str,
+        confidence: float,
+    ) -> Dict[str, Any]:
+        updated = dict(parsed)
+        previous_label = updated.get('category_id')
+        previous_name = updated.get('category_name', self._get_category_name(previous_label))
+        updated['category_id'] = category_id
+        updated['category_name'] = self._get_category_name(category_id)
+        updated['confidence'] = round(confidence, 2)
+        base_reasoning = updated.get('final_reasoning', '')
+        adjustment = (
+            f"post_constraint: {previous_label}:{previous_name} -> "
+            f"{category_id}:{updated['category_name']} ({reason})"
+        )
+        updated['final_reasoning'] = (
+            f"{base_reasoning} | {adjustment}" if base_reasoning else adjustment
+        )
+        return updated
     
     def _generate_with_frames(self, frames: List[Image.Image], prompt: str) -> str:
         """
@@ -722,13 +881,64 @@ class L2MCoTPipeline:
 
         return None
 
+    def _apply_deterministic_trajectory_features(
+        self,
+        level1_result: Dict[str, Any],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Override low-level geometric fields with deterministic red-line features."""
+        deterministic_mapping = {
+            'trajectory_motion_cue_deterministic': 'trajectory_motion_cue',
+            'trajectory_relation_deterministic': 'trajectory_relation',
+            'direction_change_deterministic': 'direction_change',
+            'visual_shift_deterministic': 'visual_shift',
+        }
+
+        merged = dict(level1_result)
+        applied = {}
+        for sensor_key, level1_key in deterministic_mapping.items():
+            value = sensor_data.get(sensor_key)
+            if value in {None, ""}:
+                continue
+            merged[f'vlm_{level1_key}'] = merged.get(level1_key)
+            merged[level1_key] = value
+            applied[level1_key] = value
+
+        for sensor_key in [
+            'trajectory_feature_source',
+            'trajectory_path_length_m',
+            'trajectory_visible_length_px',
+            'trajectory_visible_point_count',
+            'trajectory_point_like',
+            'trajectory_lateral_offset_m',
+            'trajectory_forward_extent_m',
+            'trajectory_heading_delta_rad',
+            'trajectory_curvature_score',
+            'trajectory_length_state',
+            'trajectory_visual_speed_state',
+        ]:
+            if sensor_key in sensor_data:
+                merged[sensor_key] = sensor_data.get(sensor_key)
+
+        if applied:
+            reasoning = merged.get('reasoning', '')
+            override_text = ", ".join(f"{k}={v}" for k, v in applied.items())
+            merged['reasoning'] = (
+                f"{reasoning} | deterministic_red_trajectory: {override_text}"
+                if reasoning else f"deterministic_red_trajectory: {override_text}"
+            )
+
+        return merged
+
     def _normalize_level1_result(self, level1_result: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(level1_result)
         raw_cue = normalized.get('trajectory_motion_cue')
         trajectory_relation = normalized.get('trajectory_relation', 'PARALLEL')
         visual_shift = normalized.get('visual_shift', 'NO_SHIFT')
         direction_change = normalized.get('direction_change', 'STRAIGHT')
-        intersection_detected = normalized.get('intersection_detected', 'NO')
+        normalized['vlm_intersection_detected'] = normalized.get('intersection_detected', 'NO')
+        intersection_detected = self._stabilize_intersection_detected(normalized)
+        normalized['intersection_detected'] = intersection_detected
 
         fallback_cue = self._infer_fallback_trajectory_motion_cue(
             trajectory_relation=trajectory_relation,
@@ -749,6 +959,58 @@ class L2MCoTPipeline:
         normalized['trajectory_motion_cue_confidence'] = cue_confidence
         normalized['trajectory_motion_cue_consistency'] = cue_consistency
         return normalized
+
+    def _stabilize_intersection_detected(
+        self,
+        level1_result: Dict[str, Any],
+    ) -> str:
+        raw_intersection = level1_result.get('intersection_detected', 'NO')
+        if raw_intersection == 'UNCERTAIN':
+            return 'UNCERTAIN'
+
+        trajectory_motion_cue = level1_result.get('trajectory_motion_cue', 'AMBIGUOUS')
+        trajectory_relation = level1_result.get('trajectory_relation', 'PARALLEL')
+        direction_change = level1_result.get('direction_change', 'STRAIGHT')
+        road_shape = level1_result.get('road_shape', 'STRAIGHT')
+        visual_shift = level1_result.get('visual_shift', 'NO_SHIFT')
+        trajectory_point_like = bool(level1_result.get('trajectory_point_like', False))
+        heading_delta = abs(float(level1_result.get('trajectory_heading_delta_rad', 0.0) or 0.0))
+        lateral_offset = abs(float(level1_result.get('trajectory_lateral_offset_m', 0.0) or 0.0))
+
+        if trajectory_point_like:
+            return 'NO'
+
+        if trajectory_motion_cue in {'LEFT_LANE_CHANGE_CUE', 'RIGHT_LANE_CHANGE_CUE'}:
+            return 'NO'
+
+        strong_turn_context = (
+            road_shape == 'STRAIGHT'
+            and direction_change == 'TURNING'
+            and visual_shift != 'NO_SHIFT'
+            and heading_delta >= 0.22
+            and lateral_offset >= 0.75
+        )
+
+        if raw_intersection == 'YES':
+            if (
+                trajectory_motion_cue == 'STRAIGHT_CUE'
+                and trajectory_relation == 'PARALLEL'
+                and direction_change == 'STRAIGHT'
+                and visual_shift == 'NO_SHIFT'
+            ):
+                return 'NO'
+            if strong_turn_context and trajectory_motion_cue in {'LEFT_TURN_CUE', 'RIGHT_TURN_CUE'}:
+                return 'YES'
+            return 'UNCERTAIN'
+
+        if trajectory_motion_cue in {'LEFT_TURN_CUE', 'RIGHT_TURN_CUE'}:
+            expected_curve = 'CURVE_LEFT' if trajectory_motion_cue == 'LEFT_TURN_CUE' else 'CURVE_RIGHT'
+            if road_shape == expected_curve and trajectory_relation == 'PARALLEL':
+                return 'NO'
+            if strong_turn_context:
+                return 'UNCERTAIN'
+
+        return 'NO'
 
     def _infer_fallback_trajectory_motion_cue(
         self,
@@ -984,6 +1246,12 @@ class L2MCoTPipeline:
         brake = sensor_data.get('brake', 0)
         motion_observation = self._build_motion_observation(sensor_data)
         strong_candidate = graph_result.get("strong_candidate") if graph_result else None
+        top_candidates = graph_result.get("top_candidates", []) if graph_result else []
+        top_candidate = top_candidates[0] if top_candidates else None
+        concepts = graph_result.get("concepts", {}) if graph_result else {}
+        intersection_state = concepts.get("intersection_state", "UNKNOWN")
+        stop_likelihood = concepts.get("stop_likelihood", "LOW")
+        trajectory_point_like = bool(concepts.get("trajectory_point_like", False))
 
         # ルール1: 速度0かつブレーキON → 停止(4)に強制補正
         if (
@@ -1030,8 +1298,33 @@ class L2MCoTPipeline:
                     )
                     return strong_id
 
+            if (
+                top_candidate
+                and predicted_label in {6, 7}
+                and top_candidate["category_id"] in {8, 9}
+                and intersection_state in {"NO", "UNCERTAIN"}
+                and float(top_candidate["score"]) >= 0.65
+            ):
+                predicted_score = float(label_support.get(predicted_label, 0.0))
+                if (float(top_candidate["score"]) - predicted_score) >= self.LEVEL3_TOP_MARGIN_THRESHOLD:
+                    logger.info(
+                        "[PostProcess] Rule3b(Graph): correcting turn -> lane change %s -> %s",
+                        predicted_label,
+                        top_candidate["category_id"],
+                    )
+                    return top_candidate["category_id"]
+
         # ルール4: 停止予測だが停止条件を満たさない場合は stop bias を補正
         if predicted_label == 4 and (speed > SPEED_STOP_THRESHOLD or brake == 0):
+            if (
+                strong_candidate
+                and strong_candidate["category_id"] == 4
+                and stop_likelihood in {"HIGH", "MEDIUM"}
+                and trajectory_point_like
+                and speed <= self.STOPLIKE_SPEED_THRESHOLD
+            ):
+                logger.info("[PostProcess] Rule4: keep stop due to strong stop-like graph evidence")
+                return 4
             if strong_candidate and strong_candidate["category_id"] != 4 and strong_candidate["score"] >= 0.55:
                 logger.info(
                     "[PostProcess] Rule4(Graph): correcting stop bias %s -> %s",
@@ -1044,6 +1337,23 @@ class L2MCoTPipeline:
             if motion_observation.get('trend') == 'STABLE' and gyro_z <= GYRO_THRESHOLD:
                 return 1
 
+        # ルール4b: 低速で stop-like な軌道なら、等速走行より停止/減速を優先
+        if (
+            predicted_label == 1
+            and speed <= self.STOPLIKE_SPEED_THRESHOLD
+            and trajectory_point_like
+            and stop_likelihood == "HIGH"
+        ):
+            if stop_likelihood == "HIGH":
+                logger.info("[PostProcess] Rule4b: stop-like trajectory -> 停止")
+                return 4
+            if top_candidate and top_candidate["category_id"] in {3, 4} and float(top_candidate["score"]) >= 0.55:
+                logger.info(
+                    "[PostProcess] Rule4b(Graph): constant speed -> %s due to stop-like trajectory",
+                    top_candidate["category_id"],
+                )
+                return top_candidate["category_id"]
+
         # ルール5: 加速/減速が direct_motion_trend と逆なら補正
         if predicted_label == 2 and motion_observation.get('trend') == 'DECREASING':
             if strong_candidate and strong_candidate["category_id"] != 2 and strong_candidate["score"] >= 0.55:
@@ -1053,6 +1363,32 @@ class L2MCoTPipeline:
             if strong_candidate and strong_candidate["category_id"] != 3 and strong_candidate["score"] >= 0.55:
                 return strong_candidate["category_id"]
             return 2
+
+        # ルール5b: turn 予測より speed-event の Graph 候補が明確に強い場合は補正
+        if (
+            top_candidate
+            and predicted_label in {6, 7}
+            and top_candidate["category_id"] in {1, 2, 3, 4, 5}
+            and float(top_candidate["score"]) >= 0.65
+        ):
+            predicted_score = float(graph_result.get("label_support", {}).get(predicted_label, 0.0))
+            if (float(top_candidate["score"]) - predicted_score) >= self.LEVEL3_TOP_MARGIN_THRESHOLD:
+                logger.info(
+                    "[PostProcess] Rule5b(Graph): correcting turn -> speed event %s -> %s",
+                    predicted_label,
+                    top_candidate["category_id"],
+                )
+                return top_candidate["category_id"]
+
+        # ルール6: Graph の発進候補が強い場合は発進を優先
+        if (
+            predicted_label in {1, 2}
+            and top_candidate
+            and top_candidate["category_id"] == 5
+            and float(top_candidate["score"]) >= 0.60
+        ):
+            logger.info("[PostProcess] Rule6(Graph): correcting %s -> 発進", predicted_label)
+            return 5
 
         return predicted_label
 

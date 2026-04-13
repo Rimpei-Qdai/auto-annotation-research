@@ -73,6 +73,11 @@ class TrajectoryVisualizer:
             self.T_v2c[:3, 3] = t
         else:
             self.T_v2c = T_v2c
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """Wrap angle to [-pi, pi]."""
+        return float((angle + np.pi) % (2 * np.pi) - np.pi)
     
     def calculate_trajectory(
         self,
@@ -153,6 +158,142 @@ class TrajectoryVisualizer:
         )
         
         return image_points, valid_mask
+
+    def extract_trajectory_features(
+        self,
+        trajectory_3d: np.ndarray,
+        image_points: Optional[np.ndarray] = None,
+        valid_mask: Optional[np.ndarray] = None,
+        speed_kmh: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        赤い軌道そのものから deterministic な特徴を抽出する。
+
+        主に以下を返す:
+        - 左右の曲がり方向
+        - 曲がりの強さ
+        - 横方向のずれ
+        - 線の長さに基づく速度の見え方
+        - Level 1 で使う cue / relation / shift
+        """
+        if trajectory_3d is None or len(trajectory_3d) == 0:
+            return {
+                "trajectory_feature_source": "PROJECTED_RED_TRAJECTORY",
+                "trajectory_path_length_m": 0.0,
+                "trajectory_visible_length_px": 0.0,
+                "trajectory_visible_point_count": 0,
+                "trajectory_point_like": True,
+                "trajectory_lateral_offset_m": 0.0,
+                "trajectory_forward_extent_m": 0.0,
+                "trajectory_heading_delta_rad": 0.0,
+                "trajectory_curvature_score": 0.0,
+                "trajectory_length_state": "POINT",
+                "trajectory_visual_speed_state": "STOPPED",
+                "trajectory_motion_cue_deterministic": "STRAIGHT_CUE",
+                "trajectory_relation_deterministic": "PARALLEL",
+                "direction_change_deterministic": "STRAIGHT",
+                "visual_shift_deterministic": "NO_SHIFT",
+            }
+
+        if image_points is None or valid_mask is None:
+            image_points, valid_mask = self.project_3d_to_2d(trajectory_3d)
+
+        diffs_xy = np.diff(trajectory_3d[:, :2], axis=0)
+        segment_lengths_m = np.linalg.norm(diffs_xy, axis=1) if len(diffs_xy) else np.array([], dtype=np.float32)
+        path_length_m = float(segment_lengths_m.sum())
+
+        forward_extent_m = float(max(0.0, trajectory_3d[-1, 0] - trajectory_3d[0, 0]))
+        lateral_offset_m = float(trajectory_3d[-1, 1] - trajectory_3d[0, 1])
+
+        nonzero_segments = diffs_xy[np.linalg.norm(diffs_xy, axis=1) > 1e-4] if len(diffs_xy) else np.empty((0, 2))
+        if len(nonzero_segments) >= 2:
+            start_heading = float(np.arctan2(nonzero_segments[0, 1], nonzero_segments[0, 0]))
+            end_heading = float(np.arctan2(nonzero_segments[-1, 1], nonzero_segments[-1, 0]))
+            heading_delta_rad = self._wrap_angle(end_heading - start_heading)
+        else:
+            heading_delta_rad = 0.0
+
+        curvature_score = abs(heading_delta_rad)
+        valid_points = image_points[valid_mask].astype(np.float32) if np.any(valid_mask) else np.empty((0, 2), dtype=np.float32)
+        if len(valid_points) >= 2:
+            visible_length_px = float(np.linalg.norm(np.diff(valid_points, axis=0), axis=1).sum())
+        else:
+            visible_length_px = 0.0
+
+        point_like = (
+            len(valid_points) <= 1
+            or visible_length_px < 18.0
+            or path_length_m < 0.8
+            or (speed_kmh is not None and speed_kmh < 1.0)
+        )
+
+        if point_like:
+            length_state = "POINT"
+            visual_speed_state = "STOPPED"
+        elif path_length_m < 3.0 or visible_length_px < 70.0:
+            length_state = "SHORT"
+            visual_speed_state = "SLOW"
+        elif path_length_m < 9.0 or visible_length_px < 180.0:
+            length_state = "MEDIUM"
+            visual_speed_state = "MEDIUM"
+        else:
+            length_state = "LONG"
+            visual_speed_state = "FAST"
+
+        if lateral_offset_m >= 0.45:
+            visual_shift = "SHIFT_LEFT"
+        elif lateral_offset_m <= -0.45:
+            visual_shift = "SHIFT_RIGHT"
+        else:
+            visual_shift = "NO_SHIFT"
+
+        abs_lateral_offset_m = abs(lateral_offset_m)
+        abs_heading_delta_rad = abs(heading_delta_rad)
+
+        if point_like:
+            motion_cue = "STRAIGHT_CUE"
+            direction_change = "STRAIGHT"
+            trajectory_relation = "PARALLEL"
+        elif abs_heading_delta_rad >= 0.18 and abs_lateral_offset_m >= 0.45:
+            motion_cue = "LEFT_TURN_CUE" if lateral_offset_m > 0 else "RIGHT_TURN_CUE"
+            direction_change = "TURNING"
+            if abs_lateral_offset_m >= 0.75:
+                trajectory_relation = "CROSSING_LEFT" if lateral_offset_m > 0 else "CROSSING_RIGHT"
+            else:
+                trajectory_relation = "PARALLEL"
+        elif abs_lateral_offset_m >= 0.75 and abs_heading_delta_rad < 0.18:
+            motion_cue = "LEFT_LANE_CHANGE_CUE" if lateral_offset_m > 0 else "RIGHT_LANE_CHANGE_CUE"
+            direction_change = "STRAIGHT"
+            trajectory_relation = "CROSSING_LEFT" if lateral_offset_m > 0 else "CROSSING_RIGHT"
+        elif abs_lateral_offset_m < 0.35 and abs_heading_delta_rad < 0.12:
+            motion_cue = "STRAIGHT_CUE"
+            direction_change = "STRAIGHT"
+            trajectory_relation = "PARALLEL"
+        else:
+            motion_cue = "AMBIGUOUS"
+            direction_change = "TURNING" if abs_heading_delta_rad >= 0.18 else "STRAIGHT"
+            if abs_lateral_offset_m >= 0.75:
+                trajectory_relation = "CROSSING_LEFT" if lateral_offset_m > 0 else "CROSSING_RIGHT"
+            else:
+                trajectory_relation = "PARALLEL"
+
+        return {
+            "trajectory_feature_source": "PROJECTED_RED_TRAJECTORY",
+            "trajectory_path_length_m": round(path_length_m, 3),
+            "trajectory_visible_length_px": round(visible_length_px, 1),
+            "trajectory_visible_point_count": int(len(valid_points)),
+            "trajectory_point_like": bool(point_like),
+            "trajectory_lateral_offset_m": round(lateral_offset_m, 3),
+            "trajectory_forward_extent_m": round(forward_extent_m, 3),
+            "trajectory_heading_delta_rad": round(heading_delta_rad, 3),
+            "trajectory_curvature_score": round(curvature_score, 3),
+            "trajectory_length_state": length_state,
+            "trajectory_visual_speed_state": visual_speed_state,
+            "trajectory_motion_cue_deterministic": motion_cue,
+            "trajectory_relation_deterministic": trajectory_relation,
+            "direction_change_deterministic": direction_change,
+            "visual_shift_deterministic": visual_shift,
+        }
     
     def draw_trajectory_on_image(
         self,
