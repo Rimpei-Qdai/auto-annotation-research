@@ -4,34 +4,31 @@ Moondream2 VLM Configuration for Automatic Annotation
 """
 
 # VLM Model Settings
-# ======== GPU サーバー設定 (kiwi: RTX 4090, 24GB VRAM) ========
-# Option 1: Qwen2-VL-2B (4GB VRAM, ローカル RTX 4060 向け)
-# Option 2: Qwen2-VL-7B (14GB VRAM, kiwi RTX 4090 向け, 高精度)
-HERON_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+# ======== Ver.4 baseline 設定 ========
+# Ver.4 は Qwen2-VL-2B + 4フレーム + 赤軌道 Visual Prompting + 直接分類
+HERON_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 USE_MULTI_FRAME = True  # Enable multi-frame temporal understanding
 USE_GPU = True  # GPU有効（kiwi: RTX 4090使用）
-# bfloat16: RTX 4090 (Ada Lovelace) はネイティブサポートで float16 より安定
-TORCH_DTYPE = "bfloat16"
+# Ver.4 baseline に合わせて float16 を使用
+TORCH_DTYPE = "float16"
 DEVICE_PREFERENCE = "cuda" if USE_GPU else "cpu"  # Device preference for model loading
 
 # Video Processing Settings
-# RTX 4090 (24GB VRAM) では 8 フレームを使用可能
-NUM_FRAMES_TO_EXTRACT = 8  # Number of frames to extract from video
-NUM_FRAMES_TO_USE = 8  # Number of frames to actually use
+NUM_FRAMES_TO_EXTRACT = 4  # Ver.4 baseline の抽出フレーム数
+NUM_FRAMES_TO_USE = 4  # Ver.4 baseline の使用フレーム数
 FRAME_EXTRACTION_METHOD = "uniform"  # "uniform" or "temporal"
 MAX_IMAGE_SIZE = 1080  # Maximum dimension (width or height) for image processing
 
 # L2M+CoT Settings
-USE_L2M_COT = True  # Enable Least-to-Most + Chain-of-Thought reasoning
-# L2M+CoTを有効にすると、1つの動画に対して3回の推論を実行します（Level 1, 2, 3）
-# RTX 4090 の高速推論で処理時間の問題を解消
+# Ver.4 baseline では段階的推論を使わず、赤軌道付き4フレームから直接分類する
+USE_L2M_COT = False
 
-# Generation Settings (RTX 4090 では十分な VRAM があるため上限を緩和)
-MAX_NEW_TOKENS_STANDARD = 100  # 標準推論の最大トークン数
-MAX_NEW_TOKENS_L2M = 300  # L2M+CoT 推論の最大トークン数（JSON 出力に十分な長さ）
+# Generation Settings
+MAX_NEW_TOKENS_STANDARD = 50  # Ver.4 baseline の短い直接分類出力に合わせる
+MAX_NEW_TOKENS_L2M = 150  # 互換性維持用。baseline では未使用
 
 USE_KV_CACHE = True  # KVキャッシュの使用 (高速化)
-NUM_FRAMES_OPTIMIZED = 8  # フレーム数（RTX 4090 では削減不要）
+NUM_FRAMES_OPTIMIZED = 4
 
 # Action Label Mapping
 ACTION_LABELS = {
@@ -95,12 +92,12 @@ Action Categories:
 
 **Respond with ONLY the number (0-10). Nothing else.**"""
 
-# Sensor Thresholds for Turning Detection (案2-1, 案1-2)
+# Sensor Thresholds for Turning Detection
 GYRO_THRESHOLD = 0.1        # rad/s - 旋回検出のジャイロ閾値
 ACC_X_THRESHOLD = 0.3       # m/s² - 横加速度による旋回検出閾値
 SPEED_STOP_THRESHOLD = 1.0  # km/h - 停止とみなす速度閾値
 
-# Few-shot examples for rare classes (案5-2)
+# Few-shot examples for rare classes
 FEW_SHOT_EXAMPLES = """
 【参考例（センサー → 正解クラス）】
 例1: gyro_z=+0.25 rad/s、速度=15km/h、交差点で右に曲がっている → 7（右折）
