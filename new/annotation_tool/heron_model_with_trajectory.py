@@ -583,17 +583,22 @@ class HeronAnnotatorWithTrajectory:
             stage1_choice=stage1_choice,
             stage2_choice=stage2_choice,
         )
+        # Keep both keys so analysis scripts do not miss graph output.
         self.last_prediction_details["macro_graph"] = graph_result
+        self.last_prediction_details["graph"] = graph_result
         self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
 
         strong_candidate = graph_result.get("strong_candidate")
         if strong_candidate and strong_candidate.get("macro_choice"):
             final_macro_choice = strong_candidate["macro_choice"]
-            self.last_prediction_details["graph_override"] = final_macro_choice != initial_macro_choice
+            overridden = final_macro_choice != initial_macro_choice
+            self.last_prediction_details["graph_override"] = overridden
+            self.last_prediction_details["graph_overrode"] = overridden
             self.last_prediction_details["final_macro_choice"] = final_macro_choice
             return final_macro_choice
 
         self.last_prediction_details["graph_override"] = False
+        self.last_prediction_details["graph_overrode"] = False
         self.last_prediction_details["final_macro_choice"] = initial_macro_choice
         return initial_macro_choice
     

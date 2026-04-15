@@ -387,8 +387,8 @@ class DrivingConceptGraphBuilder:
 class MacroGraphVerifier:
     """Graph-style verifier / reranker for macro 4-way classification."""
 
-    STRONG_SUPPORT_THRESHOLD = 0.68
-    STRONG_MARGIN_THRESHOLD = 0.12
+    STRONG_SUPPORT_THRESHOLD = 0.62
+    STRONG_MARGIN_THRESHOLD = 0.10
 
     def build(
         self,
@@ -432,9 +432,16 @@ class MacroGraphVerifier:
 
         denom = max(abs(forward_distance), 1.0)
         lateral_ratio = abs(lateral_offset) / denom
-        point_like = forward_distance < 4.0 or visible_count <= 1
+        point_like = (forward_distance < 2.5 and visible_count <= 1) or forward_distance < 1.5
+        moving_straight_like = (
+            speed >= 8.0
+            and forward_distance >= 6.0
+            and visible_count >= 4
+            and lateral_ratio < 0.08
+            and abs(gyro_z) < 0.08
+        )
 
-        if point_like or (speed < 4.0 and forward_distance < 5.0):
+        if point_like or (speed < 2.0 and forward_distance < 4.0):
             motion_state = "STOPLIKE"
         elif acc_x < -0.35:
             motion_state = "DECEL"
@@ -467,6 +474,7 @@ class MacroGraphVerifier:
             "visible_count": visible_count,
             "trajectory_points": trajectory_points,
             "point_like": point_like,
+            "moving_straight_like": moving_straight_like,
             "motion_state": motion_state,
             "turn_sign": turn_sign,
             "turn_strength": turn_strength,
@@ -498,6 +506,16 @@ class MacroGraphVerifier:
                     "target": "other_hypothesis",
                     "type": "supports",
                     "reason": "低速かつ短い軌道がその他系を支持",
+                }
+            )
+
+        if observations["moving_straight_like"]:
+            edges.append(
+                {
+                    "source": "trajectory_geometry",
+                    "target": "straight_hypothesis",
+                    "type": "supports",
+                    "reason": "十分な前進距離と低い横偏位が直線移動を支持",
                 }
             )
 
@@ -544,9 +562,10 @@ class MacroGraphVerifier:
         forward_distance = observations["forward_distance"]
         lateral_ratio = observations["lateral_ratio"]
         point_like = observations["point_like"]
+        moving_straight_like = observations["moving_straight_like"]
 
         if stage1_choice == "A":
-            add("A", 0.25, "Stage1 が直線系を選択")
+            add("A", 0.32, "Stage1 が直線系を選択")
         elif stage1_choice == "N":
             add("B", 0.05, "Stage1 が非直線系を選択")
             add("C", 0.05, "Stage1 が非直線系を選択")
@@ -554,6 +573,10 @@ class MacroGraphVerifier:
 
         if stage2_choice in {"B", "C", "D"}:
             add(stage2_choice, 0.22, f"Stage2 が {stage2_choice} を選択")
+
+        if stage2_choice == "D" and moving_straight_like:
+            add("A", 0.26, "Stage2 はその他だが幾何は直線移動")
+            add("D", -0.10, "十分な前進距離がその他寄り判定と矛盾")
 
         if turn_sign == "LEFT":
             add("B", 0.28 if turn_strength == "HIGH" else 0.18, "軌道終点またはヨーレートが左方向")
@@ -569,6 +592,13 @@ class MacroGraphVerifier:
         elif turn_strength == "LOW":
             add("A", 0.12, "回転強度が低い")
 
+        if moving_straight_like:
+            add("A", 0.32, "速度・可視点数・前進距離が直線移動を支持")
+            add("D", -0.14, "十分に動いているためその他へは倒しにくい")
+
+        if not point_like and forward_distance >= 5.0 and observations["visible_count"] >= 4:
+            add("A", 0.15, "軌道が十分に伸びており直線移動と整合")
+
         if stage1_choice == "A" and turn_strength == "HIGH" and turn_sign == "LEFT":
             add("B", 0.24, "Stage1 は直線系だが幾何は強い左回転")
         elif stage1_choice == "A" and turn_strength == "HIGH" and turn_sign == "RIGHT":
@@ -580,14 +610,14 @@ class MacroGraphVerifier:
             add("B", 0.22, "Stage2 は右回転だが幾何は左方向")
 
         if stage1_choice == "A" and point_like:
-            add("D", 0.16, "Stage1 は直線系だが軌道は極短でその他寄り")
+            add("D", 0.08, "Stage1 は直線系だが軌道は極短でその他寄り")
 
         if point_like:
-            add("D", 0.35, "軌道が短く停止・その他寄り")
+            add("D", 0.28, "軌道が短く停止・その他寄り")
             add("A", -0.10, "極短軌道は直線系と矛盾")
 
         if motion_state == "STOPLIKE":
-            add("D", 0.30, "速度と軌道長から stop-like")
+            add("D", 0.24, "速度と軌道長から stop-like")
         elif motion_state == "DECEL":
             add("A", 0.10, "減速は直線系にも含まれる")
             add("D", 0.08, "低速減速はその他寄りでもある")
@@ -595,7 +625,7 @@ class MacroGraphVerifier:
             add("A", 0.14, "直進かつ巡航/加速")
 
         if speed < DEFAULT_SPEED_STOP_THRESHOLD and forward_distance < 3.0:
-            add("D", 0.18, "低速かつ前進距離が短い")
+            add("D", 0.12, "低速かつ前進距離が短い")
 
         if lateral_ratio > 0.18 and turn_sign == "LEFT":
             add("B", 0.14, "横偏位比が大きく左回転寄り")
