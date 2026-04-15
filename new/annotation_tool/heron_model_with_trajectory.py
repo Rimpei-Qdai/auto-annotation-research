@@ -36,10 +36,16 @@ from config import (
     USE_MULTI_FRAME,
     PROMPT_TEMPLATE,
     ENABLE_FLASH_ATTENTION,
-    USE_L2M_COT
+    USE_L2M_COT,
+    MACRO_OUTPUT_TO_LABEL,
+    MACRO_OUTPUT_NAMES,
 )
 
 logger = logging.getLogger(__name__)
+REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
+    label_id: MACRO_OUTPUT_NAMES[macro_code]
+    for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
+}
 
 
 class HeronAnnotatorWithTrajectory:
@@ -552,7 +558,11 @@ class HeronAnnotatorWithTrajectory:
             action_label = self._extract_action_label(generated_text)
             
             if action_label is not None:
-                logger.info(f"Predicted action label: {action_label}")
+                macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
+                if macro_name:
+                    logger.info(f"Predicted action label: {action_label} ({macro_name})")
+                else:
+                    logger.info(f"Predicted action label: {action_label}")
             else:
                 logger.warning("Failed to extract action label from model output")
             
@@ -570,7 +580,7 @@ class HeronAnnotatorWithTrajectory:
             text: Model generated text
         
         Returns:
-            Action label (0-10) or None if extraction fails
+            Representative 11-class label for the macro category or None
         """
         import re
         
@@ -579,25 +589,38 @@ class HeronAnnotatorWithTrajectory:
         if assistant_match:
             response_text = assistant_match.group(1).strip()
         else:
-            # Fallback: use full text if no assistant marker found
-            response_text = text
-        
-        # Look for patterns like "action: 2", "label: 5", or just a number
-        patterns = [
-            r'action[:\s]+(\d+)',
-            r'label[:\s]+(\d+)',
-            r'prediction[:\s]+(\d+)',
-            r'class[:\s]+(\d+)',
-            r'(\d+)'  # Last resort: any digit
+            # Fallback: use only the tail to avoid re-matching prompt contents
+            response_text = text[-200:].strip()
+
+        normalized = response_text.strip()
+        normalized_upper = normalized.upper()
+
+        macro_patterns = [
+            (r'^\s*A\s*$', "A"),
+            (r'^\s*B\s*$', "B"),
+            (r'^\s*C\s*$', "C"),
+            (r'^\s*D\s*$', "D"),
+            (r'\bA\b', "A"),
+            (r'\bB\b', "B"),
+            (r'\bC\b', "C"),
+            (r'\bD\b', "D"),
         ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, response_text.lower())
-            if match:
-                action_label = int(match.group(1))
-                if 0 <= action_label <= 10:
-                    return action_label
-        
+
+        for pattern, macro_code in macro_patterns:
+            if re.search(pattern, normalized_upper):
+                return MACRO_OUTPUT_TO_LABEL[macro_code]
+
+        japanese_aliases = [
+            ("直線系", "A"),
+            ("左回転系", "B"),
+            ("右回転系", "C"),
+            ("その他", "D"),
+        ]
+
+        for alias, macro_code in japanese_aliases:
+            if alias in normalized:
+                return MACRO_OUTPUT_TO_LABEL[macro_code]
+
         return None
     
     def predict_batch(
