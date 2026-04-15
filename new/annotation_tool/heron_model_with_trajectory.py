@@ -404,51 +404,153 @@ class HeronAnnotatorWithTrajectory:
             "visible_count": int(np.sum(valid_mask)),
         }
 
-    def _render_trajectory_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
-        """Render a clean bird's-eye summary image showing only trajectory geometry."""
+    def _trajectory_to_canvas_points(
+        self,
+        trajectory_3d: np.ndarray,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+        max_forward_m: float,
+        max_side_m: float,
+    ) -> List[Tuple[int, int]]:
+        """Project trajectory to a clean 2D summary canvas with fixed orientation."""
+        center_x = width // 2
+        origin_y = height - margin
+        points: List[Tuple[int, int]] = []
+        for x, y, _ in trajectory_3d:
+            px = center_x + int((y / max_side_m) * (width * 0.32))
+            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
+            points.append((px, py))
+        return points
+
+    def _draw_summary_trajectory(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a high-contrast trajectory with start/end emphasis."""
+        if not points:
+            return
+
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 0, 0), width=14)
+            draw.line(points, fill=(220, 30, 30), width=8)
+
+            marker_indices = sorted(
+                set(
+                    [
+                        max(0, len(points) // 3),
+                        max(0, (2 * len(points)) // 3),
+                    ]
+                )
+            )
+            for marker_idx in marker_indices:
+                mx, my = points[marker_idx]
+                draw.ellipse(
+                    [mx - 8, my - 8, mx + 8, my + 8],
+                    fill=(255, 255, 255),
+                    outline=(0, 0, 0),
+                    width=2,
+                )
+        else:
+            px, py = points[0]
+            draw.ellipse(
+                [px - 8, py - 8, px + 8, py + 8],
+                fill=(220, 30, 30),
+                outline=(0, 0, 0),
+                width=2,
+            )
+
+        sx, sy = points[0]
+        draw.ellipse(
+            [sx - 10, sy - 10, sx + 10, sy + 10],
+            fill=(255, 255, 255),
+            outline=(0, 0, 0),
+            width=3,
+        )
+
+        ex, ey = points[-1]
+        draw.ellipse(
+            [ex - 9, ey - 9, ex + 9, ey + 9],
+            fill=(245, 180, 0),
+            outline=(0, 0, 0),
+            width=2,
+        )
+
+    def _render_topdown_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a fixed-scale bird's-eye summary image."""
         width, height = 720, 720
         margin = 60
         center_x = width // 2
         origin_y = height - margin
         max_forward_m = 35.0
-        max_side_m = 12.0
+        max_side_m = 14.0
 
         canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
 
-        # Straight reference line
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
         draw.line(
             [(center_x, origin_y), (center_x, margin)],
             fill=(40, 180, 40),
             width=6,
         )
 
-        points = []
-        for x, y, _ in trajectory_3d:
-            px = center_x + int((y / max_side_m) * (width * 0.32))
-            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
-            points.append((px, py))
+        points = self._trajectory_to_canvas_points(
+            trajectory_3d,
+            width=width,
+            height=height,
+            margin=margin,
+            max_forward_m=max_forward_m,
+            max_side_m=max_side_m,
+        )
+        self._draw_summary_trajectory(draw, points)
 
-        if len(points) == 1:
-            draw.ellipse(
-                [points[0][0] - 8, points[0][1] - 8, points[0][0] + 8, points[0][1] + 8],
-                fill=(220, 30, 30),
-                outline=(220, 30, 30),
-            )
-            return canvas
+        return canvas
 
-        # Halo then trajectory for high contrast
-        if len(points) >= 2:
-            draw.line(points, fill=(0, 0, 0), width=14)
-            draw.line(points, fill=(220, 30, 30), width=8)
+    def _render_normalized_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a shape-normalized summary to emphasize left/right sign and curvature."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
 
-        # Start marker
-        sx, sy = points[0]
-        draw.ellipse([sx - 10, sy - 10, sx + 10, sy + 10], fill=(255, 255, 255), outline=(0, 0, 0), width=3)
+        max_forward = max(float(np.max(trajectory_3d[:, 0])), 1.0)
+        max_side = max(float(np.max(np.abs(trajectory_3d[:, 1]))), 1.5)
 
-        # End arrow marker
-        ex, ey = points[-1]
-        draw.ellipse([ex - 8, ey - 8, ex + 8, ey + 8], fill=(245, 180, 0), outline=(0, 0, 0), width=2)
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        draw.line(
+            [(center_x, origin_y), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
+        draw.rectangle(
+            [margin, margin, width - margin, origin_y],
+            outline=(230, 230, 230),
+            width=2,
+        )
+
+        points = self._trajectory_to_canvas_points(
+            trajectory_3d,
+            width=width,
+            height=height,
+            margin=margin,
+            max_forward_m=max_forward,
+            max_side_m=max_side,
+        )
+        self._draw_summary_trajectory(draw, points)
 
         return canvas
 
@@ -458,23 +560,30 @@ class HeronAnnotatorWithTrajectory:
         sensor_data: Dict[str, Any],
         sample_id: Optional[int] = None
     ) -> Tuple[List[Image.Image], Dict[str, Any]]:
-        """Prepare raw frames plus one clean trajectory summary image for VLM input."""
+        """Prepare raw frames plus two clean trajectory summary images for VLM input."""
         geometry = self._build_trajectory_geometry(sensor_data)
-        summary_image = self._render_trajectory_summary(geometry["trajectory_3d"])
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
 
         if self.save_trajectory_frames and sample_id is not None:
             os.makedirs(self.trajectory_output_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            summary_path = os.path.join(
+            summary_topdown_path = os.path.join(
                 self.trajectory_output_dir,
-                f"sample_{sample_id:03d}_trajectory_summary_{timestamp}.jpg",
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
             )
-            summary_image.save(summary_path, quality=95)
+            summary_normalized_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            normalized_summary.save(summary_normalized_path, quality=95)
 
         logger.info(
             f"Trajectory summary: {geometry['visible_count']}/{len(geometry['valid_mask'])} points visible"
         )
-        model_frames = list(frames[:4]) + [summary_image]
+        model_frames = list(frames[:4]) + [topdown_summary, normalized_summary]
+        self.last_prediction_details["visual_input_count"] = len(model_frames)
         return model_frames, geometry
 
     def _run_prompt_on_frames(
@@ -745,7 +854,6 @@ class HeronAnnotatorWithTrajectory:
                 acc_y=sensor_data.get('acc_y', 0),
                 acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
-                brake=sensor_data.get('brake', 0)
             )
             stage1_generated = self._run_prompt_on_frames(model_frames, stage1_prompt)
             stage1_choice = self._extract_choice(
@@ -790,7 +898,6 @@ class HeronAnnotatorWithTrajectory:
                 acc_y=sensor_data.get('acc_y', 0),
                 acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
-                brake=sensor_data.get('brake', 0)
             )
             stage2_generated = self._run_prompt_on_frames(model_frames, stage2_prompt)
             stage2_choice = self._extract_choice(
