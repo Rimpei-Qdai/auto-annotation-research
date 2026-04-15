@@ -296,47 +296,117 @@ class HeronAnnotatorWithTrajectory:
         try:
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_duration = total_frames / fps if fps > 0 else 0
-            
-            # Calculate frame indices
-            start_frame = int(start_time * fps)
-            available_duration = min(duration, video_duration - start_time)
-            end_frame = min(int((start_time + available_duration) * fps), total_frames)
-            
-            if end_frame <= start_frame:
-                end_frame = min(start_frame + 2, total_frames)
-            
-            frame_indices = np.linspace(
-                start_frame, 
-                end_frame - 1, 
-                num_frames, 
-                dtype=int
+            frame_indices = self._compute_frame_indices(
+                fps=fps,
+                total_frames=total_frames,
+                start_time=start_time,
+                duration=duration,
+                num_frames=num_frames,
             )
             
             frames = []
+            actual_indices = []
             for frame_idx in frame_indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                
-                if ret:
-                    # Convert BGR to RGB
+                actual_idx, frame = self._read_frame_with_fallback(cap, frame_idx, total_frames)
+
+                if frame is not None:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_image = Image.fromarray(frame_rgb)
                     frames.append(pil_image)
+                    actual_indices.append(actual_idx)
                 else:
                     logger.warning(f"Failed to read frame {frame_idx}")
             
             logger.info(f"Extracted {len(frames)} frames from {video_path}")
-            return frames, frame_indices.tolist()
+            return frames, actual_indices
             
         finally:
             cap.release()
+
+    def _compute_frame_indices(
+        self,
+        *,
+        fps: float,
+        total_frames: int,
+        start_time: float,
+        duration: float,
+        num_frames: int,
+    ) -> List[int]:
+        if total_frames <= 0:
+            return []
+        if fps <= 0:
+            return [0] * num_frames
+
+        video_duration = total_frames / fps
+        safe_duration = max(duration, num_frames / fps)
+        window_end = min(max(start_time, 0.0) + safe_duration, video_duration)
+        window_start = max(0.0, window_end - safe_duration)
+
+        start_frame = max(0, min(int(window_start * fps), total_frames - 1))
+        end_frame = max(start_frame + 1, min(int(window_end * fps), total_frames))
+        base_indices = np.linspace(start_frame, end_frame - 1, num_frames, dtype=int).tolist()
+
+        ordered_unique: List[int] = []
+        seen = set()
+        for frame_idx in base_indices:
+            clamped = max(0, min(int(frame_idx), total_frames - 1))
+            if clamped not in seen:
+                seen.add(clamped)
+                ordered_unique.append(clamped)
+
+        radius = 1
+        while len(ordered_unique) < num_frames and len(seen) < total_frames:
+            added = False
+            for base_idx in base_indices:
+                for offset in (-radius, radius):
+                    candidate = base_idx + offset
+                    if 0 <= candidate < total_frames and candidate not in seen:
+                        seen.add(candidate)
+                        ordered_unique.append(candidate)
+                        added = True
+                        if len(ordered_unique) >= num_frames:
+                            break
+                if len(ordered_unique) >= num_frames:
+                    break
+            if not added:
+                break
+            radius += 1
+
+        ordered_unique.sort()
+        if not ordered_unique:
+            ordered_unique = [start_frame]
+        while len(ordered_unique) < num_frames:
+            ordered_unique.append(ordered_unique[-1])
+
+        return ordered_unique[:num_frames]
+
+    def _read_frame_with_fallback(
+        self,
+        cap: cv2.VideoCapture,
+        frame_idx: int,
+        total_frames: int,
+        max_offset: int = 2,
+    ) -> Tuple[int, Optional[np.ndarray]]:
+        candidate_indices = [frame_idx]
+        for offset in range(1, max_offset + 1):
+            candidate_indices.extend([frame_idx - offset, frame_idx + offset])
+
+        for candidate_idx in candidate_indices:
+            if not (0 <= candidate_idx < total_frames):
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, candidate_idx)
+            ret, frame = cap.read()
+            if ret:
+                return candidate_idx, frame
+
+        return frame_idx, None
     
     def draw_trajectory_on_frames(
         self,
         frames: List[Image.Image],
         sensor_data: Dict[str, Any],
-        sample_id: Optional[int] = None
+        sample_id: Optional[int] = None,
+        trajectory_bundle: Optional[Dict[str, Any]] = None,
     ) -> List[Image.Image]:
         """
         Draw trajectory on all frames
@@ -352,25 +422,16 @@ class HeronAnnotatorWithTrajectory:
         if not frames:
             logger.warning("No frames to draw trajectory on")
             return frames
-        
-        # Extract sensor data for trajectory calculation
-        speed = sensor_data.get('speed', 0.0)  # km/h
-        gyro_z = sensor_data.get('gyro_z', 0.0)  # rad/s (yaw rate)
-        
-        # Convert speed to m/s
-        speed_ms = speed / 3.6
-        
-        # Create speed and yaw rate sequences for 3 seconds (30 steps * 0.1s)
-        num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
-        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        
-        # Calculate 3D trajectory using Bicycle Model
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
-        
-        # Project to 2D image coordinates
-        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
-        
+
+        if trajectory_bundle is None:
+            trajectory_bundle = self._build_trajectory_bundle(sensor_data)
+
+        speed = float(sensor_data.get('speed', 0.0) or 0.0)  # km/h
+        gyro_z = float(sensor_data.get('gyro_z', 0.0) or 0.0)  # rad/s (yaw rate)
+        trajectory_3d = trajectory_bundle["trajectory_3d"]
+        image_points = trajectory_bundle["image_points"]
+        valid_mask = trajectory_bundle["valid_mask"]
+
         visible_count = np.sum(valid_mask)
         logger.info(f"Trajectory: {visible_count}/{len(valid_mask)} points visible")
         
@@ -419,6 +480,40 @@ class HeronAnnotatorWithTrajectory:
         
         logger.info(f"Drew trajectory on {len(frames_with_trajectory)} frames")
         return frames_with_trajectory
+
+    def _build_trajectory_bundle(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate trajectory and deterministic red-line features from the same data used for drawing."""
+        speed = float(sensor_data.get('speed', 0.0) or 0.0)  # km/h
+        gyro_z = float(sensor_data.get('gyro_z', 0.0) or 0.0)  # rad/s
+
+        speed_ms = speed / 3.6
+        num_steps = 30
+        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+
+        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+        trajectory_features = self.trajectory_visualizer.extract_trajectory_features(
+            trajectory_3d=trajectory_3d,
+            image_points=image_points,
+            valid_mask=valid_mask,
+            speed_kmh=speed,
+        )
+        logger.info("Deterministic trajectory features: %s", trajectory_features)
+
+        return {
+            "trajectory_3d": trajectory_3d,
+            "image_points": image_points,
+            "valid_mask": valid_mask,
+            "features": trajectory_features,
+        }
+
+    def _augment_sensor_data_with_trajectory_features(self, sensor_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Attach deterministic red-line features to sensor_data for downstream reasoning."""
+        trajectory_bundle = self._build_trajectory_bundle(sensor_data)
+        enriched_sensor_data = dict(sensor_data)
+        enriched_sensor_data.update(trajectory_bundle["features"])
+        return enriched_sensor_data, trajectory_bundle
     
     def predict_action(
         self,
@@ -486,15 +581,22 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[L2M+CoT] Extracted {len(frames)} frames at indices {frame_indices}")
-            
+
+            enriched_sensor_data, trajectory_bundle = self._augment_sensor_data_with_trajectory_features(sensor_data)
+
             # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
+            frames_with_trajectory = self.draw_trajectory_on_frames(
+                frames,
+                enriched_sensor_data,
+                sample_id,
+                trajectory_bundle=trajectory_bundle,
+            )
             
             # Create L2M pipeline
             pipeline = L2MCoTPipeline(self.generation_runtime)
             
             # Run L2M analysis with trajectory-enhanced frames
-            result = pipeline.analyze_with_l2m(frames_with_trajectory, sensor_data)
+            result = pipeline.analyze_with_l2m(frames_with_trajectory, enriched_sensor_data)
 
             # 詳細結果を保持（predict_action_with_details から参照できるよう）
             self._last_l2m_result = result
@@ -548,17 +650,24 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[Multi-frame with trajectory] Using {len(frames)} frames at indices {frame_indices}")
-            
+
+            enriched_sensor_data, trajectory_bundle = self._augment_sensor_data_with_trajectory_features(sensor_data)
+
             # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
+            frames_with_trajectory = self.draw_trajectory_on_frames(
+                frames,
+                enriched_sensor_data,
+                sample_id,
+                trajectory_bundle=trajectory_bundle,
+            )
             
             # Format prompt with sensor data
             prompt_text = PROMPT_TEMPLATE.format(
-                speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
-                brake=sensor_data.get('brake', 0)
+                speed=enriched_sensor_data.get('speed', 0),
+                acc_x=enriched_sensor_data.get('acc_x', 0),
+                acc_y=enriched_sensor_data.get('acc_y', 0),
+                acc_z=enriched_sensor_data.get('acc_z', 0),
+                brake=enriched_sensor_data.get('brake', 0)
             )
             
             generated_text = self.generation_runtime.generate_text(
