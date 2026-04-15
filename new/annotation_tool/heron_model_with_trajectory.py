@@ -16,7 +16,6 @@ from datetime import datetime
 
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
-from vlm_runtime import VLMGenerationRuntime
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -55,8 +54,6 @@ class HeronAnnotatorWithTrajectory:
         self._tokenizer = None
         self._device = None
         self._is_heron = False
-        self._last_l2m_result = None  # predict_action_with_details で参照
-        self._generation_runtime = None
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
@@ -144,52 +141,6 @@ class HeronAnnotatorWithTrajectory:
     @property
     def is_loaded(self):
         return self._model is not None and self._processor is not None
-
-    @property
-    def generation_runtime(self) -> VLMGenerationRuntime:
-        if self._generation_runtime is None:
-            raise RuntimeError("Generation runtime is not initialized. Call load_model() first.")
-        return self._generation_runtime
-
-    @property
-    def torch_dtype(self):
-        """Resolve config dtype strings into torch.dtype values."""
-        if isinstance(TORCH_DTYPE, torch.dtype):
-            return TORCH_DTYPE
-
-        if isinstance(TORCH_DTYPE, str):
-            normalized = TORCH_DTYPE.strip().lower()
-            if hasattr(torch, normalized):
-                resolved = getattr(torch, normalized)
-                if isinstance(resolved, torch.dtype):
-                    return resolved
-
-        logger.warning("Unsupported TORCH_DTYPE=%r. Falling back to torch.float16.", TORCH_DTYPE)
-        return torch.float16
-
-    @property
-    def uses_device_map(self) -> bool:
-        if self._generation_runtime is not None:
-            return self._generation_runtime.uses_device_map
-        device_map = getattr(self._model, "hf_device_map", None)
-        return isinstance(device_map, dict) and len(device_map) > 0
-
-    @property
-    def generation_device(self) -> Optional[torch.device]:
-        if self._generation_runtime is not None:
-            return self._generation_runtime.generation_device
-        return self._device
-
-    def prepare_inputs_for_generation(self, inputs):
-        return self.generation_runtime.prepare_inputs_for_generation(inputs)
-
-    def _collect_tensor_devices(self, value):
-        return self.generation_runtime._collect_tensor_devices(value)
-
-    def _collect_model_devices(self):
-        if self._generation_runtime is None:
-            return set()
-        return self._generation_runtime.collect_model_devices()
     
     def load_model(self):
         """Load Heron VLM model and processor"""
@@ -205,7 +156,7 @@ class HeronAnnotatorWithTrajectory:
             
             # Device setup
             if USE_GPU and torch.cuda.is_available():
-                self._device = torch.device("cuda:0")
+                self._device = torch.device("cuda")
                 logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
             else:
                 self._device = torch.device("cpu")
@@ -213,29 +164,24 @@ class HeronAnnotatorWithTrajectory:
             
             # Check if Qwen2-VL model
             is_qwen = "qwen" in HERON_MODEL_ID.lower()
-            load_with_explicit_device = self._device.type != "cpu"
-
-            if load_with_explicit_device:
-                logger.info(
-                    "Loading model onto a single target device to avoid mixed CPU/CUDA placement during generation"
-                )
             
             if is_qwen:
                 # Qwen2-VL specific loading
                 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
                 self._model = Qwen2VLForConditionalGeneration.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=self.torch_dtype,
-                    device_map=None
+                    torch_dtype=TORCH_DTYPE,
+                    device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
-                logger.info("Qwen2-VL model loaded with multi-frame support")
+                logger.info(f"Qwen2-VL model loaded with multi-frame support (memory optimized)")
             else:
                 # Standard Heron model loading
                 self._model = AutoModelForCausalLM.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=self.torch_dtype,
-                    trust_remote_code=True
+                    torch_dtype=TORCH_DTYPE,
+                    trust_remote_code=True,
+                    device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(
                     HERON_MODEL_ID,
@@ -244,20 +190,8 @@ class HeronAnnotatorWithTrajectory:
                 self._is_heron = True
                 logger.info(f"Heron model loaded with multi-frame support")
             
-            if self._device is not None:
+            if not USE_GPU or self._device.type == "cpu":
                 self._model = self._model.to(self._device)
-            self._generation_runtime = VLMGenerationRuntime(
-                model=self._model,
-                processor=self._processor,
-                model_id=HERON_MODEL_ID,
-                target_device=self._device,
-            )
-            self._generation_runtime.validate_model_placement()
-
-            if self.uses_device_map:
-                logger.info(f"Model uses Accelerate device_map: {self._model.hf_device_map}")
-
-            logger.info(f"Generation inputs will be placed on: {self.generation_device}")
             
             self._model.eval()
             logger.info("Model loaded successfully")
@@ -491,37 +425,27 @@ class HeronAnnotatorWithTrajectory:
             frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
             
             # Create L2M pipeline
-            pipeline = L2MCoTPipeline(self.generation_runtime)
+            pipeline = L2MCoTPipeline(self)
             
             # Run L2M analysis with trajectory-enhanced frames
             result = pipeline.analyze_with_l2m(frames_with_trajectory, sensor_data)
-
-            # 詳細結果を保持（predict_action_with_details から参照できるよう）
-            self._last_l2m_result = result
-
-            if result.get('status') == 'failed' or result.get('final_category') is None:
-                logger.warning(
-                    "[L2M+CoT] Invalid result detected. Treating prediction as failure. error=%s",
-                    result.get('error', 'unknown'),
-                )
-                return None
             
             # Extract final category
-            final_category = result.get('final_category')
+            final_category = result.get('final_category', 0)
             confidence = result.get('confidence', 0.5)
-
+            
             logger.info(f"[L2M+CoT] *** FINAL RESULT: category={final_category}, confidence={confidence:.2f} ***")
             logger.info(f"[L2M+CoT] Level 1: {result['level1'].get('road_shape', 'N/A')}, {result['level1'].get('trajectory_relation', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 2: {result['level2'].get('acceleration_cause', 'N/A')}, {result['level2'].get('speed_trend', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 3: {result['level3'].get('category_name', 'N/A')}")
             logger.info(f"[L2M+CoT] *** RETURNING: {final_category} ***")
-
+            
             return final_category
-
+            
         except Exception as e:
             logger.error(f"L2M+CoT prediction FAILED with exception: {e}", exc_info=True)
+            # フォールバック: 通常の推論を試す
             logger.warning("!!! FALLBACK to standard prediction !!!")
-            self._last_l2m_result = None
             return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
     
     def _predict_multi_frame_with_trajectory(
@@ -561,15 +485,51 @@ class HeronAnnotatorWithTrajectory:
                 brake=sensor_data.get('brake', 0)
             )
             
-            generated_text = self.generation_runtime.generate_text(
-                frames_with_trajectory,
-                prompt_text,
-                max_new_tokens=100,
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
-            )
+            # Check model type for prompt formatting
+            is_qwen = "qwen" in HERON_MODEL_ID.lower()
+            
+            if is_qwen:
+                # Qwen2-VL format
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            *[{"type": "image", "image": frame} for frame in frames_with_trajectory],
+                            {"type": "text", "text": prompt_text}
+                        ]
+                    }
+                ]
+                text_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.processor(
+                    text=[text_prompt],
+                    images=frames_with_trajectory,
+                    padding=True,
+                    return_tensors="pt"
+                ).to(self.device)
+            else:
+                # Heron format
+                inputs = self.processor(
+                    text=prompt_text,
+                    images=frames_with_trajectory,
+                    return_tensors="pt"
+                ).to(self.device)
+            
+            # Generate prediction
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=100,
+                    do_sample=False,
+                    temperature=0.0,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id
+                )
+            
+            # Decode output
+            generated_text = self.processor.batch_decode(
+                output_ids,
+                skip_special_tokens=True
+            )[0]
             
             logger.info(f"Model output: {generated_text}")
             
@@ -625,24 +585,6 @@ class HeronAnnotatorWithTrajectory:
         
         return None
     
-    def predict_action_with_details(
-        self,
-        video_path: str,
-        sensor_data: Dict[str, Any],
-        start_time: float = 0.0,
-        sample_id: Optional[int] = None
-    ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
-        """
-        predict_action と同じだが、L2M の中間推論結果も返す。
-
-        Returns:
-            (predicted_label, l2m_details) のタプル。
-            l2m_details は level1/level2/level3 の辞書。L2M未使用時は None。
-        """
-        self._last_l2m_result = None
-        label = self.predict_action(video_path, sensor_data, start_time, sample_id)
-        return label, self._last_l2m_result
-
     def predict_batch(
         self,
         samples: List[Dict[str, Any]],

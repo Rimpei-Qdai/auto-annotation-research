@@ -4,28 +4,32 @@ Moondream2 VLM Configuration for Automatic Annotation
 """
 
 # VLM Model Settings
-# ======== Ver.4 baseline 設定 ========
-# Ver.4 は Qwen2-VL-2B + 4フレーム + 赤軌道 Visual Prompting + 直接分類
+# Multi-frame video understanding models
+# Option 1: Qwen2-VL-2B (Multi-frame, 4GB VRAM, faster, good for 8GB GPU)
+# Option 2: Qwen2-VL-7B (Multi-frame, 8GB+ VRAM, better accuracy, requires more memory)
+# Note: Moondream2 is NOT supported (single-frame only)
+# Note: Heron has Windows tokenizer compatibility issues
 HERON_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 USE_MULTI_FRAME = True  # Enable multi-frame temporal understanding
-USE_GPU = True  # GPU有効（kiwi: RTX 4090使用）
-# Ver.4 baseline に合わせて float16 を使用
-TORCH_DTYPE = "float16"
+USE_GPU = True  # GPU有効
+TORCH_DTYPE = "float16"  # GPUではfloat16で高速化
 DEVICE_PREFERENCE = "cuda" if USE_GPU else "cpu"  # Device preference for model loading
 
 # Video Processing Settings
-NUM_FRAMES_TO_EXTRACT = 4  # Ver.4 baseline の抽出フレーム数
-NUM_FRAMES_TO_USE = 4  # Ver.4 baseline の使用フレーム数
+NUM_FRAMES_TO_EXTRACT = 4  # Number of frames to extract from video (reduced for 8GB VRAM)
+NUM_FRAMES_TO_USE = 4  # Number of frames to actually use (reduced to fit in memory)
 FRAME_EXTRACTION_METHOD = "uniform"  # "uniform" or "temporal"
-MAX_IMAGE_SIZE = 1080  # Maximum dimension (width or height) for image processing
+MAX_IMAGE_SIZE = 720  # Ver.4 レポートに合わせて 720p
 
 # L2M+CoT Settings
-# Ver.4 baseline では段階的推論を使わず、赤軌道付き4フレームから直接分類する
-USE_L2M_COT = False
+USE_L2M_COT = False  # Ver.4 baseline は direct classification
 
-# Generation Settings
-MAX_NEW_TOKENS_STANDARD = 50  # Ver.4 baseline の短い直接分類出力に合わせる
-MAX_NEW_TOKENS_L2M = 150  # 互換性維持用。baseline では未使用
+# Generation Optimization Settings (速度最適化設定)
+# これらの設定を調整することで、機能を維持しながら推論速度を向上できます
+MAX_NEW_TOKENS_STANDARD = 50  # 標準推論の最大トークン数 (デフォルト: 100 → 50に削減)
+MAX_NEW_TOKENS_L2M = 150  # L2M+CoT推論の最大トークン数 (デフォルト: 300 → 150に削減)
+# 理由: アクション分類は0-10の数字1つだけなので、長い出力は不要
+# 50トークンでも十分な推論結果が得られます
 
 USE_KV_CACHE = True  # KVキャッシュの使用 (高速化)
 NUM_FRAMES_OPTIMIZED = 4
@@ -46,68 +50,33 @@ ACTION_LABELS = {
 }
 
 # Prompt Template for LLaVA
-PROMPT_TEMPLATE = """You are an AI assistant analyzing taxi driving behavior.
-Classify the driver's action from the provided video frames and sensor data.
+PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+以下のセンサーデータと画像から運転行動を分類してください。
 
-**CRITICAL**: Analyze the RED trajectory line primarily to determine the vehicle's action.
+【画像の見方】
+- 赤い線: 車両の予測進路（今後3秒間の軌道）
+- 緑の線: 車線中心または基準方向
+- 赤い線が緑の線と平行 → 直進
+- 赤い線が緑の線を横切る → 車線変更または旋回
 
-Visual Indicators in the frames:
-- RED LINE/DOTS: Predicted trajectory of the vehicle for the next 3 seconds
-  * Each red dot represents a future position
-  * If RED trajectory curves significantly LEFT → Consider "6" (Left turn)
-  * If RED trajectory curves significantly RIGHT → Consider "7" (Right turn)
-  * If RED trajectory follows GREEN line (straight) → Consider "1", "2", "3", "5" based on speed
-- GREEN LINE: Straight-ahead reference line
+【センサーデータ】
+速度: {speed} km/h
+加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
+ブレーキ: {brake}
 
-Reference Sensor Data (supplementary):
-- Speed: {speed} km/h
-- Acceleration X: {acc_x} m/s²
-- Acceleration Y: {acc_y} m/s²
-- Acceleration Z: {acc_z} m/s²
-- Brake: {brake}
+【注意事項】
+- 4枚の画像は時系列順に並んでいます
+- 赤い線と道路の曲率を比較してください
+- 道路がカーブしていて、赤い線も同様にカーブしている場合は「等速走行」です
+- 赤い線が道路と異なる方向に向かう場合のみ「車線変更」または「左右折」です
 
-**Decision Rules**:
-1. If Speed = 0 km/h → Must be "4" (Stop)
-2. If RED trajectory curves LEFT significantly → "6" (Left turn)
-3. If RED trajectory curves RIGHT significantly → "7" (Right turn)
-4. If RED trajectory is straight AND Speed > 0:
-   - If Speed is increasing (Acc X > 0.5) → "2" (Acceleration) or "5" (Start if was stopped)
-   - If Speed is decreasing (Acc X < -0.5) OR Brake = 1 → "3" (Deceleration)
-   - If Speed is constant (Acc X ≈ 0) → "1" (Constant speed)
-5. Lane changes ("8"/"9"): Small lateral shift without intersection
-6. For U-turn ("10"): Very sharp turn with trajectory reversing direction
+以下から1つ選んでください:
+0: その他, 1: 等速走行, 2: 加速, 3: 減速, 4: 停止,
+5: 発進, 6: 左折, 7: 右折, 8: 車線変更(左),
+9: 車線変更(右), 10: 転回
 
-Action Categories:
-0: Other
-1: Constant speed driving - moving straight at constant speed
-2: Acceleration - speed increasing
-3: Deceleration - speed decreasing (including braking)
-4: Stop - completely stopped (speed 0 km/h)
-5: Start - beginning to move from stopped state
-6: Left turn - turning left (at intersections)
-7: Right turn - turning right (at intersections)
-8: Lane change (left) - moving to left lane
-9: Lane change (right) - moving to right lane
-10: U-turn - 180-degree direction change
-
-**Respond with ONLY the number (0-10). Nothing else.**"""
-
-# Sensor Thresholds for Turning Detection
-GYRO_THRESHOLD = 0.1        # rad/s - 旋回検出のジャイロ閾値
-ACC_X_THRESHOLD = 0.3       # m/s² - 横加速度による旋回検出閾値
-SPEED_STOP_THRESHOLD = 1.0  # km/h - 停止とみなす速度閾値
-
-# Few-shot examples for rare classes
-FEW_SHOT_EXAMPLES = """
-【参考例（センサー → 正解クラス）】
-例1: gyro_z=+0.25 rad/s、速度=15km/h、交差点で右に曲がっている → 7（右折）
-例2: gyro_z=+0.18 rad/s、速度=20km/h、車線が左にシフト → 8（車線変更（左））
-例3: gyro_z=0.00 rad/s、速度=0km/h、ブレーキON → 4（停止）
-例4: gyro_z=-0.20 rad/s、速度=12km/h、交差点で左に曲がっている → 6（左折）
-例5: acc_x=-1.5 m/s²、ブレーキON、速度低下 → 3（減速）
-例6: 速度=0km/h → 速度トレンドINCREASING → 5（発進）
-"""
+数字のみで回答してください。"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds
-ENABLE_FLASH_ATTENTION = True  # RTX 4090 では flash-attn が利用可能
+ENABLE_FLASH_ATTENTION = False  # Set to True if flash-attn is installed
