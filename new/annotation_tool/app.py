@@ -3,7 +3,7 @@
 import os
 import pandas as pd
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +15,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+JST = timezone(timedelta(hours=9))
 
 # Import production annotator
 try:
@@ -91,8 +92,8 @@ if 'action_label' not in df_auto.columns:
 # ============ ヘルパー関数 ============
 
 def unix_ms_to_datetime(unix_ms):
-    """UNIXミリ秒をdatetimeに変換"""
-    return datetime.fromtimestamp(unix_ms / 1000.0)
+    """UNIXミリ秒をJST基準のnaive datetimeに変換"""
+    return datetime.fromtimestamp(unix_ms / 1000.0, tz=JST).replace(tzinfo=None)
 
 def extract_video_timestamp(filename):
     """動画ファイル名からタイムスタンプを抽出"""
