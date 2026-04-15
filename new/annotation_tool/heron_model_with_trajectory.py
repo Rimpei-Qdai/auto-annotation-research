@@ -162,19 +162,34 @@ class HeronAnnotatorWithTrajectory:
                 self._device = torch.device("cpu")
                 logger.info("Using CPU")
             
-            # Check if Qwen2-VL model
+            # Check if Qwen-VL model family
             is_qwen = "qwen" in HERON_MODEL_ID.lower()
             
             if is_qwen:
-                # Qwen2-VL specific loading
-                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                # Qwen-VL family specific loading
+                if "qwen3-vl" in HERON_MODEL_ID.lower():
+                    try:
+                        from transformers import Qwen3VLForConditionalGeneration
+                    except ImportError as e:
+                        raise RuntimeError(
+                            "Qwen3-VL requires a transformers version with "
+                            "Qwen3VLForConditionalGeneration support "
+                            "(recommended: >=4.57.0)."
+                        ) from e
+                    qwen_loader_cls = Qwen3VLForConditionalGeneration
+                    qwen_family_name = "Qwen3-VL"
+                else:
+                    from transformers import Qwen2VLForConditionalGeneration
+                    qwen_loader_cls = Qwen2VLForConditionalGeneration
+                    qwen_family_name = "Qwen2-VL"
+
+                self._model = qwen_loader_cls.from_pretrained(
                     HERON_MODEL_ID,
                     torch_dtype=TORCH_DTYPE,
                     device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
-                logger.info(f"Qwen2-VL model loaded with multi-frame support (memory optimized)")
+                logger.info(f"{qwen_family_name} model loaded with multi-frame support (memory optimized)")
             else:
                 # Standard Heron model loading
                 self._model = AutoModelForCausalLM.from_pretrained(

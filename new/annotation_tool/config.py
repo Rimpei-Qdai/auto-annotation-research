@@ -6,10 +6,11 @@ Moondream2 VLM Configuration for Automatic Annotation
 # VLM Model Settings
 # Multi-frame video understanding models
 # Option 1: Qwen2-VL-2B (Multi-frame, 4GB VRAM, faster, good for 8GB GPU)
-# Option 2: Qwen2-VL-7B (Multi-frame, 8GB+ VRAM, better accuracy, requires more memory)
+# Option 2: Qwen3-VL-2B (Multi-frame, newer VLM generation, similar scale)
+# Option 3: Qwen2-VL-7B (Multi-frame, 8GB+ VRAM, better accuracy, requires more memory)
 # Note: Moondream2 is NOT supported (single-frame only)
 # Note: Heron has Windows tokenizer compatibility issues
-HERON_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+HERON_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 USE_MULTI_FRAME = True  # Enable multi-frame temporal understanding
 USE_GPU = True  # GPU有効
 TORCH_DTYPE = "float16"  # GPUではfloat16で高速化
