@@ -7,7 +7,7 @@ Supports trajectory drawing on 4 frames for auto-annotation
 import os
 import logging
 from typing import List, Optional, Dict, Any, Tuple
-from PIL import Image
+from PIL import Image, ImageDraw
 import cv2
 import numpy as np
 import torch
@@ -35,6 +35,8 @@ from config import (
     NUM_FRAMES_TO_USE,
     USE_MULTI_FRAME,
     PROMPT_TEMPLATE,
+    STAGE1_PROMPT_TEMPLATE,
+    STAGE2_PROMPT_TEMPLATE,
     ENABLE_FLASH_ATTENTION,
     USE_L2M_COT,
     MACRO_OUTPUT_TO_LABEL,
@@ -60,6 +62,7 @@ class HeronAnnotatorWithTrajectory:
         self._tokenizer = None
         self._device = None
         self._is_heron = False
+        self.last_prediction_details = {}
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
@@ -374,6 +377,194 @@ class HeronAnnotatorWithTrajectory:
         
         logger.info(f"Drew trajectory on {len(frames_with_trajectory)} frames")
         return frames_with_trajectory
+
+    def _build_trajectory_geometry(
+        self,
+        sensor_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build 3-second trajectory and summary stats from current sensor values."""
+        speed = sensor_data.get('speed', 0.0)
+        gyro_z = sensor_data.get('gyro_z', 0.0)
+        speed_ms = speed / 3.6
+
+        num_steps = 30
+        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+
+        return {
+            "speed": speed,
+            "gyro_z": gyro_z,
+            "trajectory_3d": trajectory_3d,
+            "image_points": image_points,
+            "valid_mask": valid_mask,
+            "visible_count": int(np.sum(valid_mask)),
+        }
+
+    def _render_trajectory_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a clean bird's-eye summary image showing only trajectory geometry."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+        max_forward_m = 35.0
+        max_side_m = 12.0
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        # Straight reference line
+        draw.line(
+            [(center_x, origin_y), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
+
+        points = []
+        for x, y, _ in trajectory_3d:
+            px = center_x + int((y / max_side_m) * (width * 0.32))
+            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
+            points.append((px, py))
+
+        if len(points) == 1:
+            draw.ellipse(
+                [points[0][0] - 8, points[0][1] - 8, points[0][0] + 8, points[0][1] + 8],
+                fill=(220, 30, 30),
+                outline=(220, 30, 30),
+            )
+            return canvas
+
+        # Halo then trajectory for high contrast
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 0, 0), width=14)
+            draw.line(points, fill=(220, 30, 30), width=8)
+
+        # Start marker
+        sx, sy = points[0]
+        draw.ellipse([sx - 10, sy - 10, sx + 10, sy + 10], fill=(255, 255, 255), outline=(0, 0, 0), width=3)
+
+        # End arrow marker
+        ex, ey = points[-1]
+        draw.ellipse([ex - 8, ey - 8, ex + 8, ey + 8], fill=(245, 180, 0), outline=(0, 0, 0), width=2)
+
+        return canvas
+
+    def prepare_visual_inputs(
+        self,
+        frames: List[Image.Image],
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Prepare raw frames plus one clean trajectory summary image for VLM input."""
+        geometry = self._build_trajectory_geometry(sensor_data)
+        summary_image = self._render_trajectory_summary(geometry["trajectory_3d"])
+
+        if self.save_trajectory_frames and sample_id is not None:
+            os.makedirs(self.trajectory_output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_{timestamp}.jpg",
+            )
+            summary_image.save(summary_path, quality=95)
+
+        logger.info(
+            f"Trajectory summary: {geometry['visible_count']}/{len(geometry['valid_mask'])} points visible"
+        )
+        model_frames = list(frames[:4]) + [summary_image]
+        return model_frames, geometry
+
+    def _run_prompt_on_frames(
+        self,
+        frames: List[Image.Image],
+        prompt_text: str
+    ) -> str:
+        """Run a single prompt against the current VLM backend."""
+        is_qwen = "qwen" in HERON_MODEL_ID.lower()
+
+        if is_qwen:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": frame} for frame in frames],
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
+            text_prompt = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self.processor(
+                text=[text_prompt],
+                images=frames,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+        else:
+            inputs = self.processor(
+                text=prompt_text,
+                images=frames,
+                return_tensors="pt",
+            ).to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=24,
+                do_sample=False,
+                temperature=0.0,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+
+        if hasattr(inputs, "input_ids") and inputs.input_ids is not None:
+            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+        else:
+            generated_ids = output_ids
+
+        generated_text = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0].strip()
+        return generated_text
+
+    def _extract_choice(
+        self,
+        text: str,
+        valid_choices: List[str],
+        alias_to_choice: Optional[Dict[str, str]] = None
+    ) -> Optional[str]:
+        """Extract a stage choice from short generated text."""
+        import re
+
+        alias_to_choice = alias_to_choice or {}
+        response_text = text.strip()
+        if not response_text:
+            return None
+
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        candidates = []
+        if lines:
+            candidates.append(lines[-1])
+        candidates.append(response_text[-80:])
+
+        upper_choices = [choice.upper() for choice in valid_choices]
+        for candidate in candidates:
+            candidate_upper = candidate.upper().strip()
+            if candidate_upper in upper_choices:
+                return candidate_upper
+            for choice in upper_choices:
+                if re.search(rf'\b{re.escape(choice)}\b', candidate_upper):
+                    return choice
+            for alias, choice in alias_to_choice.items():
+                if alias in candidate:
+                    return choice.upper()
+
+        return None
     
     def predict_action(
         self,
@@ -480,6 +671,13 @@ class HeronAnnotatorWithTrajectory:
         Predict using multiple frames with trajectory visualization
         """
         try:
+            self.last_prediction_details = {
+                "mode": "qwen3_vl_stagewise",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+            }
+
             # Extract 4 frames from video
             frames, frame_indices = self.extract_frames_from_video(
                 video_path, 
@@ -493,82 +691,96 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[Multi-frame with trajectory] Using {len(frames)} frames at indices {frame_indices}")
-            
-            # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
-            
-            # Format prompt with sensor data
-            prompt_text = PROMPT_TEMPLATE.format(
+
+            model_frames, geometry = self.prepare_visual_inputs(frames, sensor_data, sample_id)
+            self.last_prediction_details["frame_indices"] = frame_indices
+            self.last_prediction_details["trajectory_features"] = {
+                "visible_count": geometry["visible_count"],
+                "trajectory_points": len(geometry["trajectory_3d"]),
+                "final_x_m": float(geometry["trajectory_3d"][-1][0]),
+                "final_y_m": float(geometry["trajectory_3d"][-1][1]),
+                "gyro_z": float(sensor_data.get('gyro_z', 0.0)),
+                "speed": float(sensor_data.get('speed', 0.0)),
+            }
+
+            stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
                 acc_y=sensor_data.get('acc_y', 0),
                 acc_z=sensor_data.get('acc_z', 0),
+                gyro_z=sensor_data.get('gyro_z', 0),
                 brake=sensor_data.get('brake', 0)
             )
-            
-            # Check model type for prompt formatting
-            is_qwen = "qwen" in HERON_MODEL_ID.lower()
-            
-            if is_qwen:
-                # Qwen2-VL format
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            *[{"type": "image", "image": frame} for frame in frames_with_trajectory],
-                            {"type": "text", "text": prompt_text}
-                        ]
-                    }
-                ]
-                text_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = self.processor(
-                    text=[text_prompt],
-                    images=frames_with_trajectory,
-                    padding=True,
-                    return_tensors="pt"
-                ).to(self.device)
+            stage1_generated = self._run_prompt_on_frames(model_frames, stage1_prompt)
+            stage1_choice = self._extract_choice(
+                stage1_generated,
+                ["A", "N"],
+                alias_to_choice={
+                    "直線系": "A",
+                    "左回転系": "N",
+                    "右回転系": "N",
+                    "その他": "N",
+                },
+            )
+
+            self.last_prediction_details["stage1_prompt_text"] = stage1_prompt
+            self.last_prediction_details["stage1_generated_text"] = stage1_generated
+            self.last_prediction_details["stage1_choice"] = stage1_choice
+
+            if stage1_choice == "A":
+                action_label = MACRO_OUTPUT_TO_LABEL["A"]
+                self.last_prediction_details["final_macro_choice"] = "A"
+                self.last_prediction_details["predicted_label"] = action_label
+                logger.info(f"Stage1 chose A -> Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})")
+                return action_label
+
+            if stage1_choice != "N":
+                logger.warning(f"Failed to extract Stage1 choice from model output: {stage1_generated}")
+                self.last_prediction_details["error"] = "stage1_parse_failed"
+                return None
+
+            stage2_prompt = STAGE2_PROMPT_TEMPLATE.format(
+                speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
+                acc_y=sensor_data.get('acc_y', 0),
+                acc_z=sensor_data.get('acc_z', 0),
+                gyro_z=sensor_data.get('gyro_z', 0),
+                brake=sensor_data.get('brake', 0)
+            )
+            stage2_generated = self._run_prompt_on_frames(model_frames, stage2_prompt)
+            stage2_choice = self._extract_choice(
+                stage2_generated,
+                ["B", "C", "D"],
+                alias_to_choice={
+                    "左回転系": "B",
+                    "右回転系": "C",
+                    "その他": "D",
+                },
+            )
+
+            self.last_prediction_details["stage2_prompt_text"] = stage2_prompt
+            self.last_prediction_details["stage2_generated_text"] = stage2_generated
+            self.last_prediction_details["stage2_choice"] = stage2_choice
+
+            if stage2_choice is None:
+                logger.warning(f"Failed to extract Stage2 choice from model output: {stage2_generated}")
+                self.last_prediction_details["error"] = "stage2_parse_failed"
+                return None
+
+            action_label = MACRO_OUTPUT_TO_LABEL[stage2_choice]
+            self.last_prediction_details["final_macro_choice"] = stage2_choice
+            self.last_prediction_details["predicted_label"] = action_label
+
+            macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
+            if macro_name:
+                logger.info(f"Predicted action label: {action_label} ({macro_name})")
             else:
-                # Heron format
-                inputs = self.processor(
-                    text=prompt_text,
-                    images=frames_with_trajectory,
-                    return_tensors="pt"
-                ).to(self.device)
-            
-            # Generate prediction
-            with torch.no_grad():
-                output_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=100,
-                    do_sample=False,
-                    temperature=0.0,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                    eos_token_id=self.processor.tokenizer.eos_token_id
-                )
-            
-            # Decode output
-            generated_text = self.processor.batch_decode(
-                output_ids,
-                skip_special_tokens=True
-            )[0]
-            
-            logger.info(f"Model output: {generated_text}")
-            
-            # Extract action label from response
-            action_label = self._extract_action_label(generated_text)
-            
-            if action_label is not None:
-                macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
-                if macro_name:
-                    logger.info(f"Predicted action label: {action_label} ({macro_name})")
-                else:
-                    logger.info(f"Predicted action label: {action_label}")
-            else:
-                logger.warning("Failed to extract action label from model output")
+                logger.info(f"Predicted action label: {action_label}")
             
             return action_label
             
         except Exception as e:
+            self.last_prediction_details["error"] = str(e)
             logger.error(f"Error in multi-frame trajectory prediction: {e}", exc_info=True)
             return None
     

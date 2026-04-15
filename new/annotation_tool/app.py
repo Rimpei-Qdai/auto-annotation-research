@@ -1,6 +1,7 @@
 # app.py
 
 import os
+import json
 import pandas as pd
 import logging
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,7 @@ VIDEO_DIR = os.path.join(os.path.dirname(BASE_DIR), 'filterd_video')
 CSV_INPUT = os.path.join(SAMPLE_DIR, 'annotation_samples.csv')
 CSV_OUTPUT_MANUAL = os.path.join(BASE_DIR, 'annotated_samples_manual.csv')
 CSV_OUTPUT_AUTO = os.path.join(BASE_DIR, 'annotated_samples_auto.csv')
+INFERENCE_PROCESS_JSONL = os.path.join(BASE_DIR, 'inference_process.jsonl')
 
 # 静的ファイルとテンプレート
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -166,6 +168,13 @@ def save_dataframe_auto():
     output_df = df_auto[['sample_id', 'timestamp', 'action_label']].copy()
     output_df.to_csv(CSV_OUTPUT_AUTO, index=False)
     logger.info(f"Auto-annotation results saved to {CSV_OUTPUT_AUTO}")
+
+def append_inference_trace(payload):
+    """推論過程を JSONL に追記する"""
+    payload = dict(payload)
+    payload.setdefault("logged_at", datetime.now(JST).isoformat())
+    with open(INFERENCE_PROCESS_JSONL, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 # ============ ルーティング ============
 
@@ -488,6 +497,14 @@ async def auto_annotate_all():
         for idx, (_, row) in enumerate(unannotated.iterrows()):
             sample_id = int(row['sample_id'])
             try:
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_all",
+                    "phase": "start",
+                    "sample_id": sample_id,
+                    "taxi_id": row['taxi_id'],
+                    "timestamp": int(row['timestamp']),
+                })
+
                 # Find matching video
                 match_result = find_matching_videos(
                     row['taxi_id'],
@@ -496,6 +513,13 @@ async def auto_annotate_all():
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_all",
+                        "phase": "completed",
+                        "sample_id": sample_id,
+                        "status": "failed",
+                        "error": "No video found",
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -520,6 +544,15 @@ async def auto_annotate_all():
                     'blinker_r': int(row['blinker_r']),
                     'blinker_l': int(row['blinker_l'])
                 }
+
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_all",
+                    "phase": "predicting",
+                    "sample_id": sample_id,
+                    "video_path": video_path,
+                    "offset_seconds": match_result['offset_seconds'],
+                    "sensor_data": sensor_data,
+                })
                 
                 # Predict action
                 predicted_label = annotator.predict_action(
@@ -532,6 +565,14 @@ async def auto_annotate_all():
                 if predicted_label is not None:
                     # Save to auto dataframe
                     df_auto.loc[df_auto['sample_id'] == sample_id, 'action_label'] = predicted_label
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_all",
+                        "phase": "completed",
+                        "sample_id": sample_id,
+                        "status": "success",
+                        "predicted_label": int(predicted_label),
+                        "details": getattr(annotator, "last_prediction_details", {}),
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": True,
@@ -539,6 +580,14 @@ async def auto_annotate_all():
                     })
                     logger.info(f"Sample {sample_id}: predicted label {predicted_label}")
                 else:
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_all",
+                        "phase": "completed",
+                        "sample_id": sample_id,
+                        "status": "failed",
+                        "error": "Prediction returned None",
+                        "details": getattr(annotator, "last_prediction_details", {}),
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -551,6 +600,14 @@ async def auto_annotate_all():
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_all",
+                    "phase": "completed",
+                    "sample_id": sample_id,
+                    "status": "failed",
+                    "error": str(e),
+                    "details": getattr(annotator, "last_prediction_details", {}),
+                })
                 results.append({
                     "sample_id": sample_id,
                     "success": False,
