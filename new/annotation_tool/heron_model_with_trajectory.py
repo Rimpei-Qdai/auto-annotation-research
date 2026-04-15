@@ -16,6 +16,7 @@ from datetime import datetime
 
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
+from driving_graph import MacroGraphVerifier
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -68,6 +69,7 @@ class HeronAnnotatorWithTrajectory:
         self.save_trajectory_frames = save_trajectory_frames
         self.trajectory_output_dir = trajectory_output_dir
         self.trajectory_visualizer = None
+        self.graph_verifier = MacroGraphVerifier()
         
         # Create output directory for trajectory frames
         if self.save_trajectory_frames and not os.path.exists(self.trajectory_output_dir):
@@ -565,6 +567,35 @@ class HeronAnnotatorWithTrajectory:
                     return choice.upper()
 
         return None
+
+    def _apply_macro_graph(
+        self,
+        initial_macro_choice: str,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        *,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> str:
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+        self.last_prediction_details["macro_graph"] = graph_result
+        self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
+
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice"):
+            final_macro_choice = strong_candidate["macro_choice"]
+            self.last_prediction_details["graph_override"] = final_macro_choice != initial_macro_choice
+            self.last_prediction_details["final_macro_choice"] = final_macro_choice
+            return final_macro_choice
+
+        self.last_prediction_details["graph_override"] = False
+        self.last_prediction_details["final_macro_choice"] = initial_macro_choice
+        return initial_macro_choice
     
     def predict_action(
         self,
@@ -728,10 +759,19 @@ class HeronAnnotatorWithTrajectory:
             self.last_prediction_details["stage1_choice"] = stage1_choice
 
             if stage1_choice == "A":
-                action_label = MACRO_OUTPUT_TO_LABEL["A"]
-                self.last_prediction_details["final_macro_choice"] = "A"
+                final_macro_choice = self._apply_macro_graph(
+                    "A",
+                    sensor_data,
+                    self.last_prediction_details["trajectory_features"],
+                    stage1_choice=stage1_choice,
+                    stage2_choice=None,
+                )
+                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
                 self.last_prediction_details["predicted_label"] = action_label
-                logger.info(f"Stage1 chose A -> Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})")
+                logger.info(
+                    f"Stage1 chose A -> Final macro {final_macro_choice} -> "
+                    f"Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})"
+                )
                 return action_label
 
             if stage1_choice != "N":
@@ -767,13 +807,22 @@ class HeronAnnotatorWithTrajectory:
                 self.last_prediction_details["error"] = "stage2_parse_failed"
                 return None
 
-            action_label = MACRO_OUTPUT_TO_LABEL[stage2_choice]
-            self.last_prediction_details["final_macro_choice"] = stage2_choice
+            final_macro_choice = self._apply_macro_graph(
+                stage2_choice,
+                sensor_data,
+                self.last_prediction_details["trajectory_features"],
+                stage1_choice=stage1_choice,
+                stage2_choice=stage2_choice,
+            )
+            action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
             self.last_prediction_details["predicted_label"] = action_label
 
             macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
             if macro_name:
-                logger.info(f"Predicted action label: {action_label} ({macro_name})")
+                logger.info(
+                    f"Stage2 chose {stage2_choice} -> Final macro {final_macro_choice} -> "
+                    f"Predicted action label: {action_label} ({macro_name})"
+                )
             else:
                 logger.info(f"Predicted action label: {action_label}")
             
