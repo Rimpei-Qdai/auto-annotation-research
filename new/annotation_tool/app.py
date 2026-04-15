@@ -1,18 +1,29 @@
 # app.py
 
 import os
+import json
 import pandas as pd
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+JST = timezone(timedelta(hours=9))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ANNOTATION_LOG = os.path.join(BASE_DIR, 'annotation.log')
+INFERENCE_PROCESS_JSONL = os.path.join(BASE_DIR, 'inference_process.jsonl')
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(ANNOTATION_LOG, encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -29,7 +40,6 @@ except ImportError as e:
 app = FastAPI()
 
 # パス設定
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_DIR = os.path.join(os.path.dirname(BASE_DIR), 'sample')
 VIDEO_DIR = os.path.join(os.path.dirname(BASE_DIR), 'filterd_video')
 
@@ -91,8 +101,8 @@ if 'action_label' not in df_auto.columns:
 # ============ ヘルパー関数 ============
 
 def unix_ms_to_datetime(unix_ms):
-    """UNIXミリ秒をdatetimeに変換"""
-    return datetime.fromtimestamp(unix_ms / 1000.0)
+    """UNIXミリ秒をJST基準のnaive datetimeに変換"""
+    return datetime.fromtimestamp(unix_ms / 1000.0, tz=JST).replace(tzinfo=None)
 
 def extract_video_timestamp(filename):
     """動画ファイル名からタイムスタンプを抽出"""
@@ -166,6 +176,68 @@ def save_dataframe_auto():
     output_df.to_csv(CSV_OUTPUT_AUTO, index=False)
     logger.info(f"Auto-annotation results saved to {CSV_OUTPUT_AUTO}")
 
+def append_inference_trace(payload):
+    """推論過程を JSONL に追記する"""
+    record = {
+        "logged_at": datetime.now(JST).isoformat(),
+        **payload
+    }
+    with open(INFERENCE_PROCESS_JSONL, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def log_prediction_trace(
+    annotator,
+    endpoint: str,
+    sample_id: int,
+    row,
+    video_path: Optional[str],
+    offset_seconds: Optional[float],
+    predicted_label: Optional[int],
+    success: bool,
+    error: Optional[str] = None
+):
+    """Annotator の最新詳細を使って sample 単位の推論情報を保存する"""
+    details = getattr(annotator, 'last_prediction_details', None) or {}
+    resolved_error = error or details.get("error")
+    if not success and not resolved_error:
+        resolved_error = "Prediction returned None"
+    append_inference_trace({
+        "endpoint": endpoint,
+        "sample_id": int(sample_id),
+        "taxi_id": row.get('taxi_id'),
+        "timestamp": int(row.get('timestamp')),
+        "video_path": video_path,
+        "offset_seconds": offset_seconds,
+        "sensor_data": {
+            "speed": float(row.get('speed', 0.0)),
+            "acc_x": float(row.get('acc_x', 0.0)),
+            "acc_y": float(row.get('acc_y', 0.0)),
+            "acc_z": float(row.get('acc_z', 0.0)),
+            "gyro_z": float(row.get('gyro_z', 0.0)),
+            "latitude": float(row.get('latitude', 0.0)),
+            "longitude": float(row.get('longitude', 0.0)),
+        },
+        "prompt_text": details.get("prompt_text"),
+        "generated_text": details.get("generated_text"),
+        "extracted_label": details.get("extracted_label"),
+        "predicted_label": predicted_label,
+        "speed_event_hint": details.get("speed_event_hint"),
+        "turn_event_hint": details.get("turn_event_hint"),
+        "candidate_labels": details.get("candidate_labels"),
+        "macro_candidate_codes": details.get("macro_candidate_codes"),
+        "macro_candidate_labels": details.get("macro_candidate_labels"),
+        "macro_prediction_code": details.get("macro_prediction_code"),
+        "macro_prediction_label": details.get("macro_prediction_label"),
+        "stage_traces": details.get("stage_traces"),
+        "trajectory_features": details.get("trajectory_features"),
+        "stage1_reason": details.get("stage1_reason"),
+        "fine_label_reason": details.get("fine_label_reason"),
+        "frame_indices": details.get("frame_indices"),
+        "visible_trajectory_points": details.get("visible_trajectory_points"),
+        "status": "success" if success else "failed",
+        "error": resolved_error,
+    })
+
 # ============ ルーティング ============
 
 @app.get("/", response_class=HTMLResponse)
@@ -221,9 +293,9 @@ async def main_page(request: Request):
         'acc_y': float(row['acc_y']),
         'acc_z': float(row['acc_z']),
         'speed': float(row['speed']),
-        'brake': int(row['brake']),
-        'blinker_r': int(row['blinker_r']),
-        'blinker_l': int(row['blinker_l'])
+        'gyro_z': float(row['gyro_z']),
+        'latitude': float(row['latitude']),
+        'longitude': float(row['longitude'])
     }
     
     return templates.TemplateResponse("index.html", {
@@ -277,6 +349,14 @@ async def auto_annotate(sample_id: int = Form(...)):
         match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
         
         if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
+            append_inference_trace({
+                "endpoint": "/auto_annotate",
+                "sample_id": int(sample_id),
+                "taxi_id": row['taxi_id'],
+                "timestamp": int(row['timestamp']),
+                "status": "failed",
+                "error": "No video found"
+            })
             return JSONResponse(
                 {"error": "No video found for this sample"},
                 status_code=404
@@ -299,9 +379,8 @@ async def auto_annotate(sample_id: int = Form(...)):
             'acc_y': float(row['acc_y']),
             'acc_z': float(row['acc_z']),
             'gyro_z': float(row['gyro_z']),
-            'brake': int(row['brake']),
-            'blinker_r': int(row['blinker_r']),
-            'blinker_l': int(row['blinker_l'])
+            'latitude': float(row['latitude']),
+            'longitude': float(row['longitude'])
         }
         
         # Get annotator and predict
@@ -311,6 +390,16 @@ async def auto_annotate(sample_id: int = Form(...)):
             sensor_data=sensor_data,
             start_time=match_result['offset_seconds'],
             sample_id=sample_id
+        )
+        log_prediction_trace(
+            annotator=annotator,
+            endpoint="/auto_annotate",
+            sample_id=sample_id,
+            row=row,
+            video_path=video_path,
+            offset_seconds=match_result['offset_seconds'],
+            predicted_label=predicted_label,
+            success=predicted_label is not None
         )
         
         if predicted_label is not None:
@@ -325,8 +414,9 @@ async def auto_annotate(sample_id: int = Form(...)):
                 "predicted_label": int(predicted_label)
             })
         else:
+            details = getattr(annotator, 'last_prediction_details', None) or {}
             return JSONResponse(
-                {"error": "Prediction failed"},
+                {"error": details.get("error") or "Prediction failed"},
                 status_code=500
             )
             
@@ -369,6 +459,14 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_batch",
+                        "sample_id": int(sample_id),
+                        "taxi_id": row['taxi_id'],
+                        "timestamp": int(row['timestamp']),
+                        "status": "failed",
+                        "error": "No video found"
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -390,9 +488,8 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     'acc_y': float(row['acc_y']),
                     'acc_z': float(row['acc_z']),
                     'gyro_z': float(row['gyro_z']),
-                    'brake': int(row['brake']),
-                    'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l'])
+                    'latitude': float(row['latitude']),
+                    'longitude': float(row['longitude'])
                 }
                 
                 # Predict
@@ -401,6 +498,16 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
+                )
+                log_prediction_trace(
+                    annotator=annotator,
+                    endpoint="/auto_annotate_batch",
+                    sample_id=sample_id,
+                    row=row,
+                    video_path=video_path,
+                    offset_seconds=match_result['offset_seconds'],
+                    predicted_label=predicted_label,
+                    success=predicted_label is not None
                 )
                 
                 if predicted_label is not None:
@@ -412,14 +519,23 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                         "predicted_label": int(predicted_label)
                     })
                 else:
+                    details = getattr(annotator, 'last_prediction_details', None) or {}
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": "Prediction failed"
+                        "error": details.get("error") or "Prediction returned None"
                     })
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_batch",
+                    "sample_id": int(sample_id),
+                    "taxi_id": row.get('taxi_id'),
+                    "timestamp": int(row.get('timestamp')),
+                    "status": "failed",
+                    "error": str(e)
+                })
                 results.append({
                     "sample_id": sample_id,
                     "success": False,
@@ -495,6 +611,14 @@ async def auto_annotate_all():
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_all",
+                        "sample_id": sample_id,
+                        "taxi_id": row['taxi_id'],
+                        "timestamp": int(row['timestamp']),
+                        "status": "failed",
+                        "error": "No video found"
+                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
@@ -515,9 +639,8 @@ async def auto_annotate_all():
                     'acc_y': float(row['acc_y']),
                     'acc_z': float(row['acc_z']),
                     'gyro_z': float(row['gyro_z']),
-                    'brake': int(row['brake']),
-                    'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l'])
+                    'latitude': float(row['latitude']),
+                    'longitude': float(row['longitude'])
                 }
                 
                 # Predict action
@@ -526,6 +649,16 @@ async def auto_annotate_all():
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
+                )
+                log_prediction_trace(
+                    annotator=annotator,
+                    endpoint="/auto_annotate_all",
+                    sample_id=sample_id,
+                    row=row,
+                    video_path=video_path,
+                    offset_seconds=match_result['offset_seconds'],
+                    predicted_label=predicted_label,
+                    success=predicted_label is not None
                 )
                 
                 if predicted_label is not None:
@@ -538,10 +671,11 @@ async def auto_annotate_all():
                     })
                     logger.info(f"Sample {sample_id}: predicted label {predicted_label}")
                 else:
+                    details = getattr(annotator, 'last_prediction_details', None) or {}
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": "Prediction returned None"
+                        "error": details.get("error") or "Prediction returned None"
                     })
                 
                 # Progress logging
@@ -550,6 +684,14 @@ async def auto_annotate_all():
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_all",
+                    "sample_id": sample_id,
+                    "taxi_id": row.get('taxi_id'),
+                    "timestamp": int(row.get('timestamp')),
+                    "status": "failed",
+                    "error": str(e)
+                })
                 results.append({
                     "sample_id": sample_id,
                     "success": False,
