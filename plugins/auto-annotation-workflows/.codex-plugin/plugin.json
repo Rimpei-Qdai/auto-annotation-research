@@ -1,0 +1,41 @@
+{
+  "name": "auto-annotation-workflows",
+  "version": "0.1.0",
+  "description": "Repo-local slash commands for the auto-annotation research workflow.",
+  "author": {
+    "name": "Rimpei Hata",
+    "url": "https://github.com/Rimpei-Qdai"
+  },
+  "homepage": "https://github.com/Rimpei-Qdai/auto-annotation-research",
+  "repository": "https://github.com/Rimpei-Qdai/auto-annotation-research",
+  "license": "MIT",
+  "keywords": [
+    "auto-annotation",
+    "research",
+    "trajectory",
+    "vlm",
+    "evaluation"
+  ],
+  "interface": {
+    "displayName": "Auto Annotation Workflows",
+    "shortDescription": "Slash commands for sync, evaluation, rendering, implementation, and literature-backed proposals.",
+    "longDescription": "Research-specific Codex commands for this repository. The commands sync latest annotation runs from kiwi, compare against manual labels, generate trajectory input previews, implement focused improvements, and produce literature-backed remediation reports with repo-specific paths and guardrails baked in.",
+    "developerName": "Rimpei Hata",
+    "category": "Research",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Rimpei-Qdai/auto-annotation-research",
+    "privacyPolicyURL": "https://github.com/Rimpei-Qdai/auto-annotation-research",
+    "termsOfServiceURL": "https://github.com/Rimpei-Qdai/auto-annotation-research",
+    "defaultPrompt": [
+      "/sync-annotation-report host=kiwi",
+      "/render-trajectory-inputs sample_ids=1,7,2,4,47",
+      "/investigate-and-propose focus=vlm-trajectory-reading"
+    ],
+    "brandColor": "#1F6FEB",
+    "screenshots": []
+  }
+}
