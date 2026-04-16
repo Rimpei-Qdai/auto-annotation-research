@@ -67,7 +67,7 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
-PROMPT_VERSION = "summary_v6_direction_speed_split"
+PROMPT_VERSION = "summary_v7_visual_probe_split"
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
@@ -94,72 +94,37 @@ D: その他（停止・発進・その他）
 A, B, C, D のいずれか1文字のみで回答してください。"""
 
 STAGE1_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1は direction summary、画像2は speed summary です。
+画像1は top-down summary、画像2は direction summary です。
 
-【画像の役割】
-- 画像1: 左右の曲がりを見る画像です
-- 画像2: 前進距離と速度変化を見る画像です
-- 緑線は直進基準、赤線は今後3秒間の予測軌道です
+【見る対象】
+- 画像2の赤線の終点が、LEFT / CENTER / RIGHT のどこにあるかだけを見てください
 - LEFT / RIGHT は車両基準の左 / 右です
-
-【判断】
-- A = 直進系
-- N = 回転系またはその他
-- 画像1で赤線が中央の straight band 付近に収まり、画像2で十分に前へ伸びていれば A です
-- 画像1で明確に LEFT / RIGHT 側へ外れる、または画像2で軌道が短すぎるなら N です
-- 少しの曲がりや軽い横ずれだけなら A を選んでください
+- 緑の中央帯の中なら CENTER です
+- 少しの曲がりで中央帯に残るなら CENTER です
 
 【センサーデータ】
 速度: {speed} km/h
 加速度X: {acc_x} m/s²
 Yaw rate: {gyro_z} rad/s
 
-最終回答は A または N の1文字のみで回答してください。"""
+最終回答は LEFT, CENTER, RIGHT のいずれか1語のみで回答してください。"""
 
 STAGE2_ROUTE_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1は direction summary です。
+画像1は top-down summary、画像2は speed summary です。
 
-【画像の役割】
-- この1枚だけで判断してください
-- 緑線は直進基準、赤線は今後3秒間の予測軌道です
-- LEFT / RIGHT は車両基準の左 / 右です
-
-【判断】
-- R = 回転系
-- D = その他
-- 赤線が straight band からはっきり外れ、LEFT / RIGHT のどちらかへ一貫して曲がるなら R です
-- 中央付近に留まる、左右の偏りが弱い、または stop-like で回転方向が弱いなら D です
-- 曖昧なら R ではなく D を選んでください
+【見る対象】
+- 軌道が十分に前へ伸びているかだけを見てください
+- 長く伸びていれば LONG、極端に短いか点状なら SHORT です
+- 左右の曲がりは無視して、長さと点間隔だけを見てください
 
 【センサーデータ】
 速度: {speed} km/h
 加速度X: {acc_x} m/s²
 Yaw rate: {gyro_z} rad/s
 
-最終回答は R または D の1文字のみで回答してください。"""
+最終回答は LONG または SHORT の1語のみで回答してください。"""
 
-STAGE3_TURN_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1は direction summary です。
-
-【画像の役割】
-- この1枚だけで判断してください
-- LEFT / RIGHT は車両基準の左 / 右です
-- 緑線は直進基準、赤線は今後3秒間の予測軌道です
-
-【判断】
-- B = 左回転系
-- C = 右回転系
-- 終点と軌道全体が LEFT 側なら B です
-- 終点と軌道全体が RIGHT 側なら C です
-- B と C は対称です。片方をデフォルトにしないでください
-- 曖昧なときは、終点が中央線からどちら側へより遠いかで選んでください
-
-【センサーデータ】
-速度: {speed} km/h
-加速度X: {acc_x} m/s²
-Yaw rate: {gyro_z} rad/s
-
-最終回答は B または C の1文字のみで回答してください。"""
+STAGE3_TURN_PROMPT_TEMPLATE = """unused"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds

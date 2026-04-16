@@ -142,24 +142,22 @@ class TrajectorySummaryTests(unittest.TestCase):
 
         self.assertGreater(points[-1][0], 360)
 
-    def test_stage_frame_selection_uses_only_two_summary_images(self):
+    def test_stage_frame_selection_uses_probe_specific_summary_pairs(self):
         model_frames = make_frames() + [
-            Image.new("RGB", (720, 720), color="white"),
-            Image.new("RGB", (720, 720), color="red"),
-            Image.new("RGB", (720, 720), color="blue"),
+            Image.new("RGB", (720, 720), color="white"),  # topdown
+            Image.new("RGB", (720, 720), color="red"),    # direction
+            Image.new("RGB", (720, 720), color="blue"),   # speed
         ]
 
         stage1_selected = self.annotator._select_stage_frames(model_frames, "stage1")
         stage2_selected = self.annotator._select_stage_frames(model_frames, "stage2")
-        stage3_selected = self.annotator._select_stage_frames(model_frames, "stage3")
 
         self.assertEqual(len(stage1_selected), 2)
-        self.assertIs(stage1_selected[0], model_frames[-2])
-        self.assertIs(stage1_selected[1], model_frames[-1])
-        self.assertEqual(len(stage2_selected), 1)
-        self.assertIs(stage2_selected[0], model_frames[-2])
-        self.assertEqual(len(stage3_selected), 1)
-        self.assertIs(stage3_selected[0], model_frames[-2])
+        self.assertIs(stage1_selected[0], model_frames[-3])
+        self.assertIs(stage1_selected[1], model_frames[-2])
+        self.assertEqual(len(stage2_selected), 2)
+        self.assertIs(stage2_selected[0], model_frames[-3])
+        self.assertIs(stage2_selected[1], model_frames[-1])
 
 
 if __name__ == "__main__":

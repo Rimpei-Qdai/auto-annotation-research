@@ -854,16 +854,17 @@ class HeronAnnotatorWithTrajectory:
     ) -> List[Image.Image]:
         """Select the visual inputs for a stage.
 
-        Stage1 reads direction + speed summaries.
-        Stage2/3 read only the direction summary so the task is purely directional.
+        Stage1 reads topdown + direction for left/center/right probing.
+        Stage2 reads topdown + speed for long/short probing.
         """
         if len(model_frames) >= 3:
+            topdown_summary = model_frames[-3]
             direction_summary = model_frames[-2]
             speed_summary = model_frames[-1]
             if stage_name == "stage1":
-                return [direction_summary, speed_summary]
-            if stage_name in {"stage2", "stage3"}:
-                return [direction_summary]
+                return [topdown_summary, direction_summary]
+            if stage_name == "stage2":
+                return [topdown_summary, speed_summary]
         return model_frames
 
     def _extract_choice(
@@ -1073,142 +1074,96 @@ class HeronAnnotatorWithTrajectory:
                 "acc_x": float(sensor_data.get('acc_x', 0.0)),
             }
 
-            stage1_frames = self._select_stage_frames(model_frames, "stage1")
-            self.last_prediction_details["stage1_visual_input_count"] = len(stage1_frames)
-            self.last_prediction_details["stage1_visual_mode"] = "direction_plus_speed"
+            direction_frames = self._select_stage_frames(model_frames, "stage1")
+            self.last_prediction_details["stage1_visual_input_count"] = len(direction_frames)
+            self.last_prediction_details["stage1_visual_mode"] = "topdown_plus_direction"
 
             stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
-            stage1_generated = self._run_prompt_on_frames(stage1_frames, stage1_prompt)
-            stage1_choice = self._extract_choice(
+            stage1_generated = self._run_prompt_on_frames(direction_frames, stage1_prompt)
+            direction_choice = self._extract_choice(
                 stage1_generated,
-                ["A", "N"],
+                ["LEFT", "CENTER", "RIGHT"],
                 alias_to_choice={
-                    "直線系": "A",
-                    "左回転系": "N",
-                    "右回転系": "N",
-                    "その他": "N",
+                    "左": "LEFT",
+                    "中央": "CENTER",
+                    "右": "RIGHT",
                 },
             )
 
             self.last_prediction_details["stage1_prompt_text"] = stage1_prompt
             self.last_prediction_details["stage1_generated_text"] = stage1_generated
-            self.last_prediction_details["stage1_choice"] = stage1_choice
+            self.last_prediction_details["direction_probe_choice"] = direction_choice
 
-            if stage1_choice == "A":
-                final_macro_choice = self._apply_macro_graph(
-                    "A",
-                    sensor_data,
-                    self.last_prediction_details["trajectory_features"],
-                    stage1_choice=stage1_choice,
-                    stage2_choice=None,
-                )
-                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
-                self.last_prediction_details["predicted_label"] = action_label
-                logger.info(
-                    f"Stage1 chose A -> Final macro {final_macro_choice} -> "
-                    f"Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})"
-                )
-                return action_label
-
-            if stage1_choice != "N":
-                logger.warning(f"Failed to extract Stage1 choice from model output: {stage1_generated}")
+            if direction_choice is None:
+                logger.warning(f"Failed to extract direction probe from model output: {stage1_generated}")
                 self.last_prediction_details["error"] = "stage1_parse_failed"
                 return None
 
-            stage2_frames = self._select_stage_frames(model_frames, "stage2")
-            self.last_prediction_details["stage2_visual_input_count"] = len(stage2_frames)
-            self.last_prediction_details["stage2_visual_mode"] = "direction_only"
+            speed_frames = self._select_stage_frames(model_frames, "stage2")
+            self.last_prediction_details["stage2_visual_input_count"] = len(speed_frames)
+            self.last_prediction_details["stage2_visual_mode"] = "topdown_plus_speed"
 
             stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
-            stage2_generated = self._run_prompt_on_frames(stage2_frames, stage2_prompt)
-            stage2_route_choice = self._extract_choice(
+            stage2_generated = self._run_prompt_on_frames(speed_frames, stage2_prompt)
+            speed_choice = self._extract_choice(
                 stage2_generated,
-                ["R", "D"],
+                ["LONG", "SHORT"],
                 alias_to_choice={
-                    "回転系": "R",
-                    "その他": "D",
+                    "長い": "LONG",
+                    "短い": "SHORT",
                 },
             )
 
             self.last_prediction_details["stage2_prompt_text"] = stage2_prompt
             self.last_prediction_details["stage2_generated_text"] = stage2_generated
-            self.last_prediction_details["stage2_route_choice"] = stage2_route_choice
+            self.last_prediction_details["speed_probe_choice"] = speed_choice
 
-            if stage2_route_choice is None:
-                logger.warning(f"Failed to extract Stage2 choice from model output: {stage2_generated}")
+            if speed_choice is None:
+                logger.warning(f"Failed to extract speed probe from model output: {stage2_generated}")
                 self.last_prediction_details["error"] = "stage2_parse_failed"
                 return None
 
-            if stage2_route_choice == "D":
-                self.last_prediction_details["stage2_choice"] = "D"
-                final_macro_choice = self._apply_macro_graph(
-                    "D",
-                    sensor_data,
-                    self.last_prediction_details["trajectory_features"],
-                    stage1_choice=stage1_choice,
-                    stage2_choice="D",
+            if speed_choice == "SHORT":
+                initial_macro_choice = "D"
+            elif direction_choice == "CENTER":
+                initial_macro_choice = "A"
+            elif direction_choice == "LEFT":
+                initial_macro_choice = "B"
+            elif direction_choice == "RIGHT":
+                initial_macro_choice = "C"
+            else:
+                logger.warning(
+                    "Unexpected visual probe combination: direction=%s speed=%s",
+                    direction_choice,
+                    speed_choice,
                 )
-                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
-                self.last_prediction_details["predicted_label"] = action_label
-
-                macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
-                if macro_name:
-                    logger.info(
-                        f"Stage2 chose D -> Final macro {final_macro_choice} -> "
-                        f"Predicted action label: {action_label} ({macro_name})"
-                    )
-                else:
-                    logger.info(f"Predicted action label: {action_label}")
-                return action_label
-
-            if stage2_route_choice != "R":
-                logger.warning(f"Unexpected Stage2 route choice from model output: {stage2_generated}")
-                self.last_prediction_details["error"] = "stage2_route_unexpected"
+                self.last_prediction_details["error"] = "visual_probe_unexpected"
                 return None
 
-            stage3_frames = self._select_stage_frames(model_frames, "stage3")
-            self.last_prediction_details["stage3_visual_input_count"] = len(stage3_frames)
-            self.last_prediction_details["stage3_visual_mode"] = "direction_only"
-
-            stage3_prompt = STAGE3_TURN_PROMPT_TEMPLATE.format(
-                speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                gyro_z=sensor_data.get('gyro_z', 0),
+            self.last_prediction_details["stage1_choice"] = "A" if initial_macro_choice == "A" else "N"
+            self.last_prediction_details["stage2_route_choice"] = (
+                None if initial_macro_choice == "A"
+                else "D" if initial_macro_choice == "D"
+                else "R"
             )
-            stage3_generated = self._run_prompt_on_frames(stage3_frames, stage3_prompt)
-            stage3_choice = self._extract_choice(
-                stage3_generated,
-                ["B", "C"],
-                alias_to_choice={
-                    "左回転系": "B",
-                    "右回転系": "C",
-                },
-            )
-
-            self.last_prediction_details["stage3_prompt_text"] = stage3_prompt
-            self.last_prediction_details["stage3_generated_text"] = stage3_generated
-            self.last_prediction_details["stage3_turn_choice"] = stage3_choice
-            self.last_prediction_details["stage2_choice"] = stage3_choice
-
-            if stage3_choice is None:
-                logger.warning(f"Failed to extract Stage3 choice from model output: {stage3_generated}")
-                self.last_prediction_details["error"] = "stage3_parse_failed"
-                return None
+            self.last_prediction_details["stage2_choice"] = None if initial_macro_choice == "A" else initial_macro_choice
+            self.last_prediction_details["stage3_turn_choice"] = initial_macro_choice if initial_macro_choice in {"B", "C"} else None
+            self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
 
             final_macro_choice = self._apply_macro_graph(
-                stage3_choice,
+                initial_macro_choice,
                 sensor_data,
                 self.last_prediction_details["trajectory_features"],
-                stage1_choice=stage1_choice,
-                stage2_choice=stage3_choice,
+                stage1_choice=self.last_prediction_details["stage1_choice"],
+                stage2_choice=initial_macro_choice if initial_macro_choice != "A" else None,
             )
             action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
             self.last_prediction_details["predicted_label"] = action_label
@@ -1216,7 +1171,8 @@ class HeronAnnotatorWithTrajectory:
             macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
             if macro_name:
                 logger.info(
-                    f"Stage3 chose {stage3_choice} -> Final macro {final_macro_choice} -> "
+                    f"Visual probes direction={direction_choice}, speed={speed_choice} -> "
+                    f"initial {initial_macro_choice} -> Final macro {final_macro_choice} -> "
                     f"Predicted action label: {action_label} ({macro_name})"
                 )
             else:
