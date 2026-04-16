@@ -8,7 +8,7 @@ import os
 import logging
 import subprocess
 from typing import List, Optional, Dict, Any, Tuple
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import torch
@@ -465,10 +465,81 @@ class HeronAnnotatorWithTrajectory:
         origin_y = height - margin
         points: List[Tuple[int, int]] = []
         for x, y, _ in trajectory_3d:
-            px = center_x + int((y / max_side_m) * (width * 0.32))
+            # Vehicle-frame +Y means "left", so positive lateral offset must appear
+            # on the left side of the summary image to match the prompt semantics.
+            px = center_x - int((y / max_side_m) * (width * 0.32))
             py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
             points.append((px, py))
         return points
+
+    def _load_summary_font(self, size: int) -> ImageFont.ImageFont:
+        """Load a readable font for summary-side anchors."""
+        for name in ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "Arial.ttf"]:
+            try:
+                return ImageFont.truetype(name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _draw_direction_anchors(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+    ) -> None:
+        """Draw explicit left/right anchors so VLM can bind geometry to direction."""
+        left_color = (50, 90, 220)
+        right_color = (220, 130, 30)
+        font = self._load_summary_font(28)
+
+        # Side tint is intentionally subtle: it anchors direction without competing
+        # with the trajectory itself.
+        draw.rectangle([0, 0, margin - 10, height], fill=(238, 244, 255))
+        draw.rectangle([width - margin + 10, 0, width, height], fill=(255, 244, 232))
+
+        left_y = margin - 10
+        right_y = margin - 10
+        draw.text((36, left_y), "LEFT", fill=left_color, font=font)
+        right_text = "RIGHT"
+        bbox = draw.textbbox((0, 0), right_text, font=font)
+        right_w = bbox[2] - bbox[0]
+        draw.text((width - 36 - right_w, right_y), right_text, fill=right_color, font=font)
+
+        # Arrow markers reinforce orientation even if the text is not fully parsed.
+        left_arrow = [(margin - 18, margin + 18), (18, margin + 18), (34, margin + 6), (34, margin + 30)]
+        right_arrow = [(width - margin + 18, margin + 18), (width - 18, margin + 18), (width - 34, margin + 6), (width - 34, margin + 30)]
+        draw.line(left_arrow[:2], fill=left_color, width=10)
+        draw.polygon([left_arrow[1], left_arrow[2], left_arrow[3]], fill=left_color)
+        draw.line(right_arrow[:2], fill=right_color, width=10)
+        draw.polygon([right_arrow[1], right_arrow[2], right_arrow[3]], fill=right_color)
+
+    def _draw_endpoint_arrow(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a clear arrowhead at the final trajectory direction."""
+        if len(points) < 2:
+            return
+
+        (x1, y1), (x2, y2) = points[-2], points[-1]
+        dx = x2 - x1
+        dy = y2 - y1
+        norm = float(np.hypot(dx, dy))
+        if norm < 1e-3:
+            return
+
+        ux, uy = dx / norm, dy / norm
+        px, py = -uy, ux
+        tip = np.array([x2, y2], dtype=np.float32)
+        base = tip - np.array([ux, uy], dtype=np.float32) * 24.0
+        wing = np.array([px, py], dtype=np.float32) * 10.0
+        left = tuple((base + wing).astype(int))
+        right = tuple((base - wing).astype(int))
+        tip_t = tuple(tip.astype(int))
+        draw.polygon([tip_t, left, right], fill=(245, 180, 0), outline=(0, 0, 0))
 
     def _draw_summary_trajectory(
         self,
@@ -523,6 +594,7 @@ class HeronAnnotatorWithTrajectory:
             outline=(0, 0, 0),
             width=2,
         )
+        self._draw_endpoint_arrow(draw, points)
 
     def _render_topdown_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
         """Render a fixed-scale bird's-eye summary image."""
@@ -535,6 +607,8 @@ class HeronAnnotatorWithTrajectory:
 
         canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
+
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
 
         draw.line(
             [(margin, origin_y), (width - margin, origin_y)],
@@ -571,6 +645,8 @@ class HeronAnnotatorWithTrajectory:
 
         canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
+
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
 
         draw.line(
             [(margin, origin_y), (width - margin, origin_y)],

@@ -65,6 +65,50 @@ class TrajectorySummaryTests(unittest.TestCase):
 
         self.assertFalse(np.array_equal(left_img, right_img))
 
+    def test_positive_lateral_offset_renders_on_left_side(self):
+        left_traj = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.5, 0.0],
+                [6.0, 1.5, 0.0],
+                [9.0, 3.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        points = self.annotator._trajectory_to_canvas_points(
+            left_traj,
+            width=720,
+            height=720,
+            margin=60,
+            max_forward_m=9.0,
+            max_side_m=3.0,
+        )
+
+        self.assertLess(points[-1][0], 360)
+
+    def test_negative_lateral_offset_renders_on_right_side(self):
+        right_traj = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, -0.5, 0.0],
+                [6.0, -1.5, 0.0],
+                [9.0, -3.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        points = self.annotator._trajectory_to_canvas_points(
+            right_traj,
+            width=720,
+            height=720,
+            margin=60,
+            max_forward_m=9.0,
+            max_side_m=3.0,
+        )
+
+        self.assertGreater(points[-1][0], 360)
+
 
 if __name__ == "__main__":
     unittest.main()
