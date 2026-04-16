@@ -42,6 +42,7 @@ from config import (
     USE_L2M_COT,
     MACRO_OUTPUT_TO_LABEL,
     MACRO_OUTPUT_NAMES,
+    PROMPT_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -818,6 +819,7 @@ class HeronAnnotatorWithTrajectory:
         try:
             self.last_prediction_details = {
                 "mode": "qwen3_vl_stagewise",
+                "prompt_version": PROMPT_VERSION,
                 "sample_id": sample_id,
                 "video_path": video_path,
                 "start_time": start_time,
