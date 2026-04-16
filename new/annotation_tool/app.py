@@ -49,7 +49,7 @@ def log_runtime_metadata(context: str = "startup"):
 
     metadata = get_runtime_metadata()
     logger.info(
-        "[%s] Runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
+        "[%s] Runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s use_rag_feedback=%s",
         context,
         metadata.get("repo_branch"),
         metadata.get("repo_commit"),
@@ -57,6 +57,7 @@ def log_runtime_metadata(context: str = "startup"):
         metadata.get("model_id"),
         metadata.get("prompt_version"),
         metadata.get("use_l2m_cot"),
+        metadata.get("use_rag_feedback"),
     )
 
 # 静的ファイルとテンプレート

@@ -67,7 +67,10 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
-PROMPT_VERSION = "summary_v3_prompt_split"
+PROMPT_VERSION = "summary_v3_rag_feedback"
+
+USE_RAG_FEEDBACK = True
+RAG_TOP_K = 3
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
@@ -169,6 +172,38 @@ B: 左回転系（左折・左車線変更）
 C: 右回転系（右折・右車線変更・転回）
 
 最終回答は B または C の1文字のみで回答してください。"""
+
+RAG_FEEDBACK_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+画像1-4は時系列順の元フレームです。
+画像5は fixed-scale の top-down trajectory summary、画像6は normalized geometry summary です。
+
+【現在サンプルの初回判定】
+- 初回 macro 判定: {initial_macro_choice} ({initial_macro_name})
+
+【現在サンプルの観測値】
+- 速度: {speed:.1f} km/h
+- 加速度X: {acc_x:.3f} m/s²
+- Yaw rate: {gyro_z:.3f} rad/s
+- 推定前進距離: {forward_distance_m:.2f} m
+- 推定横偏位: {lateral_offset_m:.2f} m
+- 推定heading変化: {heading_delta_rad:.3f} rad
+
+【類似する正解事例】
+{retrieved_cases_block}
+
+【判断ルール】
+- まず画像5,6の赤線形状を見てください
+- 次に、上の類似事例と現在サンプルの数値特徴を比較してください
+- 初回判定をそのまま繰り返さず、類似事例に照らして再評価してください
+- 回答は A/B/C/D の4分類だけです
+
+以下から1つ選んでください:
+A: 直線系（等速走行・加速・減速）
+B: 左回転系（左折・左車線変更）
+C: 右回転系（右折・右車線変更・転回）
+D: その他（停止・発進・その他）
+
+最終回答は A, B, C, D のいずれか1文字のみで回答してください。"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds

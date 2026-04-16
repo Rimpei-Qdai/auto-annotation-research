@@ -18,6 +18,9 @@ from datetime import datetime
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
 from driving_graph import MacroGraphVerifier
+from case_memory import CaseMemory
+from retrieval_index import NumericCaseRetriever, compute_retrieval_features
+from feedback_prompting import build_rag_feedback_prompt
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -45,6 +48,8 @@ from config import (
     MACRO_OUTPUT_TO_LABEL,
     MACRO_OUTPUT_NAMES,
     PROMPT_VERSION,
+    USE_RAG_FEEDBACK,
+    RAG_TOP_K,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +89,7 @@ def get_runtime_metadata() -> Dict[str, Any]:
         "model_id": HERON_MODEL_ID,
         "prompt_version": PROMPT_VERSION,
         "use_l2m_cot": USE_L2M_COT,
+        "use_rag_feedback": USE_RAG_FEEDBACK,
     }
 
 
@@ -116,6 +122,9 @@ class HeronAnnotatorWithTrajectory:
         self.trajectory_output_dir = trajectory_output_dir
         self.trajectory_visualizer = None
         self.graph_verifier = MacroGraphVerifier()
+        self.case_memory: Optional[CaseMemory] = None
+        self.case_retriever: Optional[NumericCaseRetriever] = None
+        self.rag_enabled = USE_RAG_FEEDBACK
         
         # Create output directory for trajectory frames
         if self.save_trajectory_frames and not os.path.exists(self.trajectory_output_dir):
@@ -124,6 +133,7 @@ class HeronAnnotatorWithTrajectory:
         
         # Initialize trajectory visualizer
         self._init_trajectory_visualizer()
+        self._init_case_retriever()
     
     def _init_trajectory_visualizer(self):
         """Initialize trajectory visualization with camera parameters"""
@@ -174,6 +184,24 @@ class HeronAnnotatorWithTrajectory:
             image_size=(width, height)
         )
         logger.info("Trajectory visualizer initialized")
+
+    def _init_case_retriever(self):
+        """Initialize local case-memory retrieval for RAG feedback."""
+        if not self.rag_enabled:
+            logger.info("RAG feedback disabled in config")
+            return
+
+        try:
+            self.case_memory = CaseMemory(_repo_root())
+            self.case_retriever = NumericCaseRetriever(self.case_memory.cases)
+            logger.info(
+                "Case retriever initialized with %d manually labeled cases",
+                len(self.case_memory.cases),
+            )
+        except Exception as exc:
+            self.case_memory = None
+            self.case_retriever = None
+            logger.warning(f"Failed to initialize case retriever, continuing without RAG: {exc}")
     
     @property
     def model(self):
@@ -832,6 +860,101 @@ class HeronAnnotatorWithTrajectory:
         self.last_prediction_details["graph_overrode"] = False
         self.last_prediction_details["final_macro_choice"] = initial_macro_choice
         return initial_macro_choice
+
+    def _run_rag_feedback(
+        self,
+        *,
+        model_frames: List[Image.Image],
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int],
+        initial_macro_choice: str,
+    ) -> str:
+        """Retrieve similar labeled cases and ask the VLM to re-evaluate macro choice."""
+        self.last_prediction_details["rag_enabled"] = bool(self.rag_enabled)
+
+        if not self.rag_enabled or self.case_retriever is None:
+            self.last_prediction_details["rag_used"] = False
+            return initial_macro_choice
+
+        query_features = compute_retrieval_features(
+            speed_kmh=float(sensor_data.get("speed", 0.0) or 0.0),
+            acc_x=float(sensor_data.get("acc_x", 0.0) or 0.0),
+            gyro_z=float(sensor_data.get("gyro_z", 0.0) or 0.0),
+        )
+        retrieved_cases = self.case_retriever.query(
+            query_features,
+            top_k=RAG_TOP_K,
+            exclude_sample_id=sample_id,
+        )
+
+        rag_prompt = build_rag_feedback_prompt(
+            initial_macro_choice=initial_macro_choice,
+            query_features=query_features,
+            retrieved_cases=retrieved_cases,
+        )
+        rag_generated = self._run_prompt_on_frames(model_frames, rag_prompt)
+        rag_choice = self._extract_choice(
+            rag_generated,
+            ["A", "B", "C", "D"],
+            alias_to_choice={
+                "直線系": "A",
+                "左回転系": "B",
+                "右回転系": "C",
+                "その他": "D",
+            },
+        )
+
+        self.last_prediction_details["rag_used"] = True
+        self.last_prediction_details["rag_query_features"] = query_features
+        self.last_prediction_details["rag_retrieved_cases"] = [
+            {
+                "sample_id": item.sample_id,
+                "distance": float(item.distance),
+                "macro_choice": item.case.get("macro_choice"),
+                "action_label_11": item.case.get("action_label_11"),
+                "summary": item.case.get("summary"),
+            }
+            for item in retrieved_cases
+        ]
+        self.last_prediction_details["rag_prompt_text"] = rag_prompt
+        self.last_prediction_details["rag_generated_text"] = rag_generated
+        self.last_prediction_details["rag_choice"] = rag_choice
+
+        if rag_choice is None:
+            return initial_macro_choice
+        return rag_choice
+
+    def _finalize_with_rag_and_graph(
+        self,
+        *,
+        model_frames: List[Image.Image],
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int],
+        stage_macro_choice: str,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> int:
+        """Apply optional RAG feedback, then graph verification, then map to label."""
+        self.last_prediction_details["stage_macro_choice"] = stage_macro_choice
+
+        rag_macro_choice = self._run_rag_feedback(
+            model_frames=model_frames,
+            sensor_data=sensor_data,
+            sample_id=sample_id,
+            initial_macro_choice=stage_macro_choice,
+        )
+        self.last_prediction_details["rag_macro_choice"] = rag_macro_choice
+
+        final_macro_choice = self._apply_macro_graph(
+            rag_macro_choice,
+            sensor_data,
+            self.last_prediction_details["trajectory_features"],
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+        action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
+        self.last_prediction_details["predicted_label"] = action_label
+        return action_label
     
     def predict_action(
         self,
@@ -995,17 +1118,16 @@ class HeronAnnotatorWithTrajectory:
             self.last_prediction_details["stage1_choice"] = stage1_choice
 
             if stage1_choice == "A":
-                final_macro_choice = self._apply_macro_graph(
-                    "A",
-                    sensor_data,
-                    self.last_prediction_details["trajectory_features"],
+                action_label = self._finalize_with_rag_and_graph(
+                    model_frames=model_frames,
+                    sensor_data=sensor_data,
+                    sample_id=sample_id,
+                    stage_macro_choice="A",
                     stage1_choice=stage1_choice,
                     stage2_choice=None,
                 )
-                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
-                self.last_prediction_details["predicted_label"] = action_label
                 logger.info(
-                    f"Stage1 chose A -> Final macro {final_macro_choice} -> "
+                    f"Stage1 chose A -> Final macro {self.last_prediction_details.get('final_macro_choice')} -> "
                     f"Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})"
                 )
                 return action_label
@@ -1043,20 +1165,19 @@ class HeronAnnotatorWithTrajectory:
 
             if stage2_route_choice == "D":
                 self.last_prediction_details["stage2_choice"] = "D"
-                final_macro_choice = self._apply_macro_graph(
-                    "D",
-                    sensor_data,
-                    self.last_prediction_details["trajectory_features"],
+                action_label = self._finalize_with_rag_and_graph(
+                    model_frames=model_frames,
+                    sensor_data=sensor_data,
+                    sample_id=sample_id,
+                    stage_macro_choice="D",
                     stage1_choice=stage1_choice,
                     stage2_choice="D",
                 )
-                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
-                self.last_prediction_details["predicted_label"] = action_label
 
                 macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
                 if macro_name:
                     logger.info(
-                        f"Stage2 chose D -> Final macro {final_macro_choice} -> "
+                        f"Stage2 chose D -> Final macro {self.last_prediction_details.get('final_macro_choice')} -> "
                         f"Predicted action label: {action_label} ({macro_name})"
                     )
                 else:
@@ -1095,20 +1216,19 @@ class HeronAnnotatorWithTrajectory:
                 self.last_prediction_details["error"] = "stage3_parse_failed"
                 return None
 
-            final_macro_choice = self._apply_macro_graph(
-                stage3_choice,
-                sensor_data,
-                self.last_prediction_details["trajectory_features"],
+            action_label = self._finalize_with_rag_and_graph(
+                model_frames=model_frames,
+                sensor_data=sensor_data,
+                sample_id=sample_id,
+                stage_macro_choice=stage3_choice,
                 stage1_choice=stage1_choice,
                 stage2_choice=stage3_choice,
             )
-            action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
-            self.last_prediction_details["predicted_label"] = action_label
 
             macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
             if macro_name:
                 logger.info(
-                    f"Stage3 chose {stage3_choice} -> Final macro {final_macro_choice} -> "
+                    f"Stage3 chose {stage3_choice} -> Final macro {self.last_prediction_details.get('final_macro_choice')} -> "
                     f"Predicted action label: {action_label} ({macro_name})"
                 )
             else:
