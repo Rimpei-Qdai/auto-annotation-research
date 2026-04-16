@@ -433,17 +433,24 @@ class HeronAnnotatorWithTrajectory:
         """Build 3-second trajectory and summary stats from current sensor values."""
         speed = sensor_data.get('speed', 0.0)
         gyro_z = sensor_data.get('gyro_z', 0.0)
+        acc_x = sensor_data.get('acc_x', 0.0)
         speed_ms = speed / 3.6
 
         num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+        dt = 0.1
+        time_seq = np.arange(num_steps, dtype=np.float32) * dt
+        speed_seq = np.clip(speed_ms + (acc_x * time_seq), a_min=0.0, a_max=None).astype(np.float32)
         yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq, dt=dt)
         image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
 
         return {
             "speed": speed,
             "gyro_z": gyro_z,
+            "acc_x": acc_x,
+            "speed_seq": speed_seq,
+            "time_seq": time_seq,
+            "dt": dt,
             "trajectory_3d": trajectory_3d,
             "image_points": image_points,
             "valid_mask": valid_mask,
@@ -514,6 +521,30 @@ class HeronAnnotatorWithTrajectory:
         draw.polygon([left_arrow[1], left_arrow[2], left_arrow[3]], fill=left_color)
         draw.line(right_arrow[:2], fill=right_color, width=10)
         draw.polygon([right_arrow[1], right_arrow[2], right_arrow[3]], fill=right_color)
+
+    def _draw_straight_band(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+        band_half_width: int = 54,
+    ) -> None:
+        """Draw a center dead-zone band for straight-motion reading."""
+        center_x = width // 2
+        band = [
+            center_x - band_half_width,
+            margin + 40,
+            center_x + band_half_width,
+            height - margin,
+        ]
+        draw.rectangle(band, fill=(236, 246, 236), outline=(190, 215, 190), width=3)
+        draw.line(
+            [(center_x, height - margin), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
 
     def _draw_endpoint_arrow(
         self,
@@ -615,11 +646,7 @@ class HeronAnnotatorWithTrajectory:
             fill=(220, 220, 220),
             width=3,
         )
-        draw.line(
-            [(center_x, origin_y), (center_x, margin)],
-            fill=(40, 180, 40),
-            width=6,
-        )
+        self._draw_straight_band(draw, width=width, height=height, margin=margin, band_half_width=36)
 
         points = self._trajectory_to_canvas_points(
             trajectory_3d,
@@ -633,15 +660,14 @@ class HeronAnnotatorWithTrajectory:
 
         return canvas
 
-    def _render_normalized_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
-        """Render a shape-normalized summary to emphasize left/right sign and curvature."""
+    def _render_direction_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a direction-only summary with normalized forward spacing."""
         width, height = 720, 720
         margin = 60
         center_x = width // 2
         origin_y = height - margin
-
-        max_forward = max(float(np.max(trajectory_3d[:, 0])), 1.0)
-        max_side = max(float(np.max(np.abs(trajectory_3d[:, 1]))), 1.5)
+        max_side = max(float(np.max(np.abs(trajectory_3d[:, 1]))), 2.0)
+        num_points = max(len(trajectory_3d), 2)
 
         canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
@@ -653,26 +679,76 @@ class HeronAnnotatorWithTrajectory:
             fill=(220, 220, 220),
             width=3,
         )
-        draw.line(
-            [(center_x, origin_y), (center_x, margin)],
-            fill=(40, 180, 40),
-            width=6,
-        )
+        self._draw_straight_band(draw, width=width, height=height, margin=margin, band_half_width=54)
         draw.rectangle(
             [margin, margin, width - margin, origin_y],
             outline=(230, 230, 230),
             width=2,
         )
 
-        points = self._trajectory_to_canvas_points(
-            trajectory_3d,
-            width=width,
-            height=height,
-            margin=margin,
-            max_forward_m=max_forward,
-            max_side_m=max_side,
-        )
+        points: List[Tuple[int, int]] = []
+        for idx, (_, y, _) in enumerate(trajectory_3d):
+            px = center_x - int((y / max_side) * (width * 0.34))
+            progress = idx / float(num_points - 1)
+            py = origin_y - int(progress * (height - (2 * margin)))
+            points.append((px, py))
         self._draw_summary_trajectory(draw, points)
+
+        return canvas
+
+    def _render_speed_summary(
+        self,
+        trajectory_3d: np.ndarray,
+        speed_seq: np.ndarray,
+    ) -> Image.Image:
+        """Render a speed-only summary using forward distance and point spacing."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+        max_forward = max(float(np.max(trajectory_3d[:, 0])), 2.0)
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        draw.line(
+            [(center_x, origin_y), (center_x, margin)],
+            fill=(180, 180, 180),
+            width=6,
+        )
+
+        points: List[Tuple[int, int]] = []
+        for x, _, _ in trajectory_3d:
+            py = origin_y - int((x / max_forward) * (height - (2 * margin)))
+            points.append((center_x, py))
+
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 0, 0), width=14)
+            draw.line(points, fill=(220, 30, 30), width=8)
+        for idx, (px, py) in enumerate(points):
+            radius = 8 if idx in {0, len(points) - 1} else 5
+            fill = (255, 255, 255) if idx == 0 else (245, 180, 0) if idx == len(points) - 1 else (220, 30, 30)
+            draw.ellipse(
+                [px - radius, py - radius, px + radius, py + radius],
+                fill=fill,
+                outline=(0, 0, 0),
+                width=2,
+            )
+
+        # Draw every 5th time-step as a larger marker so spacing changes are easier to parse.
+        for idx in range(0, len(points), 5):
+            px, py = points[idx]
+            draw.ellipse(
+                [px - 7, py - 7, px + 7, py + 7],
+                fill=(255, 255, 255),
+                outline=(0, 0, 0),
+                width=2,
+            )
 
         return canvas
 
@@ -682,10 +758,11 @@ class HeronAnnotatorWithTrajectory:
         sensor_data: Dict[str, Any],
         sample_id: Optional[int] = None
     ) -> Tuple[List[Image.Image], Dict[str, Any]]:
-        """Prepare raw frames plus two clean trajectory summary images for VLM input."""
+        """Prepare raw frames plus three clean trajectory summary images for VLM input."""
         geometry = self._build_trajectory_geometry(sensor_data)
         topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
-        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+        direction_summary = self._render_direction_summary(geometry["trajectory_3d"])
+        speed_summary = self._render_speed_summary(geometry["trajectory_3d"], geometry["speed_seq"])
 
         if self.save_trajectory_frames and sample_id is not None:
             os.makedirs(self.trajectory_output_dir, exist_ok=True)
@@ -694,17 +771,22 @@ class HeronAnnotatorWithTrajectory:
                 self.trajectory_output_dir,
                 f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
             )
-            summary_normalized_path = os.path.join(
+            summary_direction_path = os.path.join(
                 self.trajectory_output_dir,
-                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+                f"sample_{sample_id:03d}_trajectory_summary_direction_{timestamp}.jpg",
+            )
+            summary_speed_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_speed_{timestamp}.jpg",
             )
             topdown_summary.save(summary_topdown_path, quality=95)
-            normalized_summary.save(summary_normalized_path, quality=95)
+            direction_summary.save(summary_direction_path, quality=95)
+            speed_summary.save(summary_speed_path, quality=95)
 
         logger.info(
             f"Trajectory summary: {geometry['visible_count']}/{len(geometry['valid_mask'])} points visible"
         )
-        model_frames = list(frames[:4]) + [topdown_summary, normalized_summary]
+        model_frames = list(frames[:4]) + [topdown_summary, direction_summary, speed_summary]
         self.last_prediction_details["visual_input_count"] = len(model_frames)
         return model_frames, geometry
 
@@ -772,11 +854,16 @@ class HeronAnnotatorWithTrajectory:
     ) -> List[Image.Image]:
         """Select the visual inputs for a stage.
 
-        For trajectory-reading stages, use only the two clean summary images to
-        reduce raw-frame distraction and force the VLM to read the geometry.
+        Stage1 reads direction + speed summaries.
+        Stage2/3 read only the direction summary so the task is purely directional.
         """
-        if stage_name in {"stage1", "stage2", "stage3"} and len(model_frames) >= 2:
-            return model_frames[-2:]
+        if len(model_frames) >= 3:
+            direction_summary = model_frames[-2]
+            speed_summary = model_frames[-1]
+            if stage_name == "stage1":
+                return [direction_summary, speed_summary]
+            if stage_name in {"stage2", "stage3"}:
+                return [direction_summary]
         return model_frames
 
     def _extract_choice(
@@ -983,14 +1070,16 @@ class HeronAnnotatorWithTrajectory:
                 "final_y_m": float(geometry["trajectory_3d"][-1][1]),
                 "gyro_z": float(sensor_data.get('gyro_z', 0.0)),
                 "speed": float(sensor_data.get('speed', 0.0)),
+                "acc_x": float(sensor_data.get('acc_x', 0.0)),
             }
 
             stage1_frames = self._select_stage_frames(model_frames, "stage1")
             self.last_prediction_details["stage1_visual_input_count"] = len(stage1_frames)
-            self.last_prediction_details["stage1_visual_mode"] = "summary_only"
+            self.last_prediction_details["stage1_visual_mode"] = "direction_plus_speed"
 
             stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
             stage1_generated = self._run_prompt_on_frames(stage1_frames, stage1_prompt)
@@ -1032,10 +1121,11 @@ class HeronAnnotatorWithTrajectory:
 
             stage2_frames = self._select_stage_frames(model_frames, "stage2")
             self.last_prediction_details["stage2_visual_input_count"] = len(stage2_frames)
-            self.last_prediction_details["stage2_visual_mode"] = "summary_only"
+            self.last_prediction_details["stage2_visual_mode"] = "direction_only"
 
             stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
             stage2_generated = self._run_prompt_on_frames(stage2_frames, stage2_prompt)
@@ -1086,10 +1176,11 @@ class HeronAnnotatorWithTrajectory:
 
             stage3_frames = self._select_stage_frames(model_frames, "stage3")
             self.last_prediction_details["stage3_visual_input_count"] = len(stage3_frames)
-            self.last_prediction_details["stage3_visual_mode"] = "summary_only"
+            self.last_prediction_details["stage3_visual_mode"] = "direction_only"
 
             stage3_prompt = STAGE3_TURN_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
             stage3_generated = self._run_prompt_on_frames(stage3_frames, stage3_prompt)

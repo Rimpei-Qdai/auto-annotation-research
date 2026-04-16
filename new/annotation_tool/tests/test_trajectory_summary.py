@@ -21,7 +21,7 @@ class TrajectorySummaryTests(unittest.TestCase):
     def setUp(self):
         self.annotator = HeronAnnotatorWithTrajectory(save_trajectory_frames=False)
 
-    def test_prepare_visual_inputs_returns_four_frames_plus_two_summaries(self):
+    def test_prepare_visual_inputs_returns_four_frames_plus_three_summaries(self):
         frames = make_frames()
         model_frames, geometry = self.annotator.prepare_visual_inputs(
             frames,
@@ -35,12 +35,14 @@ class TrajectorySummaryTests(unittest.TestCase):
             sample_id=None,
         )
 
-        self.assertEqual(len(model_frames), 6)
+        self.assertEqual(len(model_frames), 7)
         self.assertEqual(model_frames[4].size, (720, 720))
         self.assertEqual(model_frames[5].size, (720, 720))
+        self.assertEqual(model_frames[6].size, (720, 720))
         self.assertIn("visible_count", geometry)
+        self.assertIn("speed_seq", geometry)
 
-    def test_normalized_summary_changes_with_turn_sign(self):
+    def test_direction_summary_changes_with_turn_sign(self):
         left_traj = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -60,10 +62,41 @@ class TrajectorySummaryTests(unittest.TestCase):
             dtype=np.float32,
         )
 
-        left_img = np.array(self.annotator._render_normalized_summary(left_traj))
-        right_img = np.array(self.annotator._render_normalized_summary(right_traj))
+        left_img = np.array(self.annotator._render_direction_summary(left_traj))
+        right_img = np.array(self.annotator._render_direction_summary(right_traj))
 
         self.assertFalse(np.array_equal(left_img, right_img))
+
+    def test_speed_summary_changes_with_speed_profile(self):
+        base_traj = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.2, 0.0, 0.0],
+                [3.6, 0.0, 0.0],
+                [5.2, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        slow_traj = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.8, 0.0, 0.0],
+                [1.4, 0.0, 0.0],
+                [1.8, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        fast_img = np.array(
+            self.annotator._render_speed_summary(base_traj, np.array([1.0, 1.2, 1.4, 1.6], dtype=np.float32))
+        )
+        slow_img = np.array(
+            self.annotator._render_speed_summary(slow_traj, np.array([0.8, 0.6, 0.4, 0.2], dtype=np.float32))
+        )
+
+        self.assertFalse(np.array_equal(fast_img, slow_img))
 
     def test_positive_lateral_offset_renders_on_left_side(self):
         left_traj = np.array(
@@ -111,15 +144,22 @@ class TrajectorySummaryTests(unittest.TestCase):
 
     def test_stage_frame_selection_uses_only_two_summary_images(self):
         model_frames = make_frames() + [
+            Image.new("RGB", (720, 720), color="white"),
             Image.new("RGB", (720, 720), color="red"),
             Image.new("RGB", (720, 720), color="blue"),
         ]
 
-        selected = self.annotator._select_stage_frames(model_frames, "stage1")
+        stage1_selected = self.annotator._select_stage_frames(model_frames, "stage1")
+        stage2_selected = self.annotator._select_stage_frames(model_frames, "stage2")
+        stage3_selected = self.annotator._select_stage_frames(model_frames, "stage3")
 
-        self.assertEqual(len(selected), 2)
-        self.assertIs(selected[0], model_frames[-2])
-        self.assertIs(selected[1], model_frames[-1])
+        self.assertEqual(len(stage1_selected), 2)
+        self.assertIs(stage1_selected[0], model_frames[-2])
+        self.assertIs(stage1_selected[1], model_frames[-1])
+        self.assertEqual(len(stage2_selected), 1)
+        self.assertIs(stage2_selected[0], model_frames[-2])
+        self.assertEqual(len(stage3_selected), 1)
+        self.assertIs(stage3_selected[0], model_frames[-2])
 
 
 if __name__ == "__main__":
