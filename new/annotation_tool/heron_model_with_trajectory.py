@@ -765,6 +765,20 @@ class HeronAnnotatorWithTrajectory:
         )[0].strip()
         return generated_text
 
+    def _select_stage_frames(
+        self,
+        model_frames: List[Image.Image],
+        stage_name: str,
+    ) -> List[Image.Image]:
+        """Select the visual inputs for a stage.
+
+        For trajectory-reading stages, use only the two clean summary images to
+        reduce raw-frame distraction and force the VLM to read the geometry.
+        """
+        if stage_name in {"stage1", "stage2", "stage3"} and len(model_frames) >= 2:
+            return model_frames[-2:]
+        return model_frames
+
     def _extract_choice(
         self,
         text: str,
@@ -971,14 +985,15 @@ class HeronAnnotatorWithTrajectory:
                 "speed": float(sensor_data.get('speed', 0.0)),
             }
 
+            stage1_frames = self._select_stage_frames(model_frames, "stage1")
+            self.last_prediction_details["stage1_visual_input_count"] = len(stage1_frames)
+            self.last_prediction_details["stage1_visual_mode"] = "summary_only"
+
             stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
-            stage1_generated = self._run_prompt_on_frames(model_frames, stage1_prompt)
+            stage1_generated = self._run_prompt_on_frames(stage1_frames, stage1_prompt)
             stage1_choice = self._extract_choice(
                 stage1_generated,
                 ["A", "N"],
@@ -1015,14 +1030,15 @@ class HeronAnnotatorWithTrajectory:
                 self.last_prediction_details["error"] = "stage1_parse_failed"
                 return None
 
+            stage2_frames = self._select_stage_frames(model_frames, "stage2")
+            self.last_prediction_details["stage2_visual_input_count"] = len(stage2_frames)
+            self.last_prediction_details["stage2_visual_mode"] = "summary_only"
+
             stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
-            stage2_generated = self._run_prompt_on_frames(model_frames, stage2_prompt)
+            stage2_generated = self._run_prompt_on_frames(stage2_frames, stage2_prompt)
             stage2_route_choice = self._extract_choice(
                 stage2_generated,
                 ["R", "D"],
@@ -1068,14 +1084,15 @@ class HeronAnnotatorWithTrajectory:
                 self.last_prediction_details["error"] = "stage2_route_unexpected"
                 return None
 
+            stage3_frames = self._select_stage_frames(model_frames, "stage3")
+            self.last_prediction_details["stage3_visual_input_count"] = len(stage3_frames)
+            self.last_prediction_details["stage3_visual_mode"] = "summary_only"
+
             stage3_prompt = STAGE3_TURN_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
-                acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
             )
-            stage3_generated = self._run_prompt_on_frames(model_frames, stage3_prompt)
+            stage3_generated = self._run_prompt_on_frames(stage3_frames, stage3_prompt)
             stage3_choice = self._extract_choice(
                 stage3_generated,
                 ["B", "C"],

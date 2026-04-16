@@ -109,6 +109,18 @@ class TrajectorySummaryTests(unittest.TestCase):
 
         self.assertGreater(points[-1][0], 360)
 
+    def test_stage_frame_selection_uses_only_two_summary_images(self):
+        model_frames = make_frames() + [
+            Image.new("RGB", (720, 720), color="red"),
+            Image.new("RGB", (720, 720), color="blue"),
+        ]
+
+        selected = self.annotator._select_stage_frames(model_frames, "stage1")
+
+        self.assertEqual(len(selected), 2)
+        self.assertIs(selected[0], model_frames[-2])
+        self.assertIs(selected[1], model_frames[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
