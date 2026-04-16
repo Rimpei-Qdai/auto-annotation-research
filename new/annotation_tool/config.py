@@ -67,7 +67,7 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
-PROMPT_VERSION = "summary_v7_visual_probe_split"
+PROMPT_VERSION = "summary_v8_single_probe_image"
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
@@ -94,33 +94,23 @@ D: その他（停止・発進・その他）
 A, B, C, D のいずれか1文字のみで回答してください。"""
 
 STAGE1_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1は top-down summary、画像2は direction summary です。
+画像1は direction summary です。
 
 【見る対象】
-- 画像2の赤線の終点が、LEFT / CENTER / RIGHT のどこにあるかだけを見てください
+- 画像1の赤線の終点が、LEFT / CENTER / RIGHT のどこにあるかだけを見てください
 - LEFT / RIGHT は車両基準の左 / 右です
 - 緑の中央帯の中なら CENTER です
 - 少しの曲がりで中央帯に残るなら CENTER です
 
-【センサーデータ】
-速度: {speed} km/h
-加速度X: {acc_x} m/s²
-Yaw rate: {gyro_z} rad/s
-
 最終回答は LEFT, CENTER, RIGHT のいずれか1語のみで回答してください。"""
 
 STAGE2_ROUTE_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1は top-down summary、画像2は speed summary です。
+画像1は speed summary です。
 
 【見る対象】
 - 軌道が十分に前へ伸びているかだけを見てください
 - 長く伸びていれば LONG、極端に短いか点状なら SHORT です
 - 左右の曲がりは無視して、長さと点間隔だけを見てください
-
-【センサーデータ】
-速度: {speed} km/h
-加速度X: {acc_x} m/s²
-Yaw rate: {gyro_z} rad/s
 
 最終回答は LONG または SHORT の1語のみで回答してください。"""
 

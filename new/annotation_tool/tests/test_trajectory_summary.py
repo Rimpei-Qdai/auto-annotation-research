@@ -142,7 +142,7 @@ class TrajectorySummaryTests(unittest.TestCase):
 
         self.assertGreater(points[-1][0], 360)
 
-    def test_stage_frame_selection_uses_probe_specific_summary_pairs(self):
+    def test_stage_frame_selection_uses_single_probe_image(self):
         model_frames = make_frames() + [
             Image.new("RGB", (720, 720), color="white"),  # topdown
             Image.new("RGB", (720, 720), color="red"),    # direction
@@ -152,12 +152,10 @@ class TrajectorySummaryTests(unittest.TestCase):
         stage1_selected = self.annotator._select_stage_frames(model_frames, "stage1")
         stage2_selected = self.annotator._select_stage_frames(model_frames, "stage2")
 
-        self.assertEqual(len(stage1_selected), 2)
-        self.assertIs(stage1_selected[0], model_frames[-3])
-        self.assertIs(stage1_selected[1], model_frames[-2])
-        self.assertEqual(len(stage2_selected), 2)
-        self.assertIs(stage2_selected[0], model_frames[-3])
-        self.assertIs(stage2_selected[1], model_frames[-1])
+        self.assertEqual(len(stage1_selected), 1)
+        self.assertIs(stage1_selected[0], model_frames[-2])
+        self.assertEqual(len(stage2_selected), 1)
+        self.assertIs(stage2_selected[0], model_frames[-1])
 
 
 if __name__ == "__main__":

@@ -854,17 +854,16 @@ class HeronAnnotatorWithTrajectory:
     ) -> List[Image.Image]:
         """Select the visual inputs for a stage.
 
-        Stage1 reads topdown + direction for left/center/right probing.
-        Stage2 reads topdown + speed for long/short probing.
+        Stage1 reads only the direction summary for left/center/right probing.
+        Stage2 reads only the speed summary for long/short probing.
         """
         if len(model_frames) >= 3:
-            topdown_summary = model_frames[-3]
             direction_summary = model_frames[-2]
             speed_summary = model_frames[-1]
             if stage_name == "stage1":
-                return [topdown_summary, direction_summary]
+                return [direction_summary]
             if stage_name == "stage2":
-                return [topdown_summary, speed_summary]
+                return [speed_summary]
         return model_frames
 
     def _extract_choice(
@@ -1076,7 +1075,7 @@ class HeronAnnotatorWithTrajectory:
 
             direction_frames = self._select_stage_frames(model_frames, "stage1")
             self.last_prediction_details["stage1_visual_input_count"] = len(direction_frames)
-            self.last_prediction_details["stage1_visual_mode"] = "topdown_plus_direction"
+            self.last_prediction_details["stage1_visual_mode"] = "direction_only"
 
             stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
@@ -1105,7 +1104,7 @@ class HeronAnnotatorWithTrajectory:
 
             speed_frames = self._select_stage_frames(model_frames, "stage2")
             self.last_prediction_details["stage2_visual_input_count"] = len(speed_frames)
-            self.last_prediction_details["stage2_visual_mode"] = "topdown_plus_speed"
+            self.last_prediction_details["stage2_visual_mode"] = "speed_only"
 
             stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
