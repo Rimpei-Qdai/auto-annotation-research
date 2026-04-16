@@ -6,6 +6,7 @@ Supports trajectory drawing on 4 frames for auto-annotation
 
 import os
 import logging
+import subprocess
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image, ImageDraw
 import cv2
@@ -53,6 +54,39 @@ REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
 }
 
 
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _run_git_command(args: List[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return completed.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def get_runtime_metadata() -> Dict[str, Any]:
+    branch = _run_git_command(["branch", "--show-current"])
+    commit = _run_git_command(["rev-parse", "--short", "HEAD"])
+    dirty = bool(_run_git_command(["status", "--short"]))
+    return {
+        "repo_branch": branch,
+        "repo_commit": commit,
+        "repo_dirty": dirty,
+        "model_id": HERON_MODEL_ID,
+        "prompt_version": PROMPT_VERSION,
+        "use_l2m_cot": USE_L2M_COT,
+    }
+
+
 class HeronAnnotatorWithTrajectory:
     """
     Heron VLM-based automatic annotation system with trajectory visualization
@@ -66,6 +100,16 @@ class HeronAnnotatorWithTrajectory:
         self._device = None
         self._is_heron = False
         self.last_prediction_details = {}
+        self.runtime_metadata = get_runtime_metadata()
+        logger.info(
+            "Annotator runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
+            self.runtime_metadata.get("repo_branch"),
+            self.runtime_metadata.get("repo_commit"),
+            self.runtime_metadata.get("repo_dirty"),
+            self.runtime_metadata.get("model_id"),
+            self.runtime_metadata.get("prompt_version"),
+            self.runtime_metadata.get("use_l2m_cot"),
+        )
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
@@ -820,10 +864,10 @@ class HeronAnnotatorWithTrajectory:
         try:
             self.last_prediction_details = {
                 "mode": "qwen3_vl_stagewise",
-                "prompt_version": PROMPT_VERSION,
                 "sample_id": sample_id,
                 "video_path": video_path,
                 "start_time": start_time,
+                **self.runtime_metadata,
             }
 
             # Extract 4 frames from video
