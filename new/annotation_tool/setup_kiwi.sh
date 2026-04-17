@@ -17,6 +17,8 @@ set -e
 CONTAINER_NAME="hata_annotation"
 IMAGE_NAME="auto-annotation:latest"
 PROJECT_DIR="$HOME/workspace/auto-annotation-research"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env.kiwi"
 # HuggingFaceキャッシュをホスト側に永続化（コンテナ再作成時の再ダウンロードを防ぐ）
 HF_CACHE_DIR="$HOME/workspace/hf_cache"
 mkdir -p "$HF_CACHE_DIR"
@@ -28,6 +30,22 @@ echo "コンテナ名: $CONTAINER_NAME"
 echo "プロジェクトディレクトリ: $PROJECT_DIR"
 echo "ホストポート: $HOST_PORT"
 echo ""
+
+# ローカルの .env.kiwi から Gemini API キーを読み込む
+if [ -f "$ENV_FILE" ]; then
+    echo ".env.kiwi を読み込みます..."
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+    echo "WARNING: GEMINI_API_KEY が未設定です。Gemini 推論は失敗します。"
+    echo "  ${ENV_FILE} に GEMINI_API_KEY=... を設定してください。"
+else
+    echo "GEMINI_API_KEY をコンテナへ渡します。"
+fi
 
 # プロジェクトディレクトリの存在確認
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -66,6 +84,7 @@ docker run \
     --ipc=host \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
+    -e GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
     -v "${PROJECT_DIR}:/project" \
     -v "${HF_CACHE_DIR}:/root/.cache/huggingface" \
     -p "${HOST_PORT}:8000" \
