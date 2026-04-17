@@ -1,13 +1,14 @@
 # heron_model_with_trajectory.py
 """
-Heron VLM Model Manager with Trajectory Visualization
-Supports trajectory drawing on 4 frames for auto-annotation
+Simple video baseline annotator with optional Gemini backend.
 """
 
 import os
 import time
 import tempfile
 import logging
+import json
+import base64
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image
 import cv2
@@ -15,6 +16,8 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
 from datetime import datetime
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
@@ -30,7 +33,11 @@ except ImportError as e:
     logging.warning(f"Required libraries not found: {e}. Auto-annotation will not be available.")
 
 from config import (
+    MODEL_PROVIDER,
     HERON_MODEL_ID,
+    GEMINI_MODEL_ID,
+    GEMINI_API_KEY_ENV,
+    GEMINI_API_BASE,
     USE_GPU,
     TORCH_DTYPE,
     NUM_FRAMES_TO_EXTRACT,
@@ -185,6 +192,17 @@ class HeronAnnotatorWithTrajectory:
     
     def load_model(self):
         """Load Heron VLM model and processor"""
+        if MODEL_PROVIDER == "gemini":
+            api_key = os.getenv(GEMINI_API_KEY_ENV)
+            if not api_key:
+                raise RuntimeError(f"{GEMINI_API_KEY_ENV} is not set")
+            self._model = GEMINI_MODEL_ID
+            self._processor = "gemini-api"
+            self._device = "api"
+            self._is_heron = False
+            logger.info(f"Gemini backend configured: {GEMINI_MODEL_ID}")
+            return
+
         if not HERON_AVAILABLE:
             raise RuntimeError("Required libraries (torch, transformers) not available")
         
@@ -250,6 +268,86 @@ class HeronAnnotatorWithTrajectory:
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
+
+    def _run_gemini_prompt_on_video_clip(
+        self,
+        clip_path: str,
+        prompt_text: str,
+        max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Call Gemini generateContent with a raw mp4 clip plus prompt text."""
+        api_key = os.getenv(GEMINI_API_KEY_ENV)
+        if not api_key:
+            raise RuntimeError(f"{GEMINI_API_KEY_ENV} is not set")
+
+        with open(clip_path, "rb") as f:
+            clip_bytes = f.read()
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "video/mp4",
+                                "data": base64.b64encode(clip_bytes).decode("utf-8"),
+                            }
+                        },
+                        {"text": prompt_text},
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "topP": 1,
+                "maxOutputTokens": max(32, int(max_new_tokens)),
+                "responseMimeType": "text/plain",
+                "thinkingConfig": {
+                    "thinkingBudget": 0,
+                },
+            },
+        }
+
+        endpoint = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL_ID}:generateContent?key={api_key}"
+        req = urllib_request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib_request.urlopen(req, timeout=180) as resp:
+                response_json = json.loads(resp.read().decode("utf-8"))
+        except urllib_error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Gemini API error {e.code}: {body}") from e
+        except urllib_error.URLError as e:
+            raise RuntimeError(f"Gemini API connection failed: {e}") from e
+
+        candidates = response_json.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini returned no candidates: {response_json}")
+
+        content = candidates[0].get("content", {})
+        text_parts = [
+            part.get("text", "")
+            for part in content.get("parts", [])
+            if isinstance(part, dict) and part.get("text")
+        ]
+        generated_text = "\n".join(text_parts).strip()
+        if not generated_text:
+            raise RuntimeError(f"Gemini returned empty text: {response_json}")
+
+        metadata = {
+            "provider": "gemini",
+            "clip_size_bytes": len(clip_bytes),
+            "model_version": response_json.get("modelVersion"),
+            "response_id": response_json.get("responseId"),
+            "usage_metadata": response_json.get("usageMetadata"),
+        }
+        return prompt_text, generated_text, metadata
     
     def extract_frames_from_video(
         self, 
@@ -1276,6 +1374,13 @@ class HeronAnnotatorWithTrajectory:
         max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Run a single prompt on a video clip path."""
+        if MODEL_PROVIDER == "gemini":
+            return self._run_gemini_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=prompt_text,
+                max_new_tokens=max_new_tokens,
+            )
+
         messages = [
             {
                 "role": "user",
@@ -1411,6 +1516,8 @@ class HeronAnnotatorWithTrajectory:
             "annotation_center_time_seconds": start_time,
             "sample_id": sample_id,
             "mode": "simple_video_direct_11class",
+            "model_provider": MODEL_PROVIDER,
+            "model_id": GEMINI_MODEL_ID if MODEL_PROVIDER == "gemini" else HERON_MODEL_ID,
         }
 
         return self._predict_simple_video_baseline(

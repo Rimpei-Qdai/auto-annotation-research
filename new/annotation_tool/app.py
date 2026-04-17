@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 try:
     from heron_model_with_trajectory import get_annotator
     HERON_ENABLED = True
-    logger.info("Using simple Qwen3-VL video baseline annotator")
+    logger.info("Using simple video baseline annotator")
 except ImportError as e:
     HERON_ENABLED = False
     logger.warning(f"Heron auto-annotation disabled: {e}")
@@ -221,6 +221,8 @@ def log_prediction_trace(
         "generated_text": details.get("generated_text"),
         "extracted_label": details.get("extracted_label"),
         "predicted_label": predicted_label,
+        "model_provider": details.get("model_provider"),
+        "model_id": details.get("model_id"),
         "prompt_version": details.get("prompt_version"),
         "speed_event_hint": details.get("speed_event_hint"),
         "turn_event_hint": details.get("turn_event_hint"),

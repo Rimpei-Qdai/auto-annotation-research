@@ -1,10 +1,17 @@
 # config.py
 """
-Simple Qwen3-VL video baseline configuration.
+Simple video baseline configuration.
 """
 
 # VLM Model Settings
+# Backend selection:
+# - "hf": local Hugging Face VLM (Qwen3-VL etc.)
+# - "gemini": Google Gemini API
+MODEL_PROVIDER = "gemini"
 HERON_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
+GEMINI_MODEL_ID = "gemini-2.5-flash"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 USE_MULTI_FRAME = False
 USE_GPU = True
 TORCH_DTYPE = "float16"
@@ -16,7 +23,7 @@ NUM_FRAMES_TO_USE = 4
 FRAME_EXTRACTION_METHOD = "uniform"
 MAX_IMAGE_SIZE = 720
 VIDEO_CLIP_DURATION_SECONDS = 6.0
-PROMPT_VERSION = "simple_video_v1_qwen3vl"
+PROMPT_VERSION = "simple_video_v1_gemini"
 
 # Baseline Behavior Flags
 USE_L2M_COT = False
