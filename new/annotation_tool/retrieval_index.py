@@ -105,6 +105,9 @@ class NumericCaseRetriever:
         *,
         top_k: int = 3,
         exclude_sample_id: Optional[int] = None,
+        min_cases: int = 1,
+        max_distance: Optional[float] = None,
+        require_diverse_macros: bool = False,
     ) -> List[RetrievedCase]:
         ranked: List[RetrievedCase] = []
         for case in self.cases:
@@ -122,4 +125,37 @@ class NumericCaseRetriever:
             )
 
         ranked.sort(key=lambda item: (item.distance, item.sample_id))
+
+        if max_distance is not None:
+            ranked = [item for item in ranked if item.distance <= max_distance]
+
+        if require_diverse_macros and ranked:
+            selected: List[RetrievedCase] = []
+            selected_ids = set()
+            seen_macros = set()
+
+            for item in ranked:
+                macro_choice = item.case.get("macro_choice")
+                if macro_choice in seen_macros:
+                    continue
+                selected.append(item)
+                selected_ids.add(item.sample_id)
+                seen_macros.add(macro_choice)
+                if len(selected) >= top_k:
+                    break
+
+            if len(selected) < top_k:
+                for item in ranked:
+                    if item.sample_id in selected_ids:
+                        continue
+                    selected.append(item)
+                    selected_ids.add(item.sample_id)
+                    if len(selected) >= top_k:
+                        break
+
+            ranked = selected
+
+        if len(ranked) < min_cases:
+            return []
+
         return ranked[:top_k]

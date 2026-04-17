@@ -51,6 +51,9 @@ from config import (
     PROMPT_VERSION,
     USE_RAG_FEEDBACK,
     RAG_TOP_K,
+    RAG_MIN_CASES,
+    RAG_MAX_DISTANCE,
+    RAG_REQUIRE_DIVERSE_MACROS,
 )
 
 logger = logging.getLogger(__name__)
@@ -896,13 +899,16 @@ class HeronAnnotatorWithTrajectory:
             query_features,
             top_k=RAG_TOP_K,
             exclude_sample_id=sample_id,
+            min_cases=RAG_MIN_CASES,
+            max_distance=RAG_MAX_DISTANCE,
+            require_diverse_macros=RAG_REQUIRE_DIVERSE_MACROS,
         )
 
         if not retrieved_cases:
             self.last_prediction_details["rag_used"] = False
             self.last_prediction_details["rag_query_features"] = query_features
             self.last_prediction_details["rag_retrieved_cases"] = []
-            self.last_prediction_details["rag_skip_reason"] = "empty_retrieval"
+            self.last_prediction_details["rag_skip_reason"] = "insufficient_or_distant_retrieval"
             return initial_macro_choice
 
         rag_prompt = build_rag_feedback_prompt(
@@ -925,6 +931,10 @@ class HeronAnnotatorWithTrajectory:
         self.last_prediction_details["rag_used"] = True
         self.last_prediction_details["rag_skip_reason"] = None
         self.last_prediction_details["rag_query_features"] = query_features
+        self.last_prediction_details["rag_retrieval_count"] = len(retrieved_cases)
+        self.last_prediction_details["rag_retrieval_macros"] = [
+            item.case.get("macro_choice") for item in retrieved_cases
+        ]
         self.last_prediction_details["rag_retrieved_cases"] = [
             {
                 "sample_id": item.sample_id,

@@ -55,6 +55,84 @@ class RetrievalIndexTests(unittest.TestCase):
 
         self.assertEqual(results[0].sample_id, 20)
 
+    def test_retriever_can_require_macro_diversity(self):
+        cases = [
+            {
+                "sample_id": 10,
+                "macro_choice": "B",
+                "action_label_11": 6,
+                "action_label_name": "左折",
+                "macro_name": "左回転系",
+                "speed": 12.0,
+                "acc_x": 0.0,
+                "gyro_z": 0.18,
+                "summary": "left-like 1",
+                "retrieval_features": compute_retrieval_features(12.0, 0.0, 0.18),
+            },
+            {
+                "sample_id": 11,
+                "macro_choice": "B",
+                "action_label_11": 6,
+                "action_label_name": "左折",
+                "macro_name": "左回転系",
+                "speed": 12.0,
+                "acc_x": 0.0,
+                "gyro_z": 0.17,
+                "summary": "left-like 2",
+                "retrieval_features": compute_retrieval_features(12.0, 0.0, 0.17),
+            },
+            {
+                "sample_id": 20,
+                "macro_choice": "C",
+                "action_label_11": 7,
+                "action_label_name": "右折",
+                "macro_name": "右回転系",
+                "speed": 12.0,
+                "acc_x": 0.0,
+                "gyro_z": -0.18,
+                "summary": "right-like",
+                "retrieval_features": compute_retrieval_features(12.0, 0.0, -0.18),
+            },
+        ]
+        retriever = NumericCaseRetriever(cases)
+        query = compute_retrieval_features(12.2, 0.0, 0.16)
+
+        results = retriever.query(
+            query,
+            top_k=2,
+            require_diverse_macros=True,
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual({item.case["macro_choice"] for item in results}, {"B", "C"})
+
+    def test_retriever_can_skip_when_cases_too_far(self):
+        cases = [
+            {
+                "sample_id": 30,
+                "macro_choice": "D",
+                "action_label_11": 4,
+                "action_label_name": "停止",
+                "macro_name": "その他",
+                "speed": 2.0,
+                "acc_x": -0.2,
+                "gyro_z": 0.0,
+                "summary": "short stop-like",
+                "retrieval_features": compute_retrieval_features(2.0, -0.2, 0.0),
+            }
+        ]
+        retriever = NumericCaseRetriever(cases)
+        query = compute_retrieval_features(40.0, 0.5, 0.4)
+
+        results = retriever.query(
+            query,
+            top_k=3,
+            min_cases=1,
+            max_distance=0.5,
+        )
+
+        self.assertEqual(results, [])
+
 
 class FeedbackPromptingTests(unittest.TestCase):
     def test_feedback_prompt_contains_retrieved_case_evidence(self):
