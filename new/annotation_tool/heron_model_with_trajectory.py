@@ -8,7 +8,6 @@ import os
 import time
 import tempfile
 import logging
-from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image
 import cv2
@@ -1292,15 +1291,16 @@ class HeronAnnotatorWithTrajectory:
             add_generation_prompt=True,
         )
 
-        processor_outputs = self.processor(
-            text=[text_prompt],
-            videos=[Path(clip_path)],
-            padding=True,
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             return_tensors="pt",
             return_metadata=True,
         )
-        video_metadata = processor_outputs.pop("video_metadata", None)
-        inputs = processor_outputs.to(self.device)
+        video_metadata = inputs.pop("video_metadata", None)
+        inputs = inputs.to(self.device)
 
         with torch.no_grad():
             output_ids = self.model.generate(
