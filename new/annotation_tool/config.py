@@ -4,34 +4,36 @@ Moondream2 VLM Configuration for Automatic Annotation
 """
 
 # VLM Model Settings
-# ======== GPU サーバー設定 (kiwi: RTX 4090, 24GB VRAM) ========
-# Option 1: Qwen2-VL-2B (4GB VRAM, ローカル RTX 4060 向け)
-# Option 2: Qwen2-VL-7B (14GB VRAM, kiwi RTX 4090 向け, 高精度)
-HERON_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+# Multi-frame video understanding models
+# Option 1: Qwen2-VL-2B (Multi-frame, 4GB VRAM, faster, good for 8GB GPU)
+# Option 2: Qwen3-VL-2B (Multi-frame, newer VLM generation, similar scale)
+# Option 3: Qwen2-VL-7B (Multi-frame, 8GB+ VRAM, better accuracy, requires more memory)
+# Note: Moondream2 is NOT supported (single-frame only)
+# Note: Heron has Windows tokenizer compatibility issues
+HERON_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 USE_MULTI_FRAME = True  # Enable multi-frame temporal understanding
-USE_GPU = True  # GPU有効（kiwi: RTX 4090使用）
-# bfloat16: RTX 4090 (Ada Lovelace) はネイティブサポートで float16 より安定
-TORCH_DTYPE = "bfloat16"
+USE_GPU = True  # GPU有効
+TORCH_DTYPE = "float16"  # GPUではfloat16で高速化
 DEVICE_PREFERENCE = "cuda" if USE_GPU else "cpu"  # Device preference for model loading
 
 # Video Processing Settings
-# RTX 4090 (24GB VRAM) では 8 フレームを使用可能
-NUM_FRAMES_TO_EXTRACT = 8  # Number of frames to extract from video
-NUM_FRAMES_TO_USE = 8  # Number of frames to actually use
+NUM_FRAMES_TO_EXTRACT = 4  # Number of frames to extract from video (reduced for 8GB VRAM)
+NUM_FRAMES_TO_USE = 4  # Number of frames to actually use (reduced to fit in memory)
 FRAME_EXTRACTION_METHOD = "uniform"  # "uniform" or "temporal"
-MAX_IMAGE_SIZE = 1080  # Maximum dimension (width or height) for image processing
+MAX_IMAGE_SIZE = 720  # Ver.4 レポートに合わせて 720p
 
 # L2M+CoT Settings
-USE_L2M_COT = True  # Enable Least-to-Most + Chain-of-Thought reasoning
-# L2M+CoTを有効にすると、1つの動画に対して3回の推論を実行します（Level 1, 2, 3）
-# RTX 4090 の高速推論で処理時間の問題を解消
+USE_L2M_COT = False  # Ver.4 baseline は direct classification
 
-# Generation Settings (RTX 4090 では十分な VRAM があるため上限を緩和)
-MAX_NEW_TOKENS_STANDARD = 100  # 標準推論の最大トークン数
-MAX_NEW_TOKENS_L2M = 300  # L2M+CoT 推論の最大トークン数（JSON 出力に十分な長さ）
+# Generation Optimization Settings (速度最適化設定)
+# これらの設定を調整することで、機能を維持しながら推論速度を向上できます
+MAX_NEW_TOKENS_STANDARD = 50  # 標準推論の最大トークン数 (デフォルト: 100 → 50に削減)
+MAX_NEW_TOKENS_L2M = 150  # L2M+CoT推論の最大トークン数 (デフォルト: 300 → 150に削減)
+# 理由: アクション分類は0-10の数字1つだけなので、長い出力は不要
+# 50トークンでも十分な推論結果が得られます
 
 USE_KV_CACHE = True  # KVキャッシュの使用 (高速化)
-NUM_FRAMES_OPTIMIZED = 8  # フレーム数（RTX 4090 では削減不要）
+NUM_FRAMES_OPTIMIZED = 4
 
 # Action Label Mapping
 ACTION_LABELS = {
@@ -48,69 +50,89 @@ ACTION_LABELS = {
     10: "転回(Uターン)"
 }
 
-# Prompt Template for LLaVA
-PROMPT_TEMPLATE = """You are an AI assistant analyzing taxi driving behavior.
-Classify the driver's action from the provided video frames and sensor data.
+# Macro 4-class mapping used for Qwen3-VL comparison runs.
+# We keep representative 11-class IDs for CSV compatibility:
+# A -> 1 (直線系), B -> 6 (左回転系), C -> 7 (右回転系), D -> 4 (その他)
+MACRO_OUTPUT_TO_LABEL = {
+    "A": 1,
+    "B": 6,
+    "C": 7,
+    "D": 4,
+}
 
-**CRITICAL**: Analyze the RED trajectory line primarily to determine the vehicle's action.
+MACRO_OUTPUT_NAMES = {
+    "A": "直線系",
+    "B": "左回転系",
+    "C": "右回転系",
+    "D": "その他",
+}
 
-Visual Indicators in the frames:
-- RED LINE/DOTS: Predicted trajectory of the vehicle for the next 3 seconds
-  * Each red dot represents a future position
-  * If RED trajectory curves significantly LEFT → Consider "6" (Left turn)
-  * If RED trajectory curves significantly RIGHT → Consider "7" (Right turn)
-  * If RED trajectory follows GREEN line (straight) → Consider "1", "2", "3", "5" based on speed
-- GREEN LINE: Straight-ahead reference line
+# Legacy one-shot macro prompt kept for fallback / comparison.
+PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+以下のセンサーデータと画像から運転行動を4分類してください。
 
-Reference Sensor Data (supplementary):
-- Speed: {speed} km/h
-- Acceleration X: {acc_x} m/s²
-- Acceleration Y: {acc_y} m/s²
-- Acceleration Z: {acc_z} m/s²
-- Brake: {brake}
+【画像の見方】
+- 画像1-4: 時系列順の元フレームです
+- 画像5: 予測軌道だけを上から見た trajectory summary です
+- summary の緑線は直進基準、赤線は今後3秒間の予測軌道です
 
-**Decision Rules**:
-1. If Speed = 0 km/h → Must be "4" (Stop)
-2. If RED trajectory curves LEFT significantly → "6" (Left turn)
-3. If RED trajectory curves RIGHT significantly → "7" (Right turn)
-4. If RED trajectory is straight AND Speed > 0:
-   - If Speed is increasing (Acc X > 0.5) → "2" (Acceleration) or "5" (Start if was stopped)
-   - If Speed is decreasing (Acc X < -0.5) OR Brake = 1 → "3" (Deceleration)
-   - If Speed is constant (Acc X ≈ 0) → "1" (Constant speed)
-5. Lane changes ("8"/"9"): Small lateral shift without intersection
-6. For U-turn ("10"): Very sharp turn with trajectory reversing direction
+【センサーデータ】
+速度: {speed} km/h
+加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
+Yaw rate: {gyro_z} rad/s
+ブレーキ: {brake}
 
-Action Categories:
-0: Other
-1: Constant speed driving - moving straight at constant speed
-2: Acceleration - speed increasing
-3: Deceleration - speed decreasing (including braking)
-4: Stop - completely stopped (speed 0 km/h)
-5: Start - beginning to move from stopped state
-6: Left turn - turning left (at intersections)
-7: Right turn - turning right (at intersections)
-8: Lane change (left) - moving to left lane
-9: Lane change (right) - moving to right lane
-10: U-turn - 180-degree direction change
+以下から1つ選んでください:
+A: 直線系（等速走行・加速・減速）
+B: 左回転系（左折・左車線変更）
+C: 右回転系（右折・右車線変更・転回）
+D: その他（停止・発進・その他）
 
-**Respond with ONLY the number (0-10). Nothing else.**"""
+A, B, C, D のいずれか1文字のみで回答してください。"""
 
-# Sensor Thresholds for Turning Detection (案2-1, 案1-2)
-GYRO_THRESHOLD = 0.1        # rad/s - 旋回検出のジャイロ閾値
-ACC_X_THRESHOLD = 0.3       # m/s² - 横加速度による旋回検出閾値
-SPEED_STOP_THRESHOLD = 1.0  # km/h - 停止とみなす速度閾値
+STAGE1_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+画像1-4は時系列順の元フレーム、画像5は trajectory summary です。
 
-# Few-shot examples for rare classes (案5-2)
-FEW_SHOT_EXAMPLES = """
-【参考例（センサー → 正解クラス）】
-例1: gyro_z=+0.25 rad/s、速度=15km/h、交差点で右に曲がっている → 7（右折）
-例2: gyro_z=+0.18 rad/s、速度=20km/h、車線が左にシフト → 8（車線変更（左））
-例3: gyro_z=0.00 rad/s、速度=0km/h、ブレーキON → 4（停止）
-例4: gyro_z=-0.20 rad/s、速度=12km/h、交差点で左に曲がっている → 6（左折）
-例5: acc_x=-1.5 m/s²、ブレーキON、速度低下 → 3（減速）
-例6: 速度=0km/h → 速度トレンドINCREASING → 5（発進）
-"""
+【trajectory summary の見方】
+- 緑線: 直進基準
+- 赤線: 今後3秒間の予測軌道
+- 赤線が基準にほぼ沿うなら直線系に近いです
+- 赤線が大きく左右へ曲がる、または停止・発進・その他に見えるなら直線系以外です
+
+【センサーデータ】
+速度: {speed} km/h
+加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
+Yaw rate: {gyro_z} rad/s
+ブレーキ: {brake}
+
+質問:
+- A: 直線系（等速走行・加速・減速）
+- N: 直線系以外（左回転系・右回転系・その他）
+
+最終回答は A または N の1文字のみで回答してください。"""
+
+STAGE2_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+画像1-4は時系列順の元フレーム、画像5は trajectory summary です。
+
+【trajectory summary の見方】
+- 緑線: 直進基準
+- 赤線: 今後3秒間の予測軌道
+- 左へ大きく曲がるなら B、右へ大きく曲がるなら C を優先してください
+- ほとんど動いていない、停止・発進・その他に近いなら D を選んでください
+
+【センサーデータ】
+速度: {speed} km/h
+加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
+Yaw rate: {gyro_z} rad/s
+ブレーキ: {brake}
+
+以下から1つ選んでください:
+B: 左回転系（左折・左車線変更）
+C: 右回転系（右折・右車線変更・転回）
+D: その他（停止・発進・その他）
+
+最終回答は B, C, D のいずれか1文字のみで回答してください。"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds
-ENABLE_FLASH_ATTENTION = True  # RTX 4090 では flash-attn が利用可能
+ENABLE_FLASH_ATTENTION = False  # Set to True if flash-attn is installed

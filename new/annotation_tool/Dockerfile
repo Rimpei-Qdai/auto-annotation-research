@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Qwen2-VL の動画処理に必要
+# Qwen2-VL / Qwen3-VL の動画処理に必要
 RUN pip install --no-cache-dir qwen-vl-utils
 
 # ベースイメージの cv2 を完全削除してから opencv-python-headless を再インストール
