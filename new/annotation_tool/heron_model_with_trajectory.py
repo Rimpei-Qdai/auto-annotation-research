@@ -50,7 +50,11 @@ from config import (
     USE_L2M_COT,
     USE_VLM_DIRECT,
     MAX_NEW_TOKENS_STANDARD,
+    MAX_NEW_TOKENS_DESCRIPTION,
+    MAX_NEW_TOKENS_STRUCTURED,
     SIMPLE_VIDEO_PROMPT_TEMPLATE,
+    TIMESTAMP_DESCRIPTION_PROMPT_TEMPLATE,
+    STRUCTURED_VIDEO_PROMPT_TEMPLATE,
     VIDEO_CLIP_DURATION_SECONDS,
     PROMPT_VERSION,
 )
@@ -1335,8 +1339,10 @@ class HeronAnnotatorWithTrajectory:
 
             return {
                 "clip_path": clip_path,
+                "target_center_time_seconds": float(center_time),
                 "window_start_seconds": window_start,
                 "window_end_seconds": window_end,
+                "target_seconds_in_clip": max(0.0, float(center_time) - window_start),
                 "clip_duration_seconds": max(0.0, window_end - window_start),
                 "fps": fps,
                 "source_total_duration_seconds": total_duration,
@@ -1369,6 +1375,64 @@ class HeronAnnotatorWithTrajectory:
                 if not k.startswith("_")
             }
         return str(value)
+
+    def _format_clip_timestamp(self, seconds: float) -> str:
+        """Format clip-relative seconds as MM:SS or MM:SS.s."""
+        seconds = max(0.0, float(seconds))
+        whole_minutes = int(seconds // 60)
+        remaining_seconds = seconds - (whole_minutes * 60)
+        if abs(remaining_seconds - round(remaining_seconds)) < 1e-6:
+            return f"{whole_minutes:02d}:{int(round(remaining_seconds)):02d}"
+        return f"{whole_minutes:02d}:{remaining_seconds:04.1f}"
+
+    def _parse_structured_video_response(self, text: str) -> Dict[str, Optional[str]]:
+        """Parse fixed-vocabulary structured response fields from model output."""
+        import re
+
+        patterns = {
+            "direction": r"DIRECTION\s*=\s*(STRAIGHT|LEFT|RIGHT|UNKNOWN)",
+            "speed_state": r"SPEED_STATE\s*=\s*(CONSTANT|ACCEL|DECEL|STOPPED|STARTING|UNKNOWN)",
+            "maneuver": r"MANEUVER\s*=\s*(LEFT_TURN|RIGHT_TURN|LEFT_LANE_CHANGE|RIGHT_LANE_CHANGE|U_TURN|OTHER|UNKNOWN)",
+        }
+        parsed: Dict[str, Optional[str]] = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, text, re.IGNORECASE)
+            parsed[key] = match.group(1).upper() if match else None
+        return parsed
+
+    def _map_structured_video_prediction_to_label(
+        self,
+        *,
+        direction: Optional[str],
+        speed_state: Optional[str],
+        maneuver: Optional[str],
+    ) -> int:
+        """Map structured video descriptors to the 11-class label space."""
+        maneuver_to_label = {
+            "LEFT_TURN": 6,
+            "RIGHT_TURN": 7,
+            "LEFT_LANE_CHANGE": 8,
+            "RIGHT_LANE_CHANGE": 9,
+            "U_TURN": 10,
+        }
+        if maneuver in maneuver_to_label:
+            return maneuver_to_label[maneuver]
+
+        speed_to_label = {
+            "CONSTANT": 1,
+            "ACCEL": 2,
+            "DECEL": 3,
+            "STOPPED": 4,
+            "STARTING": 5,
+        }
+        if speed_state in speed_to_label:
+            return speed_to_label[speed_state]
+
+        if direction == "LEFT":
+            return 6
+        if direction == "RIGHT":
+            return 7
+        return 0
 
     def _run_prompt_on_video_clip(
         self,
@@ -1439,51 +1503,95 @@ class HeronAnnotatorWithTrajectory:
         center_time: float = 0.0,
         sample_id: Optional[int] = None,
     ) -> Optional[int]:
-        """Predict a single 11-class label from a centered 6-second raw video clip."""
+        """Predict an 11-class label from raw video via description -> structure -> mapping."""
         clip_info = self._create_centered_video_clip(
             video_path=video_path,
             center_time=center_time,
             window_duration=VIDEO_CLIP_DURATION_SECONDS,
         )
         clip_path = clip_info["clip_path"]
-        prompt_text = SIMPLE_VIDEO_PROMPT_TEMPLATE
+        target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
+        description_prompt = TIMESTAMP_DESCRIPTION_PROMPT_TEMPLATE.format(
+            target_timestamp_text=target_timestamp_text,
+        )
         started_at = time.perf_counter()
 
         try:
-            final_prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+            timestamp_prompt_text, timestamp_generated_text, description_metadata = self._run_prompt_on_video_clip(
                 clip_path=clip_path,
-                prompt_text=prompt_text,
-                max_new_tokens=MAX_NEW_TOKENS_STANDARD,
+                prompt_text=description_prompt,
+                max_new_tokens=MAX_NEW_TOKENS_DESCRIPTION,
             )
-            predicted_label = self._extract_action_label(generated_text)
+
+            structured_prompt = STRUCTURED_VIDEO_PROMPT_TEMPLATE.format(
+                target_timestamp_text=target_timestamp_text,
+                description_text=timestamp_generated_text.strip() or "説明なし",
+            )
+            structured_prompt_text, structured_generated_text, structured_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=structured_prompt,
+                max_new_tokens=MAX_NEW_TOKENS_STRUCTURED,
+            )
+            parsed = self._parse_structured_video_response(structured_generated_text)
+            predicted_label = self._map_structured_video_prediction_to_label(
+                direction=parsed.get("direction"),
+                speed_state=parsed.get("speed_state"),
+                maneuver=parsed.get("maneuver"),
+            )
             latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            processor_metadata = {
+                "description": description_metadata,
+                "structured": structured_metadata,
+            }
 
             self._last_prediction_details = {
                 **(self._last_prediction_details or {}),
                 "prompt_version": PROMPT_VERSION,
-                "prompt_text": final_prompt_text,
-                "generated_text": generated_text,
+                "prompt_text": structured_prompt_text,
+                "generated_text": structured_generated_text,
+                "timestamp_prompt_text": timestamp_prompt_text,
+                "timestamp_generated_text": timestamp_generated_text,
+                "structured_prompt_text": structured_prompt_text,
+                "structured_generated_text": structured_generated_text,
+                "target_timestamp_text": target_timestamp_text,
+                "parsed_direction": parsed.get("direction"),
+                "parsed_speed_state": parsed.get("speed_state"),
+                "parsed_maneuver": parsed.get("maneuver"),
                 "extracted_label": predicted_label,
                 "predicted_label": predicted_label,
                 "video_input_mode": "raw_video_clip",
+                "inference_mode": "timestamp_description_then_structure",
                 "video_window_start_seconds": clip_info["window_start_seconds"],
                 "video_window_end_seconds": clip_info["window_end_seconds"],
+                "target_center_time_seconds": clip_info["target_center_time_seconds"],
+                "target_seconds_in_clip": clip_info["target_seconds_in_clip"],
                 "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
                 "video_clip_fps": clip_info["fps"],
                 "video_clip_frame_count": clip_info["clip_frame_count"],
                 "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
                 "source_frame_start": clip_info["source_frame_start"],
                 "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
-                "video_processor_metadata": processor_metadata.get("video_metadata"),
-                "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "video_processor_metadata": {
+                    "description": processor_metadata["description"].get("video_metadata"),
+                    "structured": processor_metadata["structured"].get("video_metadata"),
+                },
+                "video_grid_thw": {
+                    "description": processor_metadata["description"].get("video_grid_thw"),
+                    "structured": processor_metadata["structured"].get("video_grid_thw"),
+                },
                 "inference_latency_ms": latency_ms,
-                "error": None if predicted_label is not None else "Failed to extract 11-class label from model output",
+                "error": None,
             }
 
-            if predicted_label is not None:
-                logger.info(f"[Simple video baseline] Predicted action label: {predicted_label}")
-            else:
-                logger.warning("[Simple video baseline] Failed to extract 11-class label from model output")
+            logger.info(
+                "[Timestamp description baseline] target=%s direction=%s speed=%s maneuver=%s -> label=%s",
+                target_timestamp_text,
+                parsed.get("direction"),
+                parsed.get("speed_state"),
+                parsed.get("maneuver"),
+                predicted_label,
+            )
             return predicted_label
         finally:
             if clip_path and os.path.exists(clip_path):
@@ -1518,7 +1626,7 @@ class HeronAnnotatorWithTrajectory:
             "sensor_data": dict(sensor_data),
             "annotation_center_time_seconds": start_time,
             "sample_id": sample_id,
-            "mode": "simple_video_direct_11class",
+            "mode": "simple_video_timestamp_description_11class",
             "model_provider": MODEL_PROVIDER,
             "model_id": GEMINI_MODEL_ID if MODEL_PROVIDER == "gemini" else HERON_MODEL_ID,
         }

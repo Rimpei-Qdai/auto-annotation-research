@@ -41,6 +41,42 @@ class SimpleVideoBaselineTest(unittest.TestCase):
         self.assertAlmostEqual(start, 0.0)
         self.assertAlmostEqual(end, 4.0)
 
+    def test_format_clip_timestamp(self):
+        self.assertEqual(self.annotator._format_clip_timestamp(3.0), "00:03")
+        self.assertEqual(self.annotator._format_clip_timestamp(3.5), "00:03.5")
+
+    def test_parse_structured_video_response(self):
+        parsed = self.annotator._parse_structured_video_response(
+            "DIRECTION=LEFT\nSPEED_STATE=DECEL\nMANEUVER=LEFT_TURN"
+        )
+        self.assertEqual(parsed["direction"], "LEFT")
+        self.assertEqual(parsed["speed_state"], "DECEL")
+        self.assertEqual(parsed["maneuver"], "LEFT_TURN")
+
+    def test_map_structured_video_prediction_turn(self):
+        label = self.annotator._map_structured_video_prediction_to_label(
+            direction="LEFT",
+            speed_state="DECEL",
+            maneuver="LEFT_TURN",
+        )
+        self.assertEqual(label, 6)
+
+    def test_map_structured_video_prediction_speed_event(self):
+        label = self.annotator._map_structured_video_prediction_to_label(
+            direction="STRAIGHT",
+            speed_state="STARTING",
+            maneuver="OTHER",
+        )
+        self.assertEqual(label, 5)
+
+    def test_map_structured_video_prediction_direction_fallback(self):
+        label = self.annotator._map_structured_video_prediction_to_label(
+            direction="RIGHT",
+            speed_state="UNKNOWN",
+            maneuver="UNKNOWN",
+        )
+        self.assertEqual(label, 7)
+
 
 if __name__ == "__main__":
     unittest.main()
