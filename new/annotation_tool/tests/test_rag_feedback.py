@@ -4,9 +4,11 @@ from pathlib import Path
 
 
 ANNOTATION_TOOL_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(ANNOTATION_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(ANNOTATION_TOOL_DIR))
 
+from case_memory import CaseMemory, _manual_csv_candidates, _sample_csv_candidates  # noqa: E402
 from feedback_prompting import build_rag_feedback_prompt  # noqa: E402
 from retrieval_index import NumericCaseRetriever, RetrievedCase, compute_retrieval_features  # noqa: E402
 
@@ -85,6 +87,26 @@ class FeedbackPromptingTests(unittest.TestCase):
         self.assertIn("sample 42", prompt)
         self.assertIn("停止", prompt)
         self.assertIn("A/B/C/D", prompt)
+
+
+class CaseMemoryTests(unittest.TestCase):
+    def test_candidate_paths_cover_repo_root_layouts(self):
+        repo_root = "/tmp/project"
+        resolved_root = str(Path(repo_root).resolve())
+        manual_candidates = _manual_csv_candidates(repo_root)
+        sample_candidates = _sample_csv_candidates(repo_root)
+
+        self.assertIn(f"{resolved_root}/new/results/annotated_samples_manual.0121.csv", manual_candidates)
+        self.assertIn(f"{resolved_root}/results/annotated_samples_manual.0121.csv", manual_candidates)
+        self.assertIn(f"{resolved_root}/new/sample/annotation_samples.csv", sample_candidates)
+        self.assertIn(f"{resolved_root}/sample/annotation_samples.csv", sample_candidates)
+
+    def test_case_memory_loads_current_repo_cases(self):
+        case_memory = CaseMemory(str(REPO_ROOT))
+
+        self.assertGreaterEqual(len(case_memory.cases), 100)
+        self.assertEqual(case_memory.cases[0]["sample_id"], 1)
+        self.assertIn("macro_choice", case_memory.cases[0])
 
 
 if __name__ == "__main__":

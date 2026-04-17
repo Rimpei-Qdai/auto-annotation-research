@@ -8,6 +8,7 @@ import os
 import logging
 import subprocess
 from typing import List, Optional, Dict, Any, Tuple
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
@@ -60,7 +61,7 @@ REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
 
 
 def _repo_root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return str(Path(__file__).resolve().parents[2])
 
 
 def _run_git_command(args: List[str]) -> Optional[str]:
@@ -125,6 +126,7 @@ class HeronAnnotatorWithTrajectory:
         self.case_memory: Optional[CaseMemory] = None
         self.case_retriever: Optional[NumericCaseRetriever] = None
         self.rag_enabled = USE_RAG_FEEDBACK
+        self.rag_init_error: Optional[str] = None
         
         # Create output directory for trajectory frames
         if self.save_trajectory_frames and not os.path.exists(self.trajectory_output_dir):
@@ -194,6 +196,7 @@ class HeronAnnotatorWithTrajectory:
         try:
             self.case_memory = CaseMemory(_repo_root())
             self.case_retriever = NumericCaseRetriever(self.case_memory.cases)
+            self.rag_init_error = None
             logger.info(
                 "Case retriever initialized with %d manually labeled cases",
                 len(self.case_memory.cases),
@@ -201,6 +204,7 @@ class HeronAnnotatorWithTrajectory:
         except Exception as exc:
             self.case_memory = None
             self.case_retriever = None
+            self.rag_init_error = str(exc)
             logger.warning(f"Failed to initialize case retriever, continuing without RAG: {exc}")
     
     @property
@@ -871,9 +875,16 @@ class HeronAnnotatorWithTrajectory:
     ) -> str:
         """Retrieve similar labeled cases and ask the VLM to re-evaluate macro choice."""
         self.last_prediction_details["rag_enabled"] = bool(self.rag_enabled)
+        self.last_prediction_details["rag_init_error"] = self.rag_init_error
 
-        if not self.rag_enabled or self.case_retriever is None:
+        if not self.rag_enabled:
             self.last_prediction_details["rag_used"] = False
+            self.last_prediction_details["rag_skip_reason"] = "rag_disabled"
+            return initial_macro_choice
+
+        if self.case_retriever is None:
+            self.last_prediction_details["rag_used"] = False
+            self.last_prediction_details["rag_skip_reason"] = "no_case_retriever"
             return initial_macro_choice
 
         query_features = compute_retrieval_features(
@@ -886,6 +897,13 @@ class HeronAnnotatorWithTrajectory:
             top_k=RAG_TOP_K,
             exclude_sample_id=sample_id,
         )
+
+        if not retrieved_cases:
+            self.last_prediction_details["rag_used"] = False
+            self.last_prediction_details["rag_query_features"] = query_features
+            self.last_prediction_details["rag_retrieved_cases"] = []
+            self.last_prediction_details["rag_skip_reason"] = "empty_retrieval"
+            return initial_macro_choice
 
         rag_prompt = build_rag_feedback_prompt(
             initial_macro_choice=initial_macro_choice,
@@ -905,6 +923,7 @@ class HeronAnnotatorWithTrajectory:
         )
 
         self.last_prediction_details["rag_used"] = True
+        self.last_prediction_details["rag_skip_reason"] = None
         self.last_prediction_details["rag_query_features"] = query_features
         self.last_prediction_details["rag_retrieved_cases"] = [
             {

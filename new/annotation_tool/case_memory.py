@@ -8,6 +8,7 @@ It does not require a vector database or external service.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -31,16 +32,19 @@ def _label_to_macro(action_label: int) -> str:
 
 
 def _manual_csv_candidates(repo_root: str) -> List[str]:
+    root = Path(repo_root).resolve()
     return [
-        os.path.join(repo_root, "new", "results", MANUAL_FILENAME),
+        str(root / "new" / "results" / MANUAL_FILENAME),
+        str(root / "results" / MANUAL_FILENAME),
         "/Users/rimpeihata/Desktop/auto-annotation-research/new/results/annotated_samples_manual.0121.csv",
     ]
 
 
 def _sample_csv_candidates(repo_root: str) -> List[str]:
+    root = Path(repo_root).resolve()
     return [
-        os.path.join(repo_root, "new", "sample", SAMPLE_FILENAME),
-        os.path.join(repo_root, "sample", SAMPLE_FILENAME),
+        str(root / "new" / "sample" / SAMPLE_FILENAME),
+        str(root / "sample" / SAMPLE_FILENAME),
         "/Users/rimpeihata/Desktop/auto-annotation-research/new/sample/annotation_samples.csv",
     ]
 
@@ -56,7 +60,7 @@ class CaseMemory:
     """Load and expose manually labeled cases for retrieval."""
 
     def __init__(self, repo_root: str):
-        self.repo_root = repo_root
+        self.repo_root = str(Path(repo_root).resolve())
         self.manual_csv_path = _resolve_existing_path(_manual_csv_candidates(repo_root))
         self.sample_csv_path = _resolve_existing_path(_sample_csv_candidates(repo_root))
         self._cases: List[Dict[str, Any]] = []
