@@ -5,7 +5,10 @@ Supports trajectory drawing on 4 frames for auto-annotation
 """
 
 import os
+import csv
+import bisect
 import logging
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image
 import cv2
@@ -43,6 +46,8 @@ from config import (
     USE_SENSOR_ONLY_BASELINE,
     MAX_NEW_TOKENS_STANDARD,
     PROMPT_VERSION,
+    SENSOR_TEMPORAL_WINDOW_SECONDS,
+    SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,8 @@ class HeronAnnotatorWithTrajectory:
         self._device = None
         self._is_heron = False
         self._last_prediction_details: Optional[Dict[str, Any]] = None
+        self._sensor_temporal_samples: Dict[str, List[Dict[str, Any]]] = {}
+        self._sensor_temporal_lookup: Dict[int, Tuple[str, int]] = {}
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
@@ -101,6 +108,8 @@ class HeronAnnotatorWithTrajectory:
         
         # Initialize trajectory visualizer
         self._init_trajectory_visualizer()
+        if USE_SENSOR_ONLY_BASELINE:
+            self._init_sensor_temporal_index()
     
     def _init_trajectory_visualizer(self):
         """Initialize trajectory visualization with camera parameters"""
@@ -151,6 +160,172 @@ class HeronAnnotatorWithTrajectory:
             image_size=(width, height)
         )
         logger.info("Trajectory visualizer initialized")
+
+    def _init_sensor_temporal_index(self):
+        """Load nearby sensor rows so the baseline can use temporal context."""
+        sample_csv = Path(__file__).resolve().parents[1] / "sample" / "annotation_samples.csv"
+        if not sample_csv.exists():
+            logger.warning(f"Sensor temporal index source not found: {sample_csv}")
+            return
+
+        def _safe_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
+            value = row.get(key, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(row: Dict[str, Any], key: str, default: int = 0) -> int:
+            value = row.get(key, default)
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+        per_taxi: Dict[str, List[Dict[str, Any]]] = {}
+        with sample_csv.open(encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                sample_id = _safe_int(row, "sample_id", -1)
+                taxi_id = str(row.get("taxi_id") or "")
+                timestamp = _safe_int(row, "timestamp", 0)
+                if sample_id < 0 or not taxi_id or timestamp <= 0:
+                    continue
+
+                per_taxi.setdefault(taxi_id, []).append({
+                    "sample_id": sample_id,
+                    "timestamp": timestamp,
+                    "speed": _safe_float(row, "speed"),
+                    "acc_x": _safe_float(row, "acc_x"),
+                    "gyro_z": _safe_float(row, "gyro_z"),
+                    "heading": _safe_float(row, "heading"),
+                    "pulseSpeed": _safe_float(row, "pulseSpeed"),
+                    "brake": _safe_int(row, "brake"),
+                    "blinker_l": _safe_int(row, "blinker_l"),
+                    "blinker_r": _safe_int(row, "blinker_r"),
+                    "rapidAccelerator": _safe_int(row, "rapidAccelerator"),
+                    "rapidDecelerator": _safe_int(row, "rapidDecelerator"),
+                    "leftSteer": _safe_int(row, "leftSteer"),
+                    "rightSteer": _safe_int(row, "rightSteer"),
+                })
+
+        for taxi_id, samples in per_taxi.items():
+            samples.sort(key=lambda x: x["timestamp"])
+            self._sensor_temporal_samples[taxi_id] = samples
+            for idx, sample in enumerate(samples):
+                self._sensor_temporal_lookup[sample["sample_id"]] = (taxi_id, idx)
+
+        logger.info(
+            "Sensor temporal index initialized: %d taxis / %d samples",
+            len(self._sensor_temporal_samples),
+            len(self._sensor_temporal_lookup),
+        )
+
+    @staticmethod
+    def _signed_heading_delta_deg(start_heading: float, end_heading: float) -> float:
+        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
+        return delta
+
+    def _build_sensor_temporal_context(
+        self,
+        sample_id: Optional[int],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build temporal features from nearby same-taxi sensor rows."""
+        current_speed = float(sensor_data.get("speed", 0.0))
+        current_acc_x = float(sensor_data.get("acc_x", 0.0))
+        current_gyro = float(sensor_data.get("gyro_z", 0.0))
+        base_context: Dict[str, Any] = {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": "snapshot_only",
+            "neighbor_count": 1,
+            "pre_count": 0,
+            "post_count": 0,
+            "speed_pre_mean": current_speed,
+            "speed_post_mean": current_speed,
+            "speed_delta": 0.0,
+            "speed_slope_kmh_per_s": 0.0,
+            "acc_x_mean": current_acc_x,
+            "gyro_z_mean": current_gyro,
+            "gyro_z_integral": 0.0,
+            "max_abs_gyro_z": abs(current_gyro),
+            "heading_delta_deg": 0.0,
+            "low_speed_ratio": 1.0 if current_speed <= 5.0 else 0.0,
+            "standstill_ratio": 1.0 if current_speed <= 1.0 else 0.0,
+        }
+        if sample_id is None or sample_id not in self._sensor_temporal_lookup:
+            return base_context
+
+        taxi_id, idx = self._sensor_temporal_lookup[sample_id]
+        samples = self._sensor_temporal_samples.get(taxi_id, [])
+        if not samples:
+            return base_context
+
+        current = samples[idx]
+        timestamps = [sample["timestamp"] for sample in samples]
+
+        def _window_slice(window_ms: int) -> List[Dict[str, Any]]:
+            ts = current["timestamp"]
+            left = bisect.bisect_left(timestamps, ts - window_ms)
+            right = bisect.bisect_right(timestamps, ts + window_ms)
+            return samples[left:right]
+
+        preferred = _window_slice(int(SENSOR_TEMPORAL_WINDOW_SECONDS * 1000))
+        if len(preferred) >= 2:
+            selected = preferred
+            source = "preferred_window"
+        else:
+            selected = _window_slice(int(SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS * 1000))
+            source = "expanded_window" if len(selected) >= 2 else "snapshot_only"
+
+        if len(selected) <= 1:
+            return base_context
+
+        current_ts = current["timestamp"]
+        pre = [sample for sample in selected if sample["timestamp"] < current_ts]
+        post = [sample for sample in selected if sample["timestamp"] > current_ts]
+        speed_pre_mean = sum(sample["speed"] for sample in pre) / len(pre) if pre else current["speed"]
+        speed_post_mean = sum(sample["speed"] for sample in post) / len(post) if post else current["speed"]
+        speed_delta = speed_post_mean - speed_pre_mean
+
+        if pre and post:
+            dt_seconds = max((post[-1]["timestamp"] - pre[0]["timestamp"]) / 1000.0, 1e-6)
+        elif pre:
+            dt_seconds = max((current_ts - pre[0]["timestamp"]) / 1000.0, 1e-6)
+        elif post:
+            dt_seconds = max((post[-1]["timestamp"] - current_ts) / 1000.0, 1e-6)
+        else:
+            dt_seconds = 1.0
+
+        ordered = sorted(selected, key=lambda x: x["timestamp"])
+        gyro_integral = 0.0
+        for left_sample, right_sample in zip(ordered, ordered[1:]):
+            dt = max((right_sample["timestamp"] - left_sample["timestamp"]) / 1000.0, 0.0)
+            gyro_integral += 0.5 * (left_sample["gyro_z"] + right_sample["gyro_z"]) * dt
+
+        heading_delta = self._signed_heading_delta_deg(ordered[0]["heading"], ordered[-1]["heading"])
+        low_speed_ratio = sum(1 for sample in selected if sample["speed"] <= 5.0) / len(selected)
+        standstill_ratio = sum(1 for sample in selected if sample["speed"] <= 1.0) / len(selected)
+
+        return {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": source,
+            "neighbor_count": len(selected),
+            "pre_count": len(pre),
+            "post_count": len(post),
+            "speed_pre_mean": speed_pre_mean,
+            "speed_post_mean": speed_post_mean,
+            "speed_delta": speed_delta,
+            "speed_slope_kmh_per_s": speed_delta / dt_seconds,
+            "acc_x_mean": sum(sample["acc_x"] for sample in selected) / len(selected),
+            "gyro_z_mean": sum(sample["gyro_z"] for sample in selected) / len(selected),
+            "gyro_z_integral": gyro_integral,
+            "max_abs_gyro_z": max(abs(sample["gyro_z"]) for sample in selected),
+            "heading_delta_deg": heading_delta,
+            "low_speed_ratio": low_speed_ratio,
+            "standstill_ratio": standstill_ratio,
+        }
     
     @property
     def model(self):
@@ -633,72 +808,111 @@ class HeronAnnotatorWithTrajectory:
     def _classify_sensor_only_label(
         self,
         sensor_data: Dict[str, Any],
+        temporal_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, Dict[str, Any]]:
-        """Classify a single 11-class label from sensor values only."""
+        """Classify a single 11-class label from sensor values plus temporal context."""
         speed = float(sensor_data.get("speed", 0.0))
         acc_x = float(sensor_data.get("acc_x", 0.0))
         gyro_z = float(sensor_data.get("gyro_z", 0.0))
         abs_gyro = abs(gyro_z)
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        temporal_context = temporal_context or {}
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs_gyro))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
 
         reason = {
             "speed_kmh": speed,
             "acc_x": acc_x,
             "gyro_z": gyro_z,
             "abs_gyro_z": abs_gyro,
+            "brake": brake,
+            "blinker_l": blinker_l,
+            "blinker_r": blinker_r,
+            "rapidAccelerator": rapid_acc,
+            "rapidDecelerator": rapid_decel,
+            "temporal_source": source,
+            "speed_delta": speed_delta,
+            "speed_slope_kmh_per_s": speed_slope,
+            "acc_x_mean": mean_acc_x,
+            "gyro_z_integral": gyro_integral,
+            "max_abs_gyro_z_window": max_abs_gyro,
+            "heading_delta_deg": heading_delta,
+            "low_speed_ratio": low_speed_ratio,
+            "standstill_ratio": standstill_ratio,
         }
 
-        # Very low speed: stop/start/misc around standstill
-        if speed <= 1.5:
-            if acc_x >= 0.18:
-                reason["rule"] = "standstill_start"
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+
+        # Strong standstill / start decisions from temporal context first.
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                reason["rule"] = "temporal_standstill_start"
                 return 5, reason
-            reason["rule"] = "standstill_stop"
+            reason["rule"] = "temporal_standstill_stop"
             return 4, reason
 
-        # Strong yaw at modest speed can indicate a U-turn-like maneuver.
-        if abs_gyro >= 0.45 and speed <= 18.0:
-            reason["rule"] = "strong_yaw_uturn"
+        # Turn / lane-change decisions should use the temporal yaw trend first.
+        if max_abs_gyro >= 0.45 and speed <= 18.0 and abs(heading_delta) >= 100.0:
+            reason["rule"] = "temporal_uturn"
             return 10, reason
 
-        # Turn / lane change decisions from yaw rate only.
-        if abs_gyro >= 0.16:
-            reason["rule"] = "strong_yaw_turn"
-            return (6 if gyro_z > 0 else 7), reason
+        if abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18:
+            reason["rule"] = "temporal_turn"
+            return (6 if signed_rotation > 0 else 7), reason
 
-        if abs_gyro >= 0.07 and speed >= 15.0:
-            reason["rule"] = "moderate_yaw_lane_change"
-            return (8 if gyro_z > 0 else 9), reason
+        if (blinker_l or blinker_r or abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0) and speed >= 15.0:
+            if blinker_l and not blinker_r:
+                reason["rule"] = "temporal_lane_change_left"
+                return 8, reason
+            if blinker_r and not blinker_l:
+                reason["rule"] = "temporal_lane_change_right"
+                return 9, reason
+            if abs(signed_rotation) >= 0.16:
+                reason["rule"] = "temporal_lane_change_from_yaw"
+                return (8 if signed_rotation > 0 else 9), reason
 
-        # Straight speed-event classes.
-        if acc_x >= 0.25:
-            reason["rule"] = "straight_acceleration"
-            return 2, reason
-
-        if acc_x <= -0.35:
-            if speed <= 6.0:
-                reason["rule"] = "slow_decel_stop_like"
-                return 4, reason
-            reason["rule"] = "straight_deceleration"
-            return 3, reason
-
-        # Slight decel near zero motion often behaves like stop-like.
-        if speed <= 4.0 and acc_x < -0.12:
-            reason["rule"] = "low_speed_stop_like"
+        # Stop-like low-speed deceleration after removing turn-like cases.
+        if speed <= 6.0 and (brake or standstill_ratio >= 0.35 or low_speed_ratio >= 0.6) and (speed_delta <= -3.0 or mean_acc_x <= -0.18):
+            reason["rule"] = "temporal_stop_like"
             return 4, reason
 
-        if abs(acc_x) <= 0.08 and abs_gyro <= 0.03:
-            reason["rule"] = "steady_constant_speed"
-            return 1, reason
-
-        if acc_x < 0:
-            reason["rule"] = "fallback_deceleration"
-            return 3, reason
-
-        if acc_x > 0:
-            reason["rule"] = "fallback_acceleration"
+        # Straight speed-event classes should rely on temporal speed change first.
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            reason["rule"] = "temporal_acceleration"
             return 2, reason
 
-        reason["rule"] = "fallback_constant_speed"
+        if speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            if speed <= 8.0 and (brake or low_speed_ratio >= 0.5):
+                reason["rule"] = "temporal_slow_decel_stop_like"
+                return 4, reason
+            reason["rule"] = "temporal_deceleration"
+            return 3, reason
+
+        if abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12 and abs(signed_rotation) <= 0.10 and max_abs_gyro <= 0.08:
+            reason["rule"] = "temporal_constant_speed"
+            return 1, reason
+
+        if mean_acc_x < -0.05 or acc_x < -0.10:
+            reason["rule"] = "fallback_temporal_deceleration"
+            return 3, reason
+
+        if mean_acc_x > 0.05 or acc_x > 0.10:
+            reason["rule"] = "fallback_temporal_acceleration"
+            return 2, reason
+
+        reason["rule"] = "fallback_temporal_constant_speed"
         return 1, reason
 
     def _predict_sensor_only_baseline(
@@ -707,7 +921,8 @@ class HeronAnnotatorWithTrajectory:
         sample_id: Optional[int] = None,
     ) -> Optional[int]:
         """Predict a single 11-class label from sensor values only."""
-        action_label, sensor_rule_reason = self._classify_sensor_only_label(sensor_data)
+        temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
+        action_label, sensor_rule_reason = self._classify_sensor_only_label(sensor_data, temporal_context=temporal_context)
         self._last_prediction_details = {
             **(self._last_prediction_details or {}),
             "prompt_version": PROMPT_VERSION,
@@ -719,9 +934,10 @@ class HeronAnnotatorWithTrajectory:
             "macro_prediction_code": FINE_LABEL_TO_MACRO_GROUP.get(action_label),
             "macro_prediction_label": MACRO_GROUP_LABELS.get(FINE_LABEL_TO_MACRO_GROUP.get(action_label)),
             "sensor_rule_reason": sensor_rule_reason,
+            "sensor_temporal_context": temporal_context,
             "error": None,
         }
-        logger.info(f"[Sensor-only baseline] Predicted action label: {action_label}")
+        logger.info(f"[Sensor-temporal baseline] Predicted action label: {action_label}")
         return action_label
 
     def _determine_rotation_direction(
