@@ -341,11 +341,14 @@ class HeronAnnotatorWithTrajectory:
             raise RuntimeError(f"Gemini returned empty text: {response_json}")
 
         metadata = {
-            "provider": "gemini",
-            "clip_size_bytes": len(clip_bytes),
-            "model_version": response_json.get("modelVersion"),
-            "response_id": response_json.get("responseId"),
-            "usage_metadata": response_json.get("usageMetadata"),
+            "video_metadata": {
+                "provider": "gemini",
+                "clip_size_bytes": len(clip_bytes),
+                "model_version": response_json.get("modelVersion"),
+                "response_id": response_json.get("responseId"),
+                "usage_metadata": response_json.get("usageMetadata"),
+            },
+            "video_grid_thw": None,
         }
         return prompt_text, generated_text, metadata
     
@@ -1471,8 +1474,8 @@ class HeronAnnotatorWithTrajectory:
                 "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
                 "source_frame_start": clip_info["source_frame_start"],
                 "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
-                "video_processor_metadata": processor_metadata["video_metadata"],
-                "video_grid_thw": processor_metadata["video_grid_thw"],
+                "video_processor_metadata": processor_metadata.get("video_metadata"),
+                "video_grid_thw": processor_metadata.get("video_grid_thw"),
                 "inference_latency_ms": latency_ms,
                 "error": None if predicted_label is not None else "Failed to extract 11-class label from model output",
             }
