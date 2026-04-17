@@ -3,16 +3,13 @@ uvicorn==0.34.3
 pandas==2.3.0
 python-multipart==0.0.20
 jinja2==3.1.6
-numpy<2
 
 # Heron VLM dependencies
 torch>=2.0.0
 transformers>=4.35.0
 Pillow>=10.0.0
-# opencv-python はベースイメージ(nvcr.io/nvidia/pytorch:24.02-py3)に含まれる 4.7.0 を使用
+opencv-python>=4.8.0
+decord>=0.6.0
 accelerate>=0.24.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
-
-# Qwen2-VL の動画・画像処理に必要
-qwen-vl-utils>=0.0.5

@@ -159,9 +159,9 @@ class TrajectoryVisualizer:
         image: np.ndarray,
         trajectory_3d: np.ndarray,
         color: Tuple[int, int, int] = (0, 0, 255),  # BGR形式で赤
-        thickness: int = 3,
+        thickness: int = 10,
         draw_reference_line: bool = True,
-        point_radius: int = 4
+        point_radius: int = 10
     ) -> np.ndarray:
         """
         計算された3D軌道を画像上に点と線として描画
@@ -187,44 +187,23 @@ class TrajectoryVisualizer:
         
         num_valid = np.sum(valid_mask)
         
-        # 速度が0で軌道点が投影できない場合は、車両の少し前方の位置を描画
+        # 停止付近では前進っぽい fallback を描かず、STOP cue を表示する
         if num_valid < 1:
-            # 車両の5m前方の点を描画（起点の代わり）
-            fallback_point = np.array([[5.0, 0.0, 0.0]], dtype=np.float32)
-            fallback_image_points, fallback_mask = self.project_3d_to_2d(fallback_point)
-            
-            if np.sum(fallback_mask) > 0:
-                logger.info("Drawing fallback point at 5m forward (low/zero speed)")
-                image_points = fallback_image_points
-                valid_mask = fallback_mask
-                num_valid = 1
-            else:
-                logger.warning("No valid points to draw trajectory (even fallback failed)")
-                return output_image
+            logger.info("Drawing stop badge fallback (no visible trajectory points)")
+            self._draw_stop_badge(output_image)
+            return output_image
         
         # 有効な点を取得
         valid_points = image_points[valid_mask].astype(np.int32)
-        
-        # 1. まず各点を円でプロット（速度が低い場合でも見える）
-        for point in valid_points:
-            cv2.circle(
-                output_image,
-                tuple(point),
-                point_radius,
-                color,
-                -1  # 塗りつぶし
-            )
-        
-        # 2. 点が2つ以上ある場合は線で結ぶ
-        if num_valid >= 2:
-            cv2.polylines(
-                output_image,
-                [valid_points],
-                isClosed=False,
-                color=color,
-                thickness=max(1, thickness - 1)  # 線は少し細めに
-            )
-        
+
+        # 1. 時系列が見えるように、軌道を濃淡付きの線分として描画
+        self._draw_temporal_trajectory(
+            output_image,
+            valid_points,
+            base_thickness=thickness,
+            point_radius=point_radius,
+        )
+
         # 緑の参照線（車線中心や直進方向）を描画
         if draw_reference_line:
             # 簡易的に直進方向を緑線として描画（前方20mまで）
@@ -237,15 +216,347 @@ class TrajectoryVisualizer:
             
             if np.sum(ref_valid) == 2:
                 pts_green = ref_points[ref_valid].astype(np.int32)
-                cv2.line(
+                self._draw_dashed_line(
                     output_image,
                     tuple(pts_green[0]),
                     tuple(pts_green[1]),
-                    (0, 255, 0),  # 緑色
-                    2
+                    (90, 255, 120),
+                    1,
+                    dash_length=22,
                 )
-        
+
+        focus_roi = self._compute_focus_roi(valid_points, output_image.shape[:2])
+        if focus_roi is not None:
+            self._draw_focus_inset(output_image, focus_roi)
+
         return output_image
+
+    def render_trajectory_summary(
+        self,
+        trajectory_3d: np.ndarray,
+        speed: float,
+        acc_x: float,
+        gyro_z: float,
+        latitude: float,
+        longitude: float,
+        canvas_size: Tuple[int, int] = (960, 960),
+    ) -> np.ndarray:
+        """Render a pure trajectory-only summary image for VLM input."""
+        width, height = canvas_size
+        image = np.full((height, width, 3), 250, dtype=np.uint8)
+
+        # Drawing region
+        top = 70
+        bottom = height - 70
+        left = 90
+        right = width - 90
+        center_x = (left + right) // 2
+
+        cv2.rectangle(image, (left, top), (right, bottom), (255, 255, 255), -1)
+        cv2.rectangle(image, (left, top), (right, bottom), (210, 210, 210), 2)
+
+        # Straight reference line
+        self._draw_dashed_line(
+            image,
+            (center_x, bottom - 20),
+            (center_x, top + 24),
+            (90, 200, 90),
+            3,
+            dash_length=28,
+        )
+
+        # Project BEV trajectory into a simple summary plane.
+        points_xy = np.asarray(trajectory_3d[:, :2], dtype=np.float32)
+        max_forward_m = max(18.0, float(np.max(points_xy[:, 0]) + 2.0))
+        lateral_range_m = max(5.0, float(np.max(np.abs(points_xy[:, 1])) + 1.5))
+
+        def to_canvas(pt: np.ndarray) -> Tuple[int, int]:
+            x_m, y_m = float(pt[0]), float(pt[1])
+            norm_x = np.clip(x_m / max_forward_m, 0.0, 1.0)
+            norm_y = np.clip(y_m / lateral_range_m, -1.0, 1.0)
+            px = int(center_x - norm_y * ((right - left) * 0.36))
+            py = int(bottom - 22 - norm_x * ((bottom - top) - 44))
+            return px, py
+
+        canvas_points = np.array([to_canvas(pt) for pt in points_xy], dtype=np.int32)
+
+        # Start marker
+        start = tuple(canvas_points[0])
+        cv2.circle(image, start, 18, (0, 0, 0), -1)
+        cv2.circle(image, start, 15, (255, 255, 255), 3)
+        cv2.circle(image, start, 10, (70, 140, 255), -1)
+
+        forward_distance = float(points_xy[-1, 0])
+        stop_like = speed < 1.0 or forward_distance < 0.8
+
+        if stop_like:
+            # Keep only a very short trajectory cue near the start for near-stationary cases.
+            cv2.circle(image, start, 18, (0, 0, 0), -1)
+            cv2.circle(image, start, 15, (255, 255, 255), 3)
+            cv2.circle(image, start, 10, (255, 90, 90), -1)
+        else:
+            for idx in range(len(canvas_points) - 1):
+                p1 = tuple(canvas_points[idx])
+                p2 = tuple(canvas_points[idx + 1])
+                progress = idx / max(1, len(canvas_points) - 2)
+                color = (
+                    255,
+                    int(40 + 180 * progress),
+                    int(20 + 25 * progress),
+                )
+                cv2.line(image, p1, p2, (0, 0, 0), 18, cv2.LINE_AA)
+                cv2.line(image, p1, p2, color, 10, cv2.LINE_AA)
+
+            if len(canvas_points) >= 2:
+                cv2.arrowedLine(
+                    image,
+                    tuple(canvas_points[-2]),
+                    tuple(canvas_points[-1]),
+                    (0, 0, 0),
+                    22,
+                    cv2.LINE_AA,
+                    tipLength=0.45,
+                )
+                cv2.arrowedLine(
+                    image,
+                    tuple(canvas_points[-2]),
+                    tuple(canvas_points[-1]),
+                    (255, 220, 0),
+                    12,
+                    cv2.LINE_AA,
+                    tipLength=0.40,
+                )
+
+        return image
+
+    def _draw_temporal_trajectory(
+        self,
+        image: np.ndarray,
+        valid_points: np.ndarray,
+        base_thickness: int,
+        point_radius: int,
+    ) -> None:
+        """Draw the trajectory with temporal cues: gradient, ticks, start ring, and end arrow."""
+        if len(valid_points) == 0:
+            return
+
+        # Draw start point as a white ring.
+        cv2.circle(image, tuple(valid_points[0]), point_radius + 6, (0, 0, 0), -1)
+        cv2.circle(image, tuple(valid_points[0]), point_radius + 4, (255, 255, 255), 3)
+        cv2.circle(image, tuple(valid_points[0]), point_radius + 1, (255, 90, 90), -1)
+
+        if len(valid_points) == 1:
+            return
+
+        segment_count = len(valid_points) - 1
+        marker_indices = {
+            max(1, int(round(segment_count / 3))),
+            max(1, int(round((2 * segment_count) / 3))),
+        }
+
+        for idx in range(segment_count):
+            p1 = tuple(valid_points[idx])
+            p2 = tuple(valid_points[idx + 1])
+            progress = idx / max(1, segment_count - 1)
+
+            # Start with darker red and gradually brighten towards yellow.
+            color = (
+                255,
+                int(40 + 180 * progress),
+                int(20 + 25 * progress),
+            )
+            thickness = base_thickness + (3 if progress > 0.45 else 0)
+            # Add a dark halo so the trajectory survives bright/complex road texture.
+            cv2.line(image, p1, p2, (0, 0, 0), thickness + 6, cv2.LINE_AA)
+            cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
+
+            cv2.circle(image, p1, point_radius + 4, (0, 0, 0), -1)
+            cv2.circle(image, p1, point_radius, color, -1)
+
+            if idx in marker_indices:
+                cv2.circle(image, p1, point_radius + 7, (0, 0, 0), 2)
+                cv2.circle(image, p1, point_radius + 5, (255, 255, 255), 3)
+                cv2.circle(image, p1, point_radius + 2, (255, 255, 255), -1)
+
+        end_start = tuple(valid_points[-2])
+        end_point = tuple(valid_points[-1])
+        cv2.arrowedLine(
+            image,
+            end_start,
+            end_point,
+            (0, 0, 0),
+            base_thickness + 10,
+            cv2.LINE_AA,
+            tipLength=0.40
+        )
+        cv2.arrowedLine(
+            image,
+            end_start,
+            end_point,
+            (255, 220, 0),
+            base_thickness + 4,
+            cv2.LINE_AA,
+            tipLength=0.36
+        )
+        cv2.circle(image, end_point, point_radius + 8, (0, 0, 0), -1)
+        cv2.circle(image, end_point, point_radius + 4, (255, 220, 0), -1)
+        cv2.circle(image, end_point, point_radius + 9, (255, 255, 255), 3)
+
+    def _compute_focus_roi(
+        self,
+        valid_points: np.ndarray,
+        image_shape: Tuple[int, int]
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Compute a crop around the trajectory so the model can see a zoomed view."""
+        if len(valid_points) < 2:
+            return None
+
+        image_h, image_w = image_shape
+        min_x = int(np.min(valid_points[:, 0]))
+        max_x = int(np.max(valid_points[:, 0]))
+        min_y = int(np.min(valid_points[:, 1]))
+        max_y = int(np.max(valid_points[:, 1]))
+
+        pad_x = max(80, int((max_x - min_x) * 0.8))
+        pad_y = max(80, int((max_y - min_y) * 0.8))
+
+        x1 = max(0, min_x - pad_x)
+        x2 = min(image_w, max_x + pad_x)
+        y1 = max(int(image_h * 0.45), min_y - pad_y)
+        y2 = min(image_h, max_y + pad_y)
+
+        if x2 - x1 < 120 or y2 - y1 < 120:
+            return None
+
+        return (x1, y1, x2, y2)
+
+    def _draw_focus_inset(
+        self,
+        image: np.ndarray,
+        roi: Tuple[int, int, int, int]
+    ) -> None:
+        """Draw an enlarged crop of the trajectory region in the upper-right corner."""
+        x1, y1, x2, y2 = roi
+        roi_crop = image[y1:y2, x1:x2]
+        if roi_crop.size == 0:
+            return
+
+        image_h, image_w = image.shape[:2]
+        inset_w = int(image_w * 0.38)
+        inset_h = int(image_h * 0.34)
+        inset = cv2.resize(roi_crop, (inset_w, inset_h), interpolation=cv2.INTER_LINEAR)
+
+        margin = 18
+        panel_x1 = image_w - inset_w - margin
+        panel_y1 = margin + 12
+        panel_x2 = image_w - margin
+        panel_y2 = panel_y1 + inset_h
+
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay,
+            (panel_x1 - 8, panel_y1 - 34),
+            (panel_x2 + 8, panel_y2 + 8),
+            (12, 12, 12),
+            -1
+        )
+        cv2.addWeighted(overlay, 0.50, image, 0.50, 0, image)
+        image[panel_y1:panel_y2, panel_x1:panel_x2] = inset
+        cv2.rectangle(image, (panel_x1, panel_y1), (panel_x2, panel_y2), (255, 255, 255), 2)
+        cv2.putText(
+            image,
+            "zoomed trajectory",
+            (panel_x1 + 10, panel_y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        # Show the ROI on the original frame so the relation between views is clear.
+        cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        # Add a simple scale cue in the inset instead of small textual legends.
+        cue_y = panel_y2 - 22
+        cue_x1 = panel_x1 + 18
+        cue_x2 = cue_x1 + 70
+        cv2.line(image, (cue_x1, cue_y), (cue_x2, cue_y), (0, 0, 0), 10, cv2.LINE_AA)
+        cv2.line(image, (cue_x1, cue_y), (cue_x2, cue_y), (255, 90, 40), 6, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            "thick path cue",
+            (cue_x2 + 12, cue_y + 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    def _draw_dashed_line(
+        self,
+        image: np.ndarray,
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        color: Tuple[int, int, int],
+        thickness: int,
+        dash_length: int = 16,
+    ) -> None:
+        """Draw a dashed line between two points."""
+        start_pt = np.array(start, dtype=np.float32)
+        end_pt = np.array(end, dtype=np.float32)
+        delta = end_pt - start_pt
+        total_length = float(np.linalg.norm(delta))
+
+        if total_length < 1.0:
+            cv2.line(image, start, end, color, thickness)
+            return
+
+        direction = delta / total_length
+        draw = True
+        current_length = 0.0
+
+        while current_length < total_length:
+            segment_start = start_pt + direction * current_length
+            next_length = min(total_length, current_length + dash_length)
+            segment_end = start_pt + direction * next_length
+
+            if draw:
+                cv2.line(
+                    image,
+                    tuple(segment_start.astype(int)),
+                    tuple(segment_end.astype(int)),
+                    color,
+                    thickness,
+                    cv2.LINE_AA
+                )
+
+            draw = not draw
+            current_length = next_length
+
+    def _draw_stop_badge(self, image: np.ndarray) -> None:
+        """Draw a large stop badge when projected motion is essentially absent."""
+        h, w = image.shape[:2]
+        cx = w // 2
+        cy = int(h * 0.74)
+        radius = max(44, min(w, h) // 14)
+
+        overlay = image.copy()
+        cv2.circle(overlay, (cx, cy), radius + 14, (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.42, image, 0.58, 0, image)
+        cv2.circle(image, (cx, cy), radius + 8, (255, 255, 255), 4)
+        cv2.circle(image, (cx, cy), radius, (0, 0, 255), -1)
+        cv2.putText(
+            image,
+            "STOP",
+            (cx - radius + 12, cy + 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
     
     def visualize_trajectory(
         self,

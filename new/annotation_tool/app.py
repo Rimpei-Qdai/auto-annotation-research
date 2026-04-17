@@ -2,26 +2,28 @@
 
 import os
 import json
-import bisect
-import time
 import pandas as pd
 import logging
 from datetime import datetime, timedelta, timezone
-
-JST = timezone(timedelta(hours=9))
+from typing import Optional
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# Configure logging（コンソール + ファイル両方に出力）
-_LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'annotation.log')
-_log_handler_file = logging.FileHandler(_LOG_FILE_PATH, encoding='utf-8')
-_log_handler_file.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+JST = timezone(timedelta(hours=9))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ANNOTATION_LOG = os.path.join(BASE_DIR, 'annotation.log')
+INFERENCE_PROCESS_JSONL = os.path.join(BASE_DIR, 'inference_process.jsonl')
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), _log_handler_file]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(ANNOTATION_LOG, encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 try:
     from heron_model_with_trajectory import get_annotator
     HERON_ENABLED = True
-    logger.info("Using trajectory-enabled annotator with L2M/CoT support")
+    logger.info("Using trajectory-enabled annotator (Ver.4 baseline mode)")
 except ImportError as e:
     HERON_ENABLED = False
     logger.warning(f"Heron auto-annotation disabled: {e}")
@@ -38,12 +40,8 @@ except ImportError as e:
 app = FastAPI()
 
 # パス設定
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# プロジェクトのルートディレクトリ (new/ の親)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
-SAMPLE_DIR = os.path.join(PROJECT_ROOT, 'sample')
+SAMPLE_DIR = os.path.join(os.path.dirname(BASE_DIR), 'sample')
 VIDEO_DIR = os.path.join(os.path.dirname(BASE_DIR), 'filterd_video')
-INFERENCE_LOG_PATH = os.path.join(BASE_DIR, 'inference_process.jsonl')
 
 CSV_INPUT = os.path.join(SAMPLE_DIR, 'annotation_samples.csv')
 CSV_OUTPUT_MANUAL = os.path.join(BASE_DIR, 'annotated_samples_manual.csv')
@@ -51,7 +49,6 @@ CSV_OUTPUT_AUTO = os.path.join(BASE_DIR, 'annotated_samples_auto.csv')
 
 # 静的ファイルとテンプレート
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
-os.makedirs(VIDEO_DIR, exist_ok=True)
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
@@ -101,18 +98,10 @@ if os.path.exists(CSV_OUTPUT_AUTO):
 if 'action_label' not in df_auto.columns:
     df_auto['action_label'] = None
 
-# 速度差分を事前計算（案2-2）: タクシーIDごとに前後サンプル間の速度変化量を算出
-# timestamp でソートしてから差分計算することで加速・減速の検出精度を向上
-if 'speed' in df_auto.columns and 'taxi_id' in df_auto.columns:
-    df_auto = df_auto.sort_values(['taxi_id', 'timestamp']).reset_index(drop=True)
-    df_auto['speed_diff'] = df_auto.groupby('taxi_id')['speed'].diff()
-    df_auto['speed_diff'] = df_auto['speed_diff'].fillna(0)
-    logger.info("速度差分(speed_diff)を計算しました")
-
 # ============ ヘルパー関数 ============
 
 def unix_ms_to_datetime(unix_ms):
-    """UNIXミリ秒をJST datetimeに変換"""
+    """UNIXミリ秒をJST基準のnaive datetimeに変換"""
     return datetime.fromtimestamp(unix_ms / 1000.0, tz=JST).replace(tzinfo=None)
 
 def extract_video_timestamp(filename):
@@ -123,119 +112,49 @@ def extract_video_timestamp(filename):
         return datetime.strptime(timestamp_str, '%Y%m%d%H%M%S')
     return None
 
-
-# taxi_idごとの動画インデックスをキャッシュして、ページ表示の待ち時間を削減
-_video_index_cache = {}
-
-
-def _build_video_index_for_taxi(taxi_id):
-    """指定タクシーの動画インデックスを構築して返す。"""
-    taxi_id = str(taxi_id)
-    taxi_folder = os.path.join(VIDEO_DIR, taxi_id)
-    if not os.path.isdir(taxi_folder):
-        return None
-
-    indexed = []
-    try:
-        for entry in os.scandir(taxi_folder):
-            if not entry.is_file():
-                continue
-            name = entry.name
-            if not name.startswith('EVT_') or not name.endswith('.mp4'):
-                continue
-
-            if name.endswith('_FRONT.mp4'):
-                base_name = name[:-10]
-            elif name.endswith('_INNER.mp4'):
-                base_name = name[:-10]
-            else:
-                continue
-
-            video_timestamp = extract_video_timestamp(name)
-            if video_timestamp is None:
-                continue
-            indexed.append((video_timestamp, base_name))
-    except OSError as e:
-        logger.warning(f"Failed to scan taxi folder {taxi_folder}: {e}")
-        return None
-
-    if not indexed:
-        return None
-
-    # 同一base_nameが重複するため、timestamp+base_nameでユニーク化
-    indexed = sorted(set(indexed), key=lambda x: x[0])
-    timestamps = [item[0] for item in indexed]
-    base_names = [item[1] for item in indexed]
-
-    result = {
-        'taxi_folder': taxi_folder,
-        'timestamps': timestamps,
-        'base_names': base_names,
-    }
-    _video_index_cache[taxi_id] = result
-    logger.info(f"Built video index for taxi_id={taxi_id}: {len(base_names)} entries")
-    return result
-
-
-def _get_video_index_for_taxi(taxi_id):
-    taxi_id = str(taxi_id)
-    if taxi_id in _video_index_cache:
-        return _video_index_cache[taxi_id]
-    return _build_video_index_for_taxi(taxi_id)
-
 def find_matching_videos(taxi_id, data_timestamp_unix_ms):
     """データのタイムスタンプに対応する動画を検索"""
-    taxi_id = str(taxi_id)
     data_time = unix_ms_to_datetime(data_timestamp_unix_ms)
-
-    video_index = _get_video_index_for_taxi(taxi_id)
-    if video_index is None:
+    taxi_folder = os.path.join(VIDEO_DIR, taxi_id)
+    
+    if not os.path.exists(taxi_folder):
         return None
-
-    taxi_folder = video_index['taxi_folder']
-    timestamps = video_index['timestamps']
-    base_names = video_index['base_names']
-    if not timestamps:
-        return None
-
-    # 条件: data_time が [video_timestamp-15s, video_timestamp+15s] に入る
-    lower = data_time - timedelta(seconds=15)
-    upper = data_time + timedelta(seconds=15)
-    left = bisect.bisect_left(timestamps, lower)
-    right = bisect.bisect_right(timestamps, upper)
-
-    for i in range(left, right):
-        video_timestamp = timestamps[i]
-        base_name = base_names[i]
-
+    
+    files = sorted([f for f in os.listdir(taxi_folder) 
+                    if f.endswith('.mp4') and f.startswith('EVT')])
+    
+    for filename in files:
+        video_timestamp = extract_video_timestamp(filename)
+        if video_timestamp is None:
+            continue
+        
         # 動画開始時刻 = タイムスタンプ - 15秒
         video_start = video_timestamp - timedelta(seconds=15)
         video_end = video_start + timedelta(seconds=30)  # Extended from 20 to 30 seconds
-
+        
         if video_start <= data_time <= video_end:
             offset = (data_time - video_start).total_seconds()
-
+            
+            base_name = filename.replace('_FRONT.mp4', '').replace('_INNER.mp4', '')
             front_file = f"{base_name}_FRONT.mp4"
             inner_file = f"{base_name}_INNER.mp4"
-
+            
             front_path = os.path.join(taxi_folder, front_file)
             inner_path = os.path.join(taxi_folder, inner_file)
-
-            has_front = os.path.exists(front_path)
-            has_inner = os.path.exists(inner_path)
+            
             result = {
                 'offset_seconds': offset,
                 'video_start_time': video_start,
                 'matched_timestamp': video_timestamp,
-                'front': f"/videos/{taxi_id}/{front_file}" if has_front else None,
-                'inner': f"/videos/{taxi_id}/{inner_file}" if has_inner else None,
-                'has_front': has_front,
-                'has_inner': has_inner
+                'front': f"/videos/{taxi_id}/{front_file}" if os.path.exists(front_path) else None,
+                'inner': f"/videos/{taxi_id}/{inner_file}" if os.path.exists(inner_path) else None,
+                'has_front': os.path.exists(front_path),
+                'has_inner': os.path.exists(inner_path)
             }
-
+            
             if result['front'] or result['inner']:
                 return result
-
+    
     return None
 
 def get_next_unannotated_sample():
@@ -257,42 +176,80 @@ def save_dataframe_auto():
     output_df.to_csv(CSV_OUTPUT_AUTO, index=False)
     logger.info(f"Auto-annotation results saved to {CSV_OUTPUT_AUTO}")
 
-
-def append_inference_log(event):
-    """推論過程ログをJSON Lines形式で保存する。"""
-    payload = {
-        'logged_at': datetime.now(JST).isoformat(),
-        **event,
+def append_inference_trace(payload):
+    """推論過程を JSONL に追記する"""
+    record = {
+        "logged_at": datetime.now(JST).isoformat(),
+        **payload
     }
-    with open(INFERENCE_LOG_PATH, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+    with open(INFERENCE_PROCESS_JSONL, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-
-def get_prediction_failure_reason(predicted_label, l2m_details):
-    """推論結果が保存可能かを判定し、失敗理由を返す。"""
-    if predicted_label is None:
-        return "Prediction returned None"
-
-    if isinstance(l2m_details, dict) and l2m_details.get('status') == 'failed':
-        return l2m_details.get('error') or 'L2M inference failed'
-
-    return None
+def log_prediction_trace(
+    annotator,
+    endpoint: str,
+    sample_id: int,
+    row,
+    video_path: Optional[str],
+    offset_seconds: Optional[float],
+    predicted_label: Optional[int],
+    success: bool,
+    error: Optional[str] = None
+):
+    """Annotator の最新詳細を使って sample 単位の推論情報を保存する"""
+    details = getattr(annotator, 'last_prediction_details', None) or {}
+    resolved_error = error or details.get("error")
+    if not success and not resolved_error:
+        resolved_error = "Prediction returned None"
+    append_inference_trace({
+        "endpoint": endpoint,
+        "sample_id": int(sample_id),
+        "taxi_id": row.get('taxi_id'),
+        "timestamp": int(row.get('timestamp')),
+        "video_path": video_path,
+        "offset_seconds": offset_seconds,
+        "sensor_data": {
+            "speed": float(row.get('speed', 0.0)),
+            "acc_x": float(row.get('acc_x', 0.0)),
+            "acc_y": float(row.get('acc_y', 0.0)),
+            "acc_z": float(row.get('acc_z', 0.0)),
+            "gyro_z": float(row.get('gyro_z', 0.0)),
+            "latitude": float(row.get('latitude', 0.0)),
+            "longitude": float(row.get('longitude', 0.0)),
+        },
+        "prompt_text": details.get("prompt_text"),
+        "generated_text": details.get("generated_text"),
+        "extracted_label": details.get("extracted_label"),
+        "predicted_label": predicted_label,
+        "speed_event_hint": details.get("speed_event_hint"),
+        "turn_event_hint": details.get("turn_event_hint"),
+        "candidate_labels": details.get("candidate_labels"),
+        "macro_candidate_codes": details.get("macro_candidate_codes"),
+        "macro_candidate_labels": details.get("macro_candidate_labels"),
+        "macro_prediction_code": details.get("macro_prediction_code"),
+        "macro_prediction_label": details.get("macro_prediction_label"),
+        "stage_traces": details.get("stage_traces"),
+        "trajectory_features": details.get("trajectory_features"),
+        "stage1_reason": details.get("stage1_reason"),
+        "fine_label_reason": details.get("fine_label_reason"),
+        "frame_indices": details.get("frame_indices"),
+        "visible_trajectory_points": details.get("visible_trajectory_points"),
+        "status": "success" if success else "failed",
+        "error": resolved_error,
+    })
 
 # ============ ルーティング ============
 
 @app.get("/", response_class=HTMLResponse)
 async def main_page(request: Request):
     """メインアノテーション画面"""
-    req_start = time.perf_counter()
     sample_id, row = get_next_unannotated_sample()
     
     if sample_id is None:
         return templates.TemplateResponse("completed.html", {"request": request})
     
     # 動画マッチング
-    match_start = time.perf_counter()
     match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
-    logger.info(f"main_page: video_match_elapsed={time.perf_counter() - match_start:.3f}s sample_id={sample_id}")
     
     if match_result is None:
         match_result = {
@@ -336,12 +293,12 @@ async def main_page(request: Request):
         'acc_y': float(row['acc_y']),
         'acc_z': float(row['acc_z']),
         'speed': float(row['speed']),
-        'brake': int(row['brake']),
-        'blinker_r': int(row['blinker_r']),
-        'blinker_l': int(row['blinker_l'])
+        'gyro_z': float(row['gyro_z']),
+        'latitude': float(row['latitude']),
+        'longitude': float(row['longitude'])
     }
     
-    response = templates.TemplateResponse("index.html", {
+    return templates.TemplateResponse("index.html", {
         "request": request,
         "sample_id": sample_id,
         "row": row.to_dict(),
@@ -353,8 +310,6 @@ async def main_page(request: Request):
         "event_info": event_info,
         "sensor_info": sensor_info
     })
-    logger.info(f"main_page: total_elapsed={time.perf_counter() - req_start:.3f}s sample_id={sample_id}")
-    return response
 
 @app.post("/annotate")
 async def annotate(
@@ -389,26 +344,18 @@ async def auto_annotate(sample_id: int = Form(...)):
     try:
         # Get sample data from auto dataframe
         row = df_auto[df_auto['sample_id'] == sample_id].iloc[0]
-        request_id = f"single-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
-        append_inference_log({
-            'request_id': request_id,
-            'endpoint': '/auto_annotate',
-            'phase': 'start',
-            'sample_id': int(sample_id),
-            'taxi_id': str(row['taxi_id']),
-            'timestamp': int(row['timestamp'])
-        })
         
         # Find matching video
         match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
         
         if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
-            append_inference_log({
-                'request_id': request_id,
-                'endpoint': '/auto_annotate',
-                'phase': 'video_not_found',
-                'sample_id': int(sample_id),
-                'taxi_id': str(row['taxi_id'])
+            append_inference_trace({
+                "endpoint": "/auto_annotate",
+                "sample_id": int(sample_id),
+                "taxi_id": row['taxi_id'],
+                "timestamp": int(row['timestamp']),
+                "status": "failed",
+                "error": "No video found"
             })
             return JSONResponse(
                 {"error": "No video found for this sample"},
@@ -432,46 +379,34 @@ async def auto_annotate(sample_id: int = Form(...)):
             'acc_y': float(row['acc_y']),
             'acc_z': float(row['acc_z']),
             'gyro_z': float(row['gyro_z']),
-            'brake': int(row['brake']),
-            'blinker_r': int(row['blinker_r']),
-            'blinker_l': int(row['blinker_l']),
-            'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
+            'latitude': float(row['latitude']),
+            'longitude': float(row['longitude'])
         }
-        append_inference_log({
-            'request_id': request_id,
-            'endpoint': '/auto_annotate',
-            'phase': 'predicting',
-            'sample_id': int(sample_id),
-            'video_path': video_path,
-            'offset_seconds': float(match_result['offset_seconds']),
-            'sensor_data': sensor_data
-        })
-
+        
         # Get annotator and predict
         annotator = get_annotator()
-        predicted_label, l2m_details = annotator.predict_action_with_details(
+        predicted_label = annotator.predict_action(
             video_path=video_path,
             sensor_data=sensor_data,
             start_time=match_result['offset_seconds'],
             sample_id=sample_id
         )
-
-        failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
-
-        if failure_reason is None:
+        log_prediction_trace(
+            annotator=annotator,
+            endpoint="/auto_annotate",
+            sample_id=sample_id,
+            row=row,
+            video_path=video_path,
+            offset_seconds=match_result['offset_seconds'],
+            predicted_label=predicted_label,
+            success=predicted_label is not None
+        )
+        
+        if predicted_label is not None:
             # Save prediction to auto dataframe
             idx = df_auto[df_auto['sample_id'] == sample_id].index[0]
             df_auto.at[idx, 'action_label'] = predicted_label
             save_dataframe_auto()
-            append_inference_log({
-                'request_id': request_id,
-                'endpoint': '/auto_annotate',
-                'phase': 'completed',
-                'sample_id': int(sample_id),
-                'predicted_label': int(predicted_label),
-                'status': 'success',
-                'l2m_details': l2m_details
-            })
             
             return JSONResponse({
                 "success": True,
@@ -479,27 +414,13 @@ async def auto_annotate(sample_id: int = Form(...)):
                 "predicted_label": int(predicted_label)
             })
         else:
-            append_inference_log({
-                'request_id': request_id,
-                'endpoint': '/auto_annotate',
-                'phase': 'completed',
-                'sample_id': int(sample_id),
-                'status': 'failed',
-                'error': failure_reason
-            })
+            details = getattr(annotator, 'last_prediction_details', None) or {}
             return JSONResponse(
-                {"error": failure_reason},
+                {"error": details.get("error") or "Prediction failed"},
                 status_code=500
             )
             
     except Exception as e:
-        append_inference_log({
-            'endpoint': '/auto_annotate',
-            'phase': 'exception',
-            'sample_id': int(sample_id),
-            'status': 'failed',
-            'error': str(e)
-        })
         logger.error(f"Auto-annotation error: {e}", exc_info=True)
         return JSONResponse(
             {"error": str(e)},
@@ -531,15 +452,6 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
         
         for idx, row in unannotated.iterrows():
             sample_id = row['sample_id']
-            request_id = f"batch-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
-            append_inference_log({
-                'request_id': request_id,
-                'endpoint': '/auto_annotate_batch',
-                'phase': 'start',
-                'sample_id': int(sample_id),
-                'taxi_id': str(row['taxi_id']),
-                'timestamp': int(row['timestamp'])
-            })
             
             try:
                 # Find matching video
@@ -547,12 +459,13 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_batch',
-                        'phase': 'video_not_found',
-                        'sample_id': int(sample_id),
-                        'taxi_id': str(row['taxi_id'])
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_batch",
+                        "sample_id": int(sample_id),
+                        "taxi_id": row['taxi_id'],
+                        "timestamp": int(row['timestamp']),
+                        "status": "failed",
+                        "error": "No video found"
                     })
                     results.append({
                         "sample_id": sample_id,
@@ -575,72 +488,53 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     'acc_y': float(row['acc_y']),
                     'acc_z': float(row['acc_z']),
                     'gyro_z': float(row['gyro_z']),
-                    'brake': int(row['brake']),
-                    'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l']),
-                    'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
+                    'latitude': float(row['latitude']),
+                    'longitude': float(row['longitude'])
                 }
-                append_inference_log({
-                    'request_id': request_id,
-                    'endpoint': '/auto_annotate_batch',
-                    'phase': 'predicting',
-                    'sample_id': int(sample_id),
-                    'video_path': video_path,
-                    'offset_seconds': float(match_result['offset_seconds']),
-                    'sensor_data': sensor_data
-                })
-
+                
                 # Predict
-                predicted_label, l2m_details = annotator.predict_action_with_details(
+                predicted_label = annotator.predict_action(
                     video_path=video_path,
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
                 )
-
-                failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
-
-                if failure_reason is None:
+                log_prediction_trace(
+                    annotator=annotator,
+                    endpoint="/auto_annotate_batch",
+                    sample_id=sample_id,
+                    row=row,
+                    video_path=video_path,
+                    offset_seconds=match_result['offset_seconds'],
+                    predicted_label=predicted_label,
+                    success=predicted_label is not None
+                )
+                
+                if predicted_label is not None:
                     # Save prediction to auto dataframe
                     df_auto.at[idx, 'action_label'] = predicted_label
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_batch',
-                        'phase': 'completed',
-                        'sample_id': int(sample_id),
-                        'predicted_label': int(predicted_label),
-                        'status': 'success',
-                        'l2m_details': l2m_details
-                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": True,
                         "predicted_label": int(predicted_label)
                     })
                 else:
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_batch',
-                        'phase': 'completed',
-                        'sample_id': int(sample_id),
-                        'status': 'failed',
-                        'error': failure_reason
-                    })
+                    details = getattr(annotator, 'last_prediction_details', None) or {}
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": failure_reason
+                        "error": details.get("error") or "Prediction returned None"
                     })
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
-                append_inference_log({
-                    'request_id': request_id,
-                    'endpoint': '/auto_annotate_batch',
-                    'phase': 'exception',
-                    'sample_id': int(sample_id),
-                    'status': 'failed',
-                    'error': str(e)
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_batch",
+                    "sample_id": int(sample_id),
+                    "taxi_id": row.get('taxi_id'),
+                    "timestamp": int(row.get('timestamp')),
+                    "status": "failed",
+                    "error": str(e)
                 })
                 results.append({
                     "sample_id": sample_id,
@@ -708,15 +602,6 @@ async def auto_annotate_all():
         
         for idx, (_, row) in enumerate(unannotated.iterrows()):
             sample_id = int(row['sample_id'])
-            request_id = f"all-{sample_id}-{int(datetime.now(JST).timestamp() * 1000)}"
-            append_inference_log({
-                'request_id': request_id,
-                'endpoint': '/auto_annotate_all',
-                'phase': 'start',
-                'sample_id': int(sample_id),
-                'taxi_id': str(row['taxi_id']),
-                'timestamp': int(row['timestamp'])
-            })
             try:
                 # Find matching video
                 match_result = find_matching_videos(
@@ -726,12 +611,13 @@ async def auto_annotate_all():
                 
                 if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
                     logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_all',
-                        'phase': 'video_not_found',
-                        'sample_id': int(sample_id),
-                        'taxi_id': str(row['taxi_id'])
+                    append_inference_trace({
+                        "endpoint": "/auto_annotate_all",
+                        "sample_id": sample_id,
+                        "taxi_id": row['taxi_id'],
+                        "timestamp": int(row['timestamp']),
+                        "status": "failed",
+                        "error": "No video found"
                     })
                     results.append({
                         "sample_id": sample_id,
@@ -753,43 +639,31 @@ async def auto_annotate_all():
                     'acc_y': float(row['acc_y']),
                     'acc_z': float(row['acc_z']),
                     'gyro_z': float(row['gyro_z']),
-                    'brake': int(row['brake']),
-                    'blinker_r': int(row['blinker_r']),
-                    'blinker_l': int(row['blinker_l']),
-                    'speed_diff': float(row['speed_diff']) if 'speed_diff' in row.index else 0.0
+                    'latitude': float(row['latitude']),
+                    'longitude': float(row['longitude'])
                 }
-                append_inference_log({
-                    'request_id': request_id,
-                    'endpoint': '/auto_annotate_all',
-                    'phase': 'predicting',
-                    'sample_id': int(sample_id),
-                    'video_path': video_path,
-                    'offset_seconds': float(match_result['offset_seconds']),
-                    'sensor_data': sensor_data
-                })
-
+                
                 # Predict action
-                predicted_label, l2m_details = annotator.predict_action_with_details(
+                predicted_label = annotator.predict_action(
                     video_path=video_path,
                     sensor_data=sensor_data,
                     start_time=match_result['offset_seconds'],
                     sample_id=sample_id
                 )
-
-                failure_reason = get_prediction_failure_reason(predicted_label, l2m_details)
-
-                if failure_reason is None:
+                log_prediction_trace(
+                    annotator=annotator,
+                    endpoint="/auto_annotate_all",
+                    sample_id=sample_id,
+                    row=row,
+                    video_path=video_path,
+                    offset_seconds=match_result['offset_seconds'],
+                    predicted_label=predicted_label,
+                    success=predicted_label is not None
+                )
+                
+                if predicted_label is not None:
                     # Save to auto dataframe
                     df_auto.loc[df_auto['sample_id'] == sample_id, 'action_label'] = predicted_label
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_all',
-                        'phase': 'completed',
-                        'sample_id': int(sample_id),
-                        'predicted_label': int(predicted_label),
-                        'status': 'success',
-                        'l2m_details': l2m_details
-                    })
                     results.append({
                         "sample_id": sample_id,
                         "success": True,
@@ -797,18 +671,11 @@ async def auto_annotate_all():
                     })
                     logger.info(f"Sample {sample_id}: predicted label {predicted_label}")
                 else:
-                    append_inference_log({
-                        'request_id': request_id,
-                        'endpoint': '/auto_annotate_all',
-                        'phase': 'completed',
-                        'sample_id': int(sample_id),
-                        'status': 'failed',
-                        'error': failure_reason
-                    })
+                    details = getattr(annotator, 'last_prediction_details', None) or {}
                     results.append({
                         "sample_id": sample_id,
                         "success": False,
-                        "error": failure_reason
+                        "error": details.get("error") or "Prediction returned None"
                     })
                 
                 # Progress logging
@@ -817,13 +684,13 @@ async def auto_annotate_all():
                     
             except Exception as e:
                 logger.error(f"Error processing sample {sample_id}: {e}")
-                append_inference_log({
-                    'request_id': request_id,
-                    'endpoint': '/auto_annotate_all',
-                    'phase': 'exception',
-                    'sample_id': int(sample_id),
-                    'status': 'failed',
-                    'error': str(e)
+                append_inference_trace({
+                    "endpoint": "/auto_annotate_all",
+                    "sample_id": sample_id,
+                    "taxi_id": row.get('taxi_id'),
+                    "timestamp": int(row.get('timestamp')),
+                    "status": "failed",
+                    "error": str(e)
                 })
                 results.append({
                     "sample_id": sample_id,
