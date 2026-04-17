@@ -24,6 +24,8 @@ MAX_IMAGE_SIZE = 720  # Ver.4 レポートに合わせて 720p
 # L2M+CoT Settings
 USE_L2M_COT = False  # Ver.4 baseline は direct classification
 USE_VLM_DIRECT = False  # direct path は VLM を使わず deterministic classifier に切り替える
+USE_SENSOR_ONLY_BASELINE = True  # 動画を使わずセンサー値だけで 11分類する baseline
+PROMPT_VERSION = "sensor_only_v1_rule_baseline"
 
 # Generation Optimization Settings (速度最適化設定)
 # これらの設定を調整することで、機能を維持しながら推論速度を向上できます

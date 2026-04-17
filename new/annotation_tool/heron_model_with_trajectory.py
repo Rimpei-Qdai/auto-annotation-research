@@ -40,7 +40,9 @@ from config import (
     ENABLE_FLASH_ATTENTION,
     USE_L2M_COT,
     USE_VLM_DIRECT,
+    USE_SENSOR_ONLY_BASELINE,
     MAX_NEW_TOKENS_STANDARD,
+    PROMPT_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -628,6 +630,100 @@ class HeronAnnotatorWithTrajectory:
         reason["rule"] = "default_misc"
         return 0, reason
 
+    def _classify_sensor_only_label(
+        self,
+        sensor_data: Dict[str, Any],
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Classify a single 11-class label from sensor values only."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        abs_gyro = abs(gyro_z)
+
+        reason = {
+            "speed_kmh": speed,
+            "acc_x": acc_x,
+            "gyro_z": gyro_z,
+            "abs_gyro_z": abs_gyro,
+        }
+
+        # Very low speed: stop/start/misc around standstill
+        if speed <= 1.5:
+            if acc_x >= 0.18:
+                reason["rule"] = "standstill_start"
+                return 5, reason
+            reason["rule"] = "standstill_stop"
+            return 4, reason
+
+        # Strong yaw at modest speed can indicate a U-turn-like maneuver.
+        if abs_gyro >= 0.45 and speed <= 18.0:
+            reason["rule"] = "strong_yaw_uturn"
+            return 10, reason
+
+        # Turn / lane change decisions from yaw rate only.
+        if abs_gyro >= 0.16:
+            reason["rule"] = "strong_yaw_turn"
+            return (6 if gyro_z > 0 else 7), reason
+
+        if abs_gyro >= 0.07 and speed >= 15.0:
+            reason["rule"] = "moderate_yaw_lane_change"
+            return (8 if gyro_z > 0 else 9), reason
+
+        # Straight speed-event classes.
+        if acc_x >= 0.25:
+            reason["rule"] = "straight_acceleration"
+            return 2, reason
+
+        if acc_x <= -0.35:
+            if speed <= 6.0:
+                reason["rule"] = "slow_decel_stop_like"
+                return 4, reason
+            reason["rule"] = "straight_deceleration"
+            return 3, reason
+
+        # Slight decel near zero motion often behaves like stop-like.
+        if speed <= 4.0 and acc_x < -0.12:
+            reason["rule"] = "low_speed_stop_like"
+            return 4, reason
+
+        if abs(acc_x) <= 0.08 and abs_gyro <= 0.03:
+            reason["rule"] = "steady_constant_speed"
+            return 1, reason
+
+        if acc_x < 0:
+            reason["rule"] = "fallback_deceleration"
+            return 3, reason
+
+        if acc_x > 0:
+            reason["rule"] = "fallback_acceleration"
+            return 2, reason
+
+        reason["rule"] = "fallback_constant_speed"
+        return 1, reason
+
+    def _predict_sensor_only_baseline(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Predict a single 11-class label from sensor values only."""
+        action_label, sensor_rule_reason = self._classify_sensor_only_label(sensor_data)
+        self._last_prediction_details = {
+            **(self._last_prediction_details or {}),
+            "prompt_version": PROMPT_VERSION,
+            "visual_input_mode": "sensor_only",
+            "predicted_label": action_label,
+            "extracted_label": action_label,
+            "generated_text": None,
+            "prompt_text": None,
+            "macro_prediction_code": FINE_LABEL_TO_MACRO_GROUP.get(action_label),
+            "macro_prediction_label": MACRO_GROUP_LABELS.get(FINE_LABEL_TO_MACRO_GROUP.get(action_label)),
+            "sensor_rule_reason": sensor_rule_reason,
+            "error": None,
+        }
+        logger.info(f"[Sensor-only baseline] Predicted action label: {action_label}")
+        return action_label
+
     def _determine_rotation_direction(
         self,
         gyro_z: float,
@@ -1164,8 +1260,14 @@ class HeronAnnotatorWithTrajectory:
             "sensor_data": dict(sensor_data),
             "start_time": start_time,
             "sample_id": sample_id,
-            "mode": "l2m" if use_l2m else ("direct_vlm" if USE_VLM_DIRECT else "direct_deterministic")
+            "mode": "sensor_only_rule_baseline" if USE_SENSOR_ONLY_BASELINE else ("l2m" if use_l2m else ("direct_vlm" if USE_VLM_DIRECT else "direct_deterministic"))
         }
+
+        if USE_SENSOR_ONLY_BASELINE:
+            return self._predict_sensor_only_baseline(
+                sensor_data=sensor_data,
+                sample_id=sample_id,
+            )
         
         # L2M+CoTパイプラインを使用する場合
         if use_l2m:

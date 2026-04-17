@@ -11,6 +11,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from config import USE_SENSOR_ONLY_BASELINE
+
 JST = timezone(timedelta(hours=9))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ANNOTATION_LOG = os.path.join(BASE_DIR, 'annotation.log')
@@ -31,7 +33,7 @@ logger = logging.getLogger(__name__)
 try:
     from heron_model_with_trajectory import get_annotator
     HERON_ENABLED = True
-    logger.info("Using trajectory-enabled annotator (Ver.4 baseline mode)")
+    logger.info("Using sensor-only baseline annotator" if USE_SENSOR_ONLY_BASELINE else "Using trajectory-enabled annotator (Ver.4 baseline mode)")
 except ImportError as e:
     HERON_ENABLED = False
     logger.warning(f"Heron auto-annotation disabled: {e}")
@@ -232,6 +234,7 @@ def log_prediction_trace(
         "trajectory_features": details.get("trajectory_features"),
         "stage1_reason": details.get("stage1_reason"),
         "fine_label_reason": details.get("fine_label_reason"),
+        "sensor_rule_reason": details.get("sensor_rule_reason"),
         "frame_indices": details.get("frame_indices"),
         "visible_trajectory_points": details.get("visible_trajectory_points"),
         "status": "success" if success else "failed",
@@ -344,33 +347,33 @@ async def auto_annotate(sample_id: int = Form(...)):
     try:
         # Get sample data from auto dataframe
         row = df_auto[df_auto['sample_id'] == sample_id].iloc[0]
-        
-        # Find matching video
-        match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
-        
-        if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
-            append_inference_trace({
-                "endpoint": "/auto_annotate",
-                "sample_id": int(sample_id),
-                "taxi_id": row['taxi_id'],
-                "timestamp": int(row['timestamp']),
-                "status": "failed",
-                "error": "No video found"
-            })
-            return JSONResponse(
-                {"error": "No video found for this sample"},
-                status_code=404
-            )
-        
-        # Use front camera if available, otherwise inner
-        video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
-        # video_url is like "/videos/taxi.../file.mp4", need to replace /videos with actual VIDEO_DIR
-        video_relative_path = video_url.replace('/videos/', '')
-        video_path = os.path.join(VIDEO_DIR, video_relative_path)
-        video_path = os.path.normpath(video_path)
-        logger.info(f"Video URL: {video_url}")
-        logger.info(f"Video path for prediction: {video_path}")
-        logger.info(f"Video file exists: {os.path.exists(video_path)}")
+        video_path = None
+        offset_seconds = None
+        if not USE_SENSOR_ONLY_BASELINE:
+            match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
+            
+            if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
+                append_inference_trace({
+                    "endpoint": "/auto_annotate",
+                    "sample_id": int(sample_id),
+                    "taxi_id": row['taxi_id'],
+                    "timestamp": int(row['timestamp']),
+                    "status": "failed",
+                    "error": "No video found"
+                })
+                return JSONResponse(
+                    {"error": "No video found for this sample"},
+                    status_code=404
+                )
+            
+            video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
+            video_relative_path = video_url.replace('/videos/', '')
+            video_path = os.path.join(VIDEO_DIR, video_relative_path)
+            video_path = os.path.normpath(video_path)
+            offset_seconds = match_result['offset_seconds']
+            logger.info(f"Video URL: {video_url}")
+            logger.info(f"Video path for prediction: {video_path}")
+            logger.info(f"Video file exists: {os.path.exists(video_path)}")
         
         # Prepare sensor data
         sensor_data = {
@@ -388,7 +391,7 @@ async def auto_annotate(sample_id: int = Form(...)):
         predicted_label = annotator.predict_action(
             video_path=video_path,
             sensor_data=sensor_data,
-            start_time=match_result['offset_seconds'],
+            start_time=offset_seconds or 0.0,
             sample_id=sample_id
         )
         log_prediction_trace(
@@ -397,7 +400,7 @@ async def auto_annotate(sample_id: int = Form(...)):
             sample_id=sample_id,
             row=row,
             video_path=video_path,
-            offset_seconds=match_result['offset_seconds'],
+            offset_seconds=offset_seconds,
             predicted_label=predicted_label,
             success=predicted_label is not None
         )
@@ -454,32 +457,33 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
             sample_id = row['sample_id']
             
             try:
-                # Find matching video
-                match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
-                
-                if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
-                    logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
-                    append_inference_trace({
-                        "endpoint": "/auto_annotate_batch",
-                        "sample_id": int(sample_id),
-                        "taxi_id": row['taxi_id'],
-                        "timestamp": int(row['timestamp']),
-                        "status": "failed",
-                        "error": "No video found"
-                    })
-                    results.append({
-                        "sample_id": sample_id,
-                        "success": False,
-                        "error": "No video found"
-                    })
-                    continue
-                
-                # Use front camera if available
-                video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
-                # video_url is like "/videos/taxi.../file.mp4", need to replace /videos with actual VIDEO_DIR
-                video_relative_path = video_url.replace('/videos/', '')
-                video_path = os.path.join(VIDEO_DIR, video_relative_path)
-                video_path = os.path.normpath(video_path)
+                video_path = None
+                offset_seconds = None
+                if not USE_SENSOR_ONLY_BASELINE:
+                    match_result = find_matching_videos(row['taxi_id'], row['timestamp'])
+                    
+                    if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
+                        logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                        append_inference_trace({
+                            "endpoint": "/auto_annotate_batch",
+                            "sample_id": int(sample_id),
+                            "taxi_id": row['taxi_id'],
+                            "timestamp": int(row['timestamp']),
+                            "status": "failed",
+                            "error": "No video found"
+                        })
+                        results.append({
+                            "sample_id": sample_id,
+                            "success": False,
+                            "error": "No video found"
+                        })
+                        continue
+                    
+                    video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
+                    video_relative_path = video_url.replace('/videos/', '')
+                    video_path = os.path.join(VIDEO_DIR, video_relative_path)
+                    video_path = os.path.normpath(video_path)
+                    offset_seconds = match_result['offset_seconds']
                 
                 # Prepare sensor data
                 sensor_data = {
@@ -496,7 +500,7 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                 predicted_label = annotator.predict_action(
                     video_path=video_path,
                     sensor_data=sensor_data,
-                    start_time=match_result['offset_seconds'],
+                    start_time=offset_seconds or 0.0,
                     sample_id=sample_id
                 )
                 log_prediction_trace(
@@ -505,7 +509,7 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     sample_id=sample_id,
                     row=row,
                     video_path=video_path,
-                    offset_seconds=match_result['offset_seconds'],
+                    offset_seconds=offset_seconds,
                     predicted_label=predicted_label,
                     success=predicted_label is not None
                 )
@@ -603,34 +607,36 @@ async def auto_annotate_all():
         for idx, (_, row) in enumerate(unannotated.iterrows()):
             sample_id = int(row['sample_id'])
             try:
-                # Find matching video
-                match_result = find_matching_videos(
-                    row['taxi_id'],
-                    row['timestamp']
-                )
-                
-                if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
-                    logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
-                    append_inference_trace({
-                        "endpoint": "/auto_annotate_all",
-                        "sample_id": sample_id,
-                        "taxi_id": row['taxi_id'],
-                        "timestamp": int(row['timestamp']),
-                        "status": "failed",
-                        "error": "No video found"
-                    })
-                    results.append({
-                        "sample_id": sample_id,
-                        "success": False,
-                        "error": "No video found"
-                    })
-                    continue
-                
-                # Get video path
-                video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
-                video_relative_path = video_url.replace('/videos/', '')
-                video_path = os.path.join(VIDEO_DIR, video_relative_path)
-                video_path = os.path.normpath(video_path)
+                video_path = None
+                offset_seconds = None
+                if not USE_SENSOR_ONLY_BASELINE:
+                    match_result = find_matching_videos(
+                        row['taxi_id'],
+                        row['timestamp']
+                    )
+                    
+                    if match_result is None or not (match_result['has_front'] or match_result['has_inner']):
+                        logger.warning(f"Sample {sample_id}: No video found for taxi_id={row['taxi_id']}, timestamp={row['timestamp']}")
+                        append_inference_trace({
+                            "endpoint": "/auto_annotate_all",
+                            "sample_id": sample_id,
+                            "taxi_id": row['taxi_id'],
+                            "timestamp": int(row['timestamp']),
+                            "status": "failed",
+                            "error": "No video found"
+                        })
+                        results.append({
+                            "sample_id": sample_id,
+                            "success": False,
+                            "error": "No video found"
+                        })
+                        continue
+                    
+                    video_url = match_result['front'] if match_result['has_front'] else match_result['inner']
+                    video_relative_path = video_url.replace('/videos/', '')
+                    video_path = os.path.join(VIDEO_DIR, video_relative_path)
+                    video_path = os.path.normpath(video_path)
+                    offset_seconds = match_result['offset_seconds']
                 
                 # Prepare sensor data
                 sensor_data = {
@@ -647,7 +653,7 @@ async def auto_annotate_all():
                 predicted_label = annotator.predict_action(
                     video_path=video_path,
                     sensor_data=sensor_data,
-                    start_time=match_result['offset_seconds'],
+                    start_time=offset_seconds or 0.0,
                     sample_id=sample_id
                 )
                 log_prediction_trace(
@@ -656,7 +662,7 @@ async def auto_annotate_all():
                     sample_id=sample_id,
                     row=row,
                     video_path=video_path,
-                    offset_seconds=match_result['offset_seconds'],
+                    offset_seconds=offset_seconds,
                     predicted_label=predicted_label,
                     success=predicted_label is not None
                 )
