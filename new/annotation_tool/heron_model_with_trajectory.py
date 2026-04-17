@@ -5,7 +5,10 @@ Supports trajectory drawing on 4 frames for auto-annotation
 """
 
 import os
+import time
+import tempfile
 import logging
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image
 import cv2
@@ -41,6 +44,9 @@ from config import (
     USE_L2M_COT,
     USE_VLM_DIRECT,
     MAX_NEW_TOKENS_STANDARD,
+    SIMPLE_VIDEO_PROMPT_TEMPLATE,
+    VIDEO_CLIP_DURATION_SECONDS,
+    PROMPT_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -198,24 +204,34 @@ class HeronAnnotatorWithTrajectory:
                 self._device = torch.device("cpu")
                 logger.info("Using CPU")
             
-            # Check if Qwen2-VL model
-            is_qwen = "qwen" in HERON_MODEL_ID.lower()
+            model_id_lower = HERON_MODEL_ID.lower()
+            is_qwen3 = "qwen3-vl" in model_id_lower
+            is_qwen2 = "qwen2-vl" in model_id_lower
+            torch_dtype = getattr(torch, TORCH_DTYPE) if isinstance(TORCH_DTYPE, str) else TORCH_DTYPE
             
-            if is_qwen:
-                # Qwen2-VL specific loading
-                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+            if is_qwen3:
+                from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+                self._model = Qwen3VLForConditionalGeneration.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=TORCH_DTYPE,
+                    torch_dtype=torch_dtype,
                     device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
-                logger.info(f"Qwen2-VL model loaded with multi-frame support (memory optimized)")
+                logger.info("Qwen3-VL model loaded for direct video baseline")
+            elif is_qwen2:
+                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    HERON_MODEL_ID,
+                    torch_dtype=torch_dtype,
+                    device_map="auto" if USE_GPU else None
+                )
+                self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
+                logger.info("Qwen2-VL model loaded")
             else:
                 # Standard Heron model loading
                 self._model = AutoModelForCausalLM.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=TORCH_DTYPE,
+                    torch_dtype=torch_dtype,
                     trust_remote_code=True,
                     device_map="auto" if USE_GPU else None
                 )
@@ -1130,6 +1146,240 @@ class HeronAnnotatorWithTrajectory:
             skip_special_tokens=True
         )[0]
         return text_prompt, generated_text
+
+    def _compute_video_window_bounds(
+        self,
+        center_time: float,
+        total_duration: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Tuple[float, float]:
+        """Compute a centered time window clipped to the source video duration."""
+        if total_duration <= 0:
+            return 0.0, max(window_duration, 0.0)
+
+        clamped_center = min(max(center_time, 0.0), total_duration)
+        usable_window = min(window_duration, total_duration)
+        half_window = usable_window / 2.0
+
+        window_start = max(0.0, clamped_center - half_window)
+        window_end = min(total_duration, clamped_center + half_window)
+
+        current_duration = window_end - window_start
+        if current_duration < usable_window:
+            if window_start <= 0.0:
+                window_end = min(total_duration, usable_window)
+            elif window_end >= total_duration:
+                window_start = max(0.0, total_duration - usable_window)
+
+        return float(window_start), float(window_end)
+
+    def _create_centered_video_clip(
+        self,
+        video_path: str,
+        center_time: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Dict[str, Any]:
+        """Create a temporary clip around the annotation timestamp using the source fps."""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+
+        writer = None
+        clip_path = None
+        frames_written = 0
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps <= 0:
+                fps = 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            total_duration = total_frames / fps if total_frames > 0 else 0.0
+
+            window_start, window_end = self._compute_video_window_bounds(
+                center_time=center_time,
+                total_duration=total_duration,
+                window_duration=window_duration,
+            )
+            start_frame = max(0, int(np.floor(window_start * fps)))
+            end_frame_exclusive = min(total_frames, int(np.ceil(window_end * fps)))
+
+            if end_frame_exclusive <= start_frame:
+                end_frame_exclusive = min(total_frames, start_frame + max(1, int(round(fps))))
+
+            fd, clip_path = tempfile.mkstemp(prefix="qwen3vl_clip_", suffix=".mp4")
+            os.close(fd)
+            writer = cv2.VideoWriter(
+                clip_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
+            if not writer.isOpened():
+                raise ValueError(f"Failed to create temporary clip: {clip_path}")
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(start_frame, end_frame_exclusive):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                writer.write(frame)
+                frames_written += 1
+
+            if frames_written == 0:
+                raise ValueError("Failed to write any frames to temporary clip")
+
+            return {
+                "clip_path": clip_path,
+                "window_start_seconds": window_start,
+                "window_end_seconds": window_end,
+                "clip_duration_seconds": max(0.0, window_end - window_start),
+                "fps": fps,
+                "source_total_duration_seconds": total_duration,
+                "source_total_frames": total_frames,
+                "clip_frame_count": frames_written,
+                "source_frame_start": start_frame,
+                "source_frame_end_exclusive": end_frame_exclusive,
+            }
+        except Exception:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+            raise
+        finally:
+            if writer is not None:
+                writer.release()
+            cap.release()
+
+    def _serialize_video_metadata(self, value: Any) -> Any:
+        """Convert processor video metadata into JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._serialize_video_metadata(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_video_metadata(v) for v in value]
+        if hasattr(value, "__dict__"):
+            return {
+                str(k): self._serialize_video_metadata(v)
+                for k, v in value.__dict__.items()
+                if not k.startswith("_")
+            }
+        return str(value)
+
+    def _run_prompt_on_video_clip(
+        self,
+        clip_path: str,
+        prompt_text: str,
+        max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Run a single prompt on a video clip path."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": str(clip_path)},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        text_prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        processor_outputs = self.processor(
+            text=[text_prompt],
+            videos=[Path(clip_path)],
+            padding=True,
+            return_tensors="pt",
+            return_metadata=True,
+        )
+        video_metadata = processor_outputs.pop("video_metadata", None)
+        inputs = processor_outputs.to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_ids = output_ids[:, prompt_length:]
+        if generated_ids.shape[1] == 0:
+            generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        else:
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        metadata = {
+            "video_metadata": self._serialize_video_metadata(video_metadata),
+            "video_grid_thw": inputs.get("video_grid_thw").detach().cpu().tolist() if "video_grid_thw" in inputs else None,
+        }
+        return text_prompt, generated_text, metadata
+
+    def _predict_simple_video_baseline(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        center_time: float = 0.0,
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Predict a single 11-class label from a centered 6-second raw video clip."""
+        clip_info = self._create_centered_video_clip(
+            video_path=video_path,
+            center_time=center_time,
+            window_duration=VIDEO_CLIP_DURATION_SECONDS,
+        )
+        clip_path = clip_info["clip_path"]
+        prompt_text = SIMPLE_VIDEO_PROMPT_TEMPLATE
+        started_at = time.perf_counter()
+
+        try:
+            final_prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=prompt_text,
+                max_new_tokens=MAX_NEW_TOKENS_STANDARD,
+            )
+            predicted_label = self._extract_action_label(generated_text)
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            self._last_prediction_details = {
+                **(self._last_prediction_details or {}),
+                "prompt_version": PROMPT_VERSION,
+                "prompt_text": final_prompt_text,
+                "generated_text": generated_text,
+                "extracted_label": predicted_label,
+                "predicted_label": predicted_label,
+                "video_input_mode": "raw_video_clip",
+                "video_window_start_seconds": clip_info["window_start_seconds"],
+                "video_window_end_seconds": clip_info["window_end_seconds"],
+                "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
+                "video_clip_fps": clip_info["fps"],
+                "video_clip_frame_count": clip_info["clip_frame_count"],
+                "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
+                "source_frame_start": clip_info["source_frame_start"],
+                "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
+                "video_processor_metadata": processor_metadata["video_metadata"],
+                "video_grid_thw": processor_metadata["video_grid_thw"],
+                "inference_latency_ms": latency_ms,
+                "error": None if predicted_label is not None else "Failed to extract 11-class label from model output",
+            }
+
+            if predicted_label is not None:
+                logger.info(f"[Simple video baseline] Predicted action label: {predicted_label}")
+            else:
+                logger.warning("[Simple video baseline] Failed to extract 11-class label from model output")
+            return predicted_label
+        finally:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
     
     def predict_action(
         self,
@@ -1152,28 +1402,23 @@ class HeronAnnotatorWithTrajectory:
         Returns:
             Predicted action label (0-10) or None if prediction fails
         """
-        if (use_l2m or (use_l2m is None and USE_L2M_COT) or USE_VLM_DIRECT) and not self.is_loaded:
+        if not self.is_loaded:
             self.load_model()
-        
-        # use_l2mが指定されていない場合はconfig設定を使用
-        if use_l2m is None:
-            use_l2m = USE_L2M_COT
 
         self._last_prediction_details = {
             "video_path": video_path,
             "sensor_data": dict(sensor_data),
-            "start_time": start_time,
+            "annotation_center_time_seconds": start_time,
             "sample_id": sample_id,
-            "mode": "l2m" if use_l2m else ("direct_vlm" if USE_VLM_DIRECT else "direct_deterministic")
+            "mode": "simple_video_direct_11class",
         }
-        
-        # L2M+CoTパイプラインを使用する場合
-        if use_l2m:
-            logger.info("Using L2M+CoT pipeline for prediction")
-            return self._predict_with_l2m(video_path, sensor_data, start_time, sample_id)
-        
-        # Use multi-frame prediction with trajectory
-        return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
+
+        return self._predict_simple_video_baseline(
+            video_path=video_path,
+            sensor_data=sensor_data,
+            center_time=start_time,
+            sample_id=sample_id,
+        )
     
     def _predict_with_l2m(
         self,
@@ -1584,12 +1829,12 @@ _annotator_instance = None
 def get_annotator() -> HeronAnnotatorWithTrajectory:
     """
     Get singleton instance of HeronAnnotatorWithTrajectory
-    Automatically saves trajectory frames to 'auto_annotation_trajectory_frames' directory
+    Simple video baseline does not save trajectory frames.
     """
     global _annotator_instance
     if _annotator_instance is None:
         _annotator_instance = HeronAnnotatorWithTrajectory(
-            save_trajectory_frames=True,
+            save_trajectory_frames=False,
             trajectory_output_dir="auto_annotation_trajectory_frames"
         )
     return _annotator_instance
