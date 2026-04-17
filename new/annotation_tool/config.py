@@ -71,9 +71,6 @@ PROMPT_VERSION = "summary_v3_rag_feedback"
 
 USE_RAG_FEEDBACK = True
 RAG_TOP_K = 3
-RAG_MIN_CASES = 2
-RAG_MAX_DISTANCE = 2.5
-RAG_REQUIRE_DIVERSE_MACROS = True
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
