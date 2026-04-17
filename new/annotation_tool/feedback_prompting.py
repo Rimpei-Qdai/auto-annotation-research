@@ -4,9 +4,9 @@ Prompt builders for RAG-style feedback inference.
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Dict, Iterable
 
-from config import MACRO_OUTPUT_NAMES, RAG_FEEDBACK_PROMPT_TEMPLATE
+from config import RAG_FEEDBACK_PROMPT_TEMPLATE
 from retrieval_index import RetrievedCase
 
 
@@ -31,13 +31,10 @@ def format_retrieved_cases_block(retrieved_cases: Iterable[RetrievedCase]) -> st
 
 def build_rag_feedback_prompt(
     *,
-    initial_macro_choice: str,
     query_features: dict,
     retrieved_cases: Iterable[RetrievedCase],
 ) -> str:
     return RAG_FEEDBACK_PROMPT_TEMPLATE.format(
-        initial_macro_choice=initial_macro_choice,
-        initial_macro_name=MACRO_OUTPUT_NAMES.get(initial_macro_choice, initial_macro_choice),
         speed=float(query_features.get("speed_kmh", 0.0)),
         acc_x=float(query_features.get("acc_x", 0.0)),
         gyro_z=float(query_features.get("gyro_z", 0.0)),
@@ -46,3 +43,16 @@ def build_rag_feedback_prompt(
         heading_delta_rad=float(query_features.get("heading_delta_rad", 0.0)),
         retrieved_cases_block=format_retrieved_cases_block(retrieved_cases),
     )
+
+
+def compute_retrieval_vote_scores(
+    retrieved_cases: Iterable[RetrievedCase],
+) -> Dict[str, float]:
+    scores = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    for retrieved in retrieved_cases:
+        macro_choice = retrieved.case.get("macro_choice")
+        if macro_choice not in scores:
+            continue
+        # Closer cases should dominate; keep the function simple and inspectable.
+        scores[macro_choice] += 1.0 / (float(retrieved.distance) + 1e-3)
+    return scores

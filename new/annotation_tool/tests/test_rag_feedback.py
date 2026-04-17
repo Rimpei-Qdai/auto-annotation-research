@@ -9,7 +9,7 @@ if str(ANNOTATION_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(ANNOTATION_TOOL_DIR))
 
 from case_memory import CaseMemory, _manual_csv_candidates, _sample_csv_candidates  # noqa: E402
-from feedback_prompting import build_rag_feedback_prompt  # noqa: E402
+from feedback_prompting import build_rag_feedback_prompt, compute_retrieval_vote_scores  # noqa: E402
 from retrieval_index import NumericCaseRetriever, RetrievedCase, compute_retrieval_features  # noqa: E402
 
 
@@ -157,7 +157,6 @@ class FeedbackPromptingTests(unittest.TestCase):
         ]
 
         prompt = build_rag_feedback_prompt(
-            initial_macro_choice="A",
             query_features=query,
             retrieved_cases=retrieved,
         )
@@ -165,6 +164,31 @@ class FeedbackPromptingTests(unittest.TestCase):
         self.assertIn("sample 42", prompt)
         self.assertIn("停止", prompt)
         self.assertIn("A/B/C/D", prompt)
+        self.assertNotIn("初回 macro 判定", prompt)
+
+    def test_retrieval_vote_scores_prefer_closer_support(self):
+        retrieved = [
+            RetrievedCase(
+                sample_id=1,
+                distance=0.20,
+                case={"macro_choice": "A"},
+            ),
+            RetrievedCase(
+                sample_id=2,
+                distance=0.25,
+                case={"macro_choice": "A"},
+            ),
+            RetrievedCase(
+                sample_id=3,
+                distance=0.90,
+                case={"macro_choice": "D"},
+            ),
+        ]
+
+        scores = compute_retrieval_vote_scores(retrieved)
+
+        self.assertGreater(scores["A"], scores["D"])
+        self.assertGreater(scores["D"], 0.0)
 
 
 class CaseMemoryTests(unittest.TestCase):

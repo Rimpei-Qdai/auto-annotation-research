@@ -21,7 +21,7 @@ from visual_prompting import TrajectoryVisualizer
 from driving_graph import MacroGraphVerifier
 from case_memory import CaseMemory
 from retrieval_index import NumericCaseRetriever, compute_retrieval_features
-from feedback_prompting import build_rag_feedback_prompt
+from feedback_prompting import build_rag_feedback_prompt, compute_retrieval_vote_scores
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -51,6 +51,7 @@ from config import (
     PROMPT_VERSION,
     USE_RAG_FEEDBACK,
     RAG_TOP_K,
+    RAG_VLM_CHOICE_BONUS,
 )
 
 logger = logging.getLogger(__name__)
@@ -906,12 +907,11 @@ class HeronAnnotatorWithTrajectory:
             return initial_macro_choice
 
         rag_prompt = build_rag_feedback_prompt(
-            initial_macro_choice=initial_macro_choice,
             query_features=query_features,
             retrieved_cases=retrieved_cases,
         )
         rag_generated = self._run_prompt_on_frames(model_frames, rag_prompt)
-        rag_choice = self._extract_choice(
+        rag_vlm_choice = self._extract_choice(
             rag_generated,
             ["A", "B", "C", "D"],
             alias_to_choice={
@@ -921,6 +921,18 @@ class HeronAnnotatorWithTrajectory:
                 "その他": "D",
             },
         )
+        retrieval_vote_scores = compute_retrieval_vote_scores(retrieved_cases)
+        retrieval_vote_choice = max(
+            retrieval_vote_scores.items(),
+            key=lambda item: (item[1], item[0]),
+        )[0]
+        rerank_scores = dict(retrieval_vote_scores)
+        if rag_vlm_choice in rerank_scores:
+            rerank_scores[rag_vlm_choice] += RAG_VLM_CHOICE_BONUS
+        rag_choice = max(
+            rerank_scores.items(),
+            key=lambda item: (item[1], item[0]),
+        )[0]
 
         self.last_prediction_details["rag_used"] = True
         self.last_prediction_details["rag_skip_reason"] = None
@@ -941,10 +953,11 @@ class HeronAnnotatorWithTrajectory:
         ]
         self.last_prediction_details["rag_prompt_text"] = rag_prompt
         self.last_prediction_details["rag_generated_text"] = rag_generated
+        self.last_prediction_details["rag_vlm_choice"] = rag_vlm_choice
+        self.last_prediction_details["rag_retrieval_vote_scores"] = retrieval_vote_scores
+        self.last_prediction_details["rag_retrieval_vote_choice"] = retrieval_vote_choice
+        self.last_prediction_details["rag_rerank_scores"] = rerank_scores
         self.last_prediction_details["rag_choice"] = rag_choice
-
-        if rag_choice is None:
-            return initial_macro_choice
         return rag_choice
 
     def _finalize_with_rag_and_graph(
