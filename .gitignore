@@ -9,3 +9,4 @@ new/annotation_tool/annotation.log
 new/annotation_tool/inference_process.jsonl
 new/annotation_tool/tests/__pycache__/
 new/annotation_tool/auto_annotation_trajectory_frames/
+new/annotation_tool/.env.kiwi

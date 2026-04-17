@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 try:
     from heron_model_with_trajectory import get_annotator
     HERON_ENABLED = True
-    logger.info("Using trajectory-enabled annotator (Ver.4 baseline mode)")
+    logger.info("Using simple video baseline annotator")
 except ImportError as e:
     HERON_ENABLED = False
     logger.warning(f"Heron auto-annotation disabled: {e}")
@@ -221,6 +221,9 @@ def log_prediction_trace(
         "generated_text": details.get("generated_text"),
         "extracted_label": details.get("extracted_label"),
         "predicted_label": predicted_label,
+        "model_provider": details.get("model_provider"),
+        "model_id": details.get("model_id"),
+        "prompt_version": details.get("prompt_version"),
         "speed_event_hint": details.get("speed_event_hint"),
         "turn_event_hint": details.get("turn_event_hint"),
         "candidate_labels": details.get("candidate_labels"),
@@ -233,6 +236,18 @@ def log_prediction_trace(
         "stage1_reason": details.get("stage1_reason"),
         "fine_label_reason": details.get("fine_label_reason"),
         "frame_indices": details.get("frame_indices"),
+        "video_input_mode": details.get("video_input_mode"),
+        "video_window_start_seconds": details.get("video_window_start_seconds"),
+        "video_window_end_seconds": details.get("video_window_end_seconds"),
+        "video_clip_duration_seconds": details.get("video_clip_duration_seconds"),
+        "video_clip_fps": details.get("video_clip_fps"),
+        "video_clip_frame_count": details.get("video_clip_frame_count"),
+        "source_total_duration_seconds": details.get("source_total_duration_seconds"),
+        "source_frame_start": details.get("source_frame_start"),
+        "source_frame_end_exclusive": details.get("source_frame_end_exclusive"),
+        "video_grid_thw": details.get("video_grid_thw"),
+        "video_processor_metadata": details.get("video_processor_metadata"),
+        "inference_latency_ms": details.get("inference_latency_ms"),
         "visible_trajectory_points": details.get("visible_trajectory_points"),
         "status": "success" if success else "failed",
         "error": resolved_error,
