@@ -218,6 +218,11 @@ def log_prediction_trace(
             "gyro_z": float(row.get('gyro_z', 0.0)),
             "latitude": float(row.get('latitude', 0.0)),
             "longitude": float(row.get('longitude', 0.0)),
+            "heading": float(row.get('heading', 0.0)),
+            "pulseSpeed": float(row.get('pulseSpeed', 0.0)),
+            "brake": int(float(row.get('brake', 0) or 0)),
+            "blinker_l": int(float(row.get('blinker_l', 0) or 0)),
+            "blinker_r": int(float(row.get('blinker_r', 0) or 0)),
         },
         "prompt_text": details.get("prompt_text"),
         "generated_text": details.get("generated_text"),
@@ -235,11 +240,34 @@ def log_prediction_trace(
         "stage1_reason": details.get("stage1_reason"),
         "fine_label_reason": details.get("fine_label_reason"),
         "sensor_rule_reason": details.get("sensor_rule_reason"),
+        "sensor_temporal_context": details.get("sensor_temporal_context"),
         "frame_indices": details.get("frame_indices"),
         "visible_trajectory_points": details.get("visible_trajectory_points"),
         "status": "success" if success else "failed",
         "error": resolved_error,
     })
+
+
+def build_sensor_data(row) -> dict:
+    """Build sensor payload used by sensor-only baselines."""
+    return {
+        'speed': float(row.get('speed', 0.0)),
+        'acc_x': float(row.get('acc_x', 0.0)),
+        'acc_y': float(row.get('acc_y', 0.0)),
+        'acc_z': float(row.get('acc_z', 0.0)),
+        'gyro_z': float(row.get('gyro_z', 0.0)),
+        'latitude': float(row.get('latitude', 0.0)),
+        'longitude': float(row.get('longitude', 0.0)),
+        'heading': float(row.get('heading', 0.0)),
+        'pulseSpeed': float(row.get('pulseSpeed', 0.0)),
+        'brake': int(float(row.get('brake', 0) or 0)),
+        'blinker_l': int(float(row.get('blinker_l', 0) or 0)),
+        'blinker_r': int(float(row.get('blinker_r', 0) or 0)),
+        'rapidAccelerator': int(float(row.get('rapidAccelerator', 0) or 0)),
+        'rapidDecelerator': int(float(row.get('rapidDecelerator', 0) or 0)),
+        'leftSteer': int(float(row.get('leftSteer', 0) or 0)),
+        'rightSteer': int(float(row.get('rightSteer', 0) or 0)),
+    }
 
 # ============ ルーティング ============
 
@@ -376,15 +404,7 @@ async def auto_annotate(sample_id: int = Form(...)):
             logger.info(f"Video file exists: {os.path.exists(video_path)}")
         
         # Prepare sensor data
-        sensor_data = {
-            'speed': float(row['speed']),
-            'acc_x': float(row['acc_x']),
-            'acc_y': float(row['acc_y']),
-            'acc_z': float(row['acc_z']),
-            'gyro_z': float(row['gyro_z']),
-            'latitude': float(row['latitude']),
-            'longitude': float(row['longitude'])
-        }
+        sensor_data = build_sensor_data(row)
         
         # Get annotator and predict
         annotator = get_annotator()
@@ -486,15 +506,7 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
                     offset_seconds = match_result['offset_seconds']
                 
                 # Prepare sensor data
-                sensor_data = {
-                    'speed': float(row['speed']),
-                    'acc_x': float(row['acc_x']),
-                    'acc_y': float(row['acc_y']),
-                    'acc_z': float(row['acc_z']),
-                    'gyro_z': float(row['gyro_z']),
-                    'latitude': float(row['latitude']),
-                    'longitude': float(row['longitude'])
-                }
+                sensor_data = build_sensor_data(row)
                 
                 # Predict
                 predicted_label = annotator.predict_action(
@@ -639,15 +651,7 @@ async def auto_annotate_all():
                     offset_seconds = match_result['offset_seconds']
                 
                 # Prepare sensor data
-                sensor_data = {
-                    'speed': float(row['speed']),
-                    'acc_x': float(row['acc_x']),
-                    'acc_y': float(row['acc_y']),
-                    'acc_z': float(row['acc_z']),
-                    'gyro_z': float(row['gyro_z']),
-                    'latitude': float(row['latitude']),
-                    'longitude': float(row['longitude'])
-                }
+                sensor_data = build_sensor_data(row)
                 
                 # Predict action
                 predicted_label = annotator.predict_action(
