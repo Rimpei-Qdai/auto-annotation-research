@@ -67,20 +67,23 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
+PROMPT_VERSION = "summary_v8_single_probe_image"
+
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
 以下のセンサーデータと画像から運転行動を4分類してください。
 
 【画像の見方】
 - 画像1-4: 時系列順の元フレームです
-- 画像5: 予測軌道だけを上から見た trajectory summary です
-- summary の緑線は直進基準、赤線は今後3秒間の予測軌道です
+- 画像5: fixed-scale の top-down trajectory summary です
+- 画像6: 左右の曲がりを強調した normalized geometry summary です
+- 画像5,6 の緑線は直進基準、赤線は今後3秒間の予測軌道です
+- 画像5,6 を主に見て、画像1-4は道路文脈の確認に使ってください
 
 【センサーデータ】
 速度: {speed} km/h
 加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
 Yaw rate: {gyro_z} rad/s
-ブレーキ: {brake}
 
 以下から1つ選んでください:
 A: 直線系（等速走行・加速・減速）
@@ -91,47 +94,27 @@ D: その他（停止・発進・その他）
 A, B, C, D のいずれか1文字のみで回答してください。"""
 
 STAGE1_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1-4は時系列順の元フレーム、画像5は trajectory summary です。
+画像1は direction summary です。
 
-【trajectory summary の見方】
-- 緑線: 直進基準
-- 赤線: 今後3秒間の予測軌道
-- 赤線が基準にほぼ沿うなら直線系に近いです
-- 赤線が大きく左右へ曲がる、または停止・発進・その他に見えるなら直線系以外です
+【見る対象】
+- 画像1の赤線の終点が、LEFT / CENTER / RIGHT のどこにあるかだけを見てください
+- LEFT / RIGHT は車両基準の左 / 右です
+- 緑の中央帯の中なら CENTER です
+- 少しの曲がりで中央帯に残るなら CENTER です
 
-【センサーデータ】
-速度: {speed} km/h
-加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
-Yaw rate: {gyro_z} rad/s
-ブレーキ: {brake}
+最終回答は LEFT, CENTER, RIGHT のいずれか1語のみで回答してください。"""
 
-質問:
-- A: 直線系（等速走行・加速・減速）
-- N: 直線系以外（左回転系・右回転系・その他）
+STAGE2_ROUTE_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
+画像1は speed summary です。
 
-最終回答は A または N の1文字のみで回答してください。"""
+【見る対象】
+- 軌道が十分に前へ伸びているかだけを見てください
+- 長く伸びていれば LONG、極端に短いか点状なら SHORT です
+- 左右の曲がりは無視して、長さと点間隔だけを見てください
 
-STAGE2_PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
-画像1-4は時系列順の元フレーム、画像5は trajectory summary です。
+最終回答は LONG または SHORT の1語のみで回答してください。"""
 
-【trajectory summary の見方】
-- 緑線: 直進基準
-- 赤線: 今後3秒間の予測軌道
-- 左へ大きく曲がるなら B、右へ大きく曲がるなら C を優先してください
-- ほとんど動いていない、停止・発進・その他に近いなら D を選んでください
-
-【センサーデータ】
-速度: {speed} km/h
-加速度(X/Y/Z): {acc_x}/{acc_y}/{acc_z} m/s²
-Yaw rate: {gyro_z} rad/s
-ブレーキ: {brake}
-
-以下から1つ選んでください:
-B: 左回転系（左折・左車線変更）
-C: 右回転系（右折・右車線変更・転回）
-D: その他（停止・発進・その他）
-
-最終回答は B, C, D のいずれか1文字のみで回答してください。"""
+STAGE3_TURN_PROMPT_TEMPLATE = """unused"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds

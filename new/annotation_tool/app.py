@@ -20,9 +20,9 @@ JST = timezone(timedelta(hours=9))
 
 # Import production annotator
 try:
-    from heron_model_with_trajectory import get_annotator
+    from heron_model_with_trajectory import get_annotator, get_runtime_metadata
     HERON_ENABLED = True
-    logger.info("Using trajectory-enabled annotator (Ver.4 baseline mode)")
+    logger.info("Using trajectory-enabled annotator")
 except ImportError as e:
     HERON_ENABLED = False
     logger.warning(f"Heron auto-annotation disabled: {e}")
@@ -40,10 +40,34 @@ CSV_OUTPUT_MANUAL = os.path.join(BASE_DIR, 'annotated_samples_manual.csv')
 CSV_OUTPUT_AUTO = os.path.join(BASE_DIR, 'annotated_samples_auto.csv')
 INFERENCE_PROCESS_JSONL = os.path.join(BASE_DIR, 'inference_process.jsonl')
 
+
+def log_runtime_metadata(context: str = "startup"):
+    """現在動作している branch / commit / prompt version をログに残す"""
+    if not HERON_ENABLED:
+        logger.info(f"[{context}] Heron annotator disabled")
+        return
+
+    metadata = get_runtime_metadata()
+    logger.info(
+        "[%s] Runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
+        context,
+        metadata.get("repo_branch"),
+        metadata.get("repo_commit"),
+        metadata.get("repo_dirty"),
+        metadata.get("model_id"),
+        metadata.get("prompt_version"),
+        metadata.get("use_l2m_cot"),
+    )
+
 # 静的ファイルとテンプレート
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
+
+@app.on_event("startup")
+async def startup_log_runtime_metadata():
+    log_runtime_metadata("startup")
 
 # ============ データ読み込み ============
 
@@ -173,6 +197,8 @@ def append_inference_trace(payload):
     """推論過程を JSONL に追記する"""
     payload = dict(payload)
     payload.setdefault("logged_at", datetime.now(JST).isoformat())
+    if HERON_ENABLED:
+        payload.setdefault("runtime_metadata", get_runtime_metadata())
     with open(INFERENCE_PROCESS_JSONL, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -280,6 +306,7 @@ async def auto_annotate(sample_id: int = Form(...)):
         )
     
     try:
+        log_runtime_metadata("auto_annotate_single")
         # Get sample data from auto dataframe
         row = df_auto[df_auto['sample_id'] == sample_id].iloc[0]
         
@@ -357,6 +384,7 @@ async def auto_annotate_batch(num_samples: int = Form(10)):
         )
     
     try:
+        log_runtime_metadata("auto_annotate_batch")
         # Get unannotated samples from auto dataframe
         unannotated = df_auto[df_auto['action_label'].isna()].head(num_samples)
         
@@ -462,7 +490,8 @@ async def auto_annotate_status():
     return JSONResponse({
         "enabled": HERON_ENABLED,
         "message": "Heron auto-annotation is available" if HERON_ENABLED 
-                   else "Heron auto-annotation is not available"
+                   else "Heron auto-annotation is not available",
+        "runtime_metadata": get_runtime_metadata() if HERON_ENABLED else None,
     })
 
 @app.post("/auto_annotate_all")
@@ -476,6 +505,7 @@ async def auto_annotate_all():
     
     try:
         global df
+        log_runtime_metadata("auto_annotate_all")
         
         # 全サンプルを取得（既存のアノテーションを上書き）
         # Clear all existing action_labels for re-annotation

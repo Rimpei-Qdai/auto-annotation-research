@@ -6,8 +6,9 @@ Supports trajectory drawing on 4 frames for auto-annotation
 
 import os
 import logging
+import subprocess
 from typing import List, Optional, Dict, Any, Tuple
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from datetime import datetime
 
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
+from driving_graph import MacroGraphVerifier
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -36,11 +38,13 @@ from config import (
     USE_MULTI_FRAME,
     PROMPT_TEMPLATE,
     STAGE1_PROMPT_TEMPLATE,
-    STAGE2_PROMPT_TEMPLATE,
+    STAGE2_ROUTE_PROMPT_TEMPLATE,
+    STAGE3_TURN_PROMPT_TEMPLATE,
     ENABLE_FLASH_ATTENTION,
     USE_L2M_COT,
     MACRO_OUTPUT_TO_LABEL,
     MACRO_OUTPUT_NAMES,
+    PROMPT_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,39 @@ REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
     label_id: MACRO_OUTPUT_NAMES[macro_code]
     for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
 }
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _run_git_command(args: List[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return completed.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def get_runtime_metadata() -> Dict[str, Any]:
+    branch = _run_git_command(["branch", "--show-current"])
+    commit = _run_git_command(["rev-parse", "--short", "HEAD"])
+    dirty = bool(_run_git_command(["status", "--short"]))
+    return {
+        "repo_branch": branch,
+        "repo_commit": commit,
+        "repo_dirty": dirty,
+        "model_id": HERON_MODEL_ID,
+        "prompt_version": PROMPT_VERSION,
+        "use_l2m_cot": USE_L2M_COT,
+    }
 
 
 class HeronAnnotatorWithTrajectory:
@@ -63,11 +100,22 @@ class HeronAnnotatorWithTrajectory:
         self._device = None
         self._is_heron = False
         self.last_prediction_details = {}
+        self.runtime_metadata = get_runtime_metadata()
+        logger.info(
+            "Annotator runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
+            self.runtime_metadata.get("repo_branch"),
+            self.runtime_metadata.get("repo_commit"),
+            self.runtime_metadata.get("repo_dirty"),
+            self.runtime_metadata.get("model_id"),
+            self.runtime_metadata.get("prompt_version"),
+            self.runtime_metadata.get("use_l2m_cot"),
+        )
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
         self.trajectory_output_dir = trajectory_output_dir
         self.trajectory_visualizer = None
+        self.graph_verifier = MacroGraphVerifier()
         
         # Create output directory for trajectory frames
         if self.save_trajectory_frames and not os.path.exists(self.trajectory_output_dir):
@@ -385,68 +433,322 @@ class HeronAnnotatorWithTrajectory:
         """Build 3-second trajectory and summary stats from current sensor values."""
         speed = sensor_data.get('speed', 0.0)
         gyro_z = sensor_data.get('gyro_z', 0.0)
+        acc_x = sensor_data.get('acc_x', 0.0)
         speed_ms = speed / 3.6
 
         num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+        dt = 0.1
+        time_seq = np.arange(num_steps, dtype=np.float32) * dt
+        speed_seq = np.clip(speed_ms + (acc_x * time_seq), a_min=0.0, a_max=None).astype(np.float32)
         yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq, dt=dt)
         image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
 
         return {
             "speed": speed,
             "gyro_z": gyro_z,
+            "acc_x": acc_x,
+            "speed_seq": speed_seq,
+            "time_seq": time_seq,
+            "dt": dt,
             "trajectory_3d": trajectory_3d,
             "image_points": image_points,
             "valid_mask": valid_mask,
             "visible_count": int(np.sum(valid_mask)),
         }
 
-    def _render_trajectory_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
-        """Render a clean bird's-eye summary image showing only trajectory geometry."""
+    def _trajectory_to_canvas_points(
+        self,
+        trajectory_3d: np.ndarray,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+        max_forward_m: float,
+        max_side_m: float,
+    ) -> List[Tuple[int, int]]:
+        """Project trajectory to a clean 2D summary canvas with fixed orientation."""
+        center_x = width // 2
+        origin_y = height - margin
+        points: List[Tuple[int, int]] = []
+        for x, y, _ in trajectory_3d:
+            # Vehicle-frame +Y means "left", so positive lateral offset must appear
+            # on the left side of the summary image to match the prompt semantics.
+            px = center_x - int((y / max_side_m) * (width * 0.32))
+            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
+            points.append((px, py))
+        return points
+
+    def _load_summary_font(self, size: int) -> ImageFont.ImageFont:
+        """Load a readable font for summary-side anchors."""
+        for name in ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "Arial.ttf"]:
+            try:
+                return ImageFont.truetype(name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _draw_direction_anchors(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+    ) -> None:
+        """Draw explicit left/right anchors so VLM can bind geometry to direction."""
+        left_color = (50, 90, 220)
+        right_color = (220, 130, 30)
+        font = self._load_summary_font(28)
+
+        # Side tint is intentionally subtle: it anchors direction without competing
+        # with the trajectory itself.
+        draw.rectangle([0, 0, margin - 10, height], fill=(238, 244, 255))
+        draw.rectangle([width - margin + 10, 0, width, height], fill=(255, 244, 232))
+
+        left_y = margin - 10
+        right_y = margin - 10
+        draw.text((36, left_y), "LEFT", fill=left_color, font=font)
+        right_text = "RIGHT"
+        bbox = draw.textbbox((0, 0), right_text, font=font)
+        right_w = bbox[2] - bbox[0]
+        draw.text((width - 36 - right_w, right_y), right_text, fill=right_color, font=font)
+
+        # Arrow markers reinforce orientation even if the text is not fully parsed.
+        left_arrow = [(margin - 18, margin + 18), (18, margin + 18), (34, margin + 6), (34, margin + 30)]
+        right_arrow = [(width - margin + 18, margin + 18), (width - 18, margin + 18), (width - 34, margin + 6), (width - 34, margin + 30)]
+        draw.line(left_arrow[:2], fill=left_color, width=10)
+        draw.polygon([left_arrow[1], left_arrow[2], left_arrow[3]], fill=left_color)
+        draw.line(right_arrow[:2], fill=right_color, width=10)
+        draw.polygon([right_arrow[1], right_arrow[2], right_arrow[3]], fill=right_color)
+
+    def _draw_straight_band(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+        band_half_width: int = 54,
+    ) -> None:
+        """Draw a center dead-zone band for straight-motion reading."""
+        center_x = width // 2
+        band = [
+            center_x - band_half_width,
+            margin + 40,
+            center_x + band_half_width,
+            height - margin,
+        ]
+        draw.rectangle(band, fill=(236, 246, 236), outline=(190, 215, 190), width=3)
+        draw.line(
+            [(center_x, height - margin), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
+
+    def _draw_endpoint_arrow(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a clear arrowhead at the final trajectory direction."""
+        if len(points) < 2:
+            return
+
+        (x1, y1), (x2, y2) = points[-2], points[-1]
+        dx = x2 - x1
+        dy = y2 - y1
+        norm = float(np.hypot(dx, dy))
+        if norm < 1e-3:
+            return
+
+        ux, uy = dx / norm, dy / norm
+        px, py = -uy, ux
+        tip = np.array([x2, y2], dtype=np.float32)
+        base = tip - np.array([ux, uy], dtype=np.float32) * 24.0
+        wing = np.array([px, py], dtype=np.float32) * 10.0
+        left = tuple((base + wing).astype(int))
+        right = tuple((base - wing).astype(int))
+        tip_t = tuple(tip.astype(int))
+        draw.polygon([tip_t, left, right], fill=(245, 180, 0), outline=(0, 0, 0))
+
+    def _draw_summary_trajectory(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a high-contrast trajectory with start/end emphasis."""
+        if not points:
+            return
+
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 0, 0), width=14)
+            draw.line(points, fill=(220, 30, 30), width=8)
+
+            marker_indices = sorted(
+                set(
+                    [
+                        max(0, len(points) // 3),
+                        max(0, (2 * len(points)) // 3),
+                    ]
+                )
+            )
+            for marker_idx in marker_indices:
+                mx, my = points[marker_idx]
+                draw.ellipse(
+                    [mx - 8, my - 8, mx + 8, my + 8],
+                    fill=(255, 255, 255),
+                    outline=(0, 0, 0),
+                    width=2,
+                )
+        else:
+            px, py = points[0]
+            draw.ellipse(
+                [px - 8, py - 8, px + 8, py + 8],
+                fill=(220, 30, 30),
+                outline=(0, 0, 0),
+                width=2,
+            )
+
+        sx, sy = points[0]
+        draw.ellipse(
+            [sx - 10, sy - 10, sx + 10, sy + 10],
+            fill=(255, 255, 255),
+            outline=(0, 0, 0),
+            width=3,
+        )
+
+        ex, ey = points[-1]
+        draw.ellipse(
+            [ex - 9, ey - 9, ex + 9, ey + 9],
+            fill=(245, 180, 0),
+            outline=(0, 0, 0),
+            width=2,
+        )
+        self._draw_endpoint_arrow(draw, points)
+
+    def _render_topdown_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a fixed-scale bird's-eye summary image."""
         width, height = 720, 720
         margin = 60
         center_x = width // 2
         origin_y = height - margin
         max_forward_m = 35.0
-        max_side_m = 12.0
+        max_side_m = 14.0
 
         canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
 
-        # Straight reference line
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        self._draw_straight_band(draw, width=width, height=height, margin=margin, band_half_width=36)
+
+        points = self._trajectory_to_canvas_points(
+            trajectory_3d,
+            width=width,
+            height=height,
+            margin=margin,
+            max_forward_m=max_forward_m,
+            max_side_m=max_side_m,
+        )
+        self._draw_summary_trajectory(draw, points)
+
+        return canvas
+
+    def _render_direction_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a direction-only summary with normalized forward spacing."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+        max_side = max(float(np.max(np.abs(trajectory_3d[:, 1]))), 2.0)
+        num_points = max(len(trajectory_3d), 2)
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        self._draw_straight_band(draw, width=width, height=height, margin=margin, band_half_width=54)
+        draw.rectangle(
+            [margin, margin, width - margin, origin_y],
+            outline=(230, 230, 230),
+            width=2,
+        )
+
+        points: List[Tuple[int, int]] = []
+        for idx, (_, y, _) in enumerate(trajectory_3d):
+            px = center_x - int((y / max_side) * (width * 0.34))
+            progress = idx / float(num_points - 1)
+            py = origin_y - int(progress * (height - (2 * margin)))
+            points.append((px, py))
+        self._draw_summary_trajectory(draw, points)
+
+        return canvas
+
+    def _render_speed_summary(
+        self,
+        trajectory_3d: np.ndarray,
+        speed_seq: np.ndarray,
+    ) -> Image.Image:
+        """Render a speed-only summary using forward distance and point spacing."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+        max_forward = max(float(np.max(trajectory_3d[:, 0])), 2.0)
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
         draw.line(
             [(center_x, origin_y), (center_x, margin)],
-            fill=(40, 180, 40),
+            fill=(180, 180, 180),
             width=6,
         )
 
-        points = []
-        for x, y, _ in trajectory_3d:
-            px = center_x + int((y / max_side_m) * (width * 0.32))
-            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
-            points.append((px, py))
+        points: List[Tuple[int, int]] = []
+        for x, _, _ in trajectory_3d:
+            py = origin_y - int((x / max_forward) * (height - (2 * margin)))
+            points.append((center_x, py))
 
-        if len(points) == 1:
-            draw.ellipse(
-                [points[0][0] - 8, points[0][1] - 8, points[0][0] + 8, points[0][1] + 8],
-                fill=(220, 30, 30),
-                outline=(220, 30, 30),
-            )
-            return canvas
-
-        # Halo then trajectory for high contrast
         if len(points) >= 2:
             draw.line(points, fill=(0, 0, 0), width=14)
             draw.line(points, fill=(220, 30, 30), width=8)
+        for idx, (px, py) in enumerate(points):
+            radius = 8 if idx in {0, len(points) - 1} else 5
+            fill = (255, 255, 255) if idx == 0 else (245, 180, 0) if idx == len(points) - 1 else (220, 30, 30)
+            draw.ellipse(
+                [px - radius, py - radius, px + radius, py + radius],
+                fill=fill,
+                outline=(0, 0, 0),
+                width=2,
+            )
 
-        # Start marker
-        sx, sy = points[0]
-        draw.ellipse([sx - 10, sy - 10, sx + 10, sy + 10], fill=(255, 255, 255), outline=(0, 0, 0), width=3)
-
-        # End arrow marker
-        ex, ey = points[-1]
-        draw.ellipse([ex - 8, ey - 8, ex + 8, ey + 8], fill=(245, 180, 0), outline=(0, 0, 0), width=2)
+        # Draw every 5th time-step as a larger marker so spacing changes are easier to parse.
+        for idx in range(0, len(points), 5):
+            px, py = points[idx]
+            draw.ellipse(
+                [px - 7, py - 7, px + 7, py + 7],
+                fill=(255, 255, 255),
+                outline=(0, 0, 0),
+                width=2,
+            )
 
         return canvas
 
@@ -456,23 +758,36 @@ class HeronAnnotatorWithTrajectory:
         sensor_data: Dict[str, Any],
         sample_id: Optional[int] = None
     ) -> Tuple[List[Image.Image], Dict[str, Any]]:
-        """Prepare raw frames plus one clean trajectory summary image for VLM input."""
+        """Prepare raw frames plus three clean trajectory summary images for VLM input."""
         geometry = self._build_trajectory_geometry(sensor_data)
-        summary_image = self._render_trajectory_summary(geometry["trajectory_3d"])
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        direction_summary = self._render_direction_summary(geometry["trajectory_3d"])
+        speed_summary = self._render_speed_summary(geometry["trajectory_3d"], geometry["speed_seq"])
 
         if self.save_trajectory_frames and sample_id is not None:
             os.makedirs(self.trajectory_output_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            summary_path = os.path.join(
+            summary_topdown_path = os.path.join(
                 self.trajectory_output_dir,
-                f"sample_{sample_id:03d}_trajectory_summary_{timestamp}.jpg",
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
             )
-            summary_image.save(summary_path, quality=95)
+            summary_direction_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_direction_{timestamp}.jpg",
+            )
+            summary_speed_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_speed_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            direction_summary.save(summary_direction_path, quality=95)
+            speed_summary.save(summary_speed_path, quality=95)
 
         logger.info(
             f"Trajectory summary: {geometry['visible_count']}/{len(geometry['valid_mask'])} points visible"
         )
-        model_frames = list(frames[:4]) + [summary_image]
+        model_frames = list(frames[:4]) + [topdown_summary, direction_summary, speed_summary]
+        self.last_prediction_details["visual_input_count"] = len(model_frames)
         return model_frames, geometry
 
     def _run_prompt_on_frames(
@@ -532,6 +847,25 @@ class HeronAnnotatorWithTrajectory:
         )[0].strip()
         return generated_text
 
+    def _select_stage_frames(
+        self,
+        model_frames: List[Image.Image],
+        stage_name: str,
+    ) -> List[Image.Image]:
+        """Select the visual inputs for a stage.
+
+        Stage1 reads only the direction summary for left/center/right probing.
+        Stage2 reads only the speed summary for long/short probing.
+        """
+        if len(model_frames) >= 3:
+            direction_summary = model_frames[-2]
+            speed_summary = model_frames[-1]
+            if stage_name == "stage1":
+                return [direction_summary]
+            if stage_name == "stage2":
+                return [speed_summary]
+        return model_frames
+
     def _extract_choice(
         self,
         text: str,
@@ -565,6 +899,40 @@ class HeronAnnotatorWithTrajectory:
                     return choice.upper()
 
         return None
+
+    def _apply_macro_graph(
+        self,
+        initial_macro_choice: str,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        *,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> str:
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+        # Keep both keys so analysis scripts do not miss graph output.
+        self.last_prediction_details["macro_graph"] = graph_result
+        self.last_prediction_details["graph"] = graph_result
+        self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
+
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice"):
+            final_macro_choice = strong_candidate["macro_choice"]
+            overridden = final_macro_choice != initial_macro_choice
+            self.last_prediction_details["graph_override"] = overridden
+            self.last_prediction_details["graph_overrode"] = overridden
+            self.last_prediction_details["final_macro_choice"] = final_macro_choice
+            return final_macro_choice
+
+        self.last_prediction_details["graph_override"] = False
+        self.last_prediction_details["graph_overrode"] = False
+        self.last_prediction_details["final_macro_choice"] = initial_macro_choice
+        return initial_macro_choice
     
     def predict_action(
         self,
@@ -676,6 +1044,7 @@ class HeronAnnotatorWithTrajectory:
                 "sample_id": sample_id,
                 "video_path": video_path,
                 "start_time": start_time,
+                **self.runtime_metadata,
             }
 
             # Extract 4 frames from video
@@ -701,79 +1070,110 @@ class HeronAnnotatorWithTrajectory:
                 "final_y_m": float(geometry["trajectory_3d"][-1][1]),
                 "gyro_z": float(sensor_data.get('gyro_z', 0.0)),
                 "speed": float(sensor_data.get('speed', 0.0)),
+                "acc_x": float(sensor_data.get('acc_x', 0.0)),
             }
+
+            direction_frames = self._select_stage_frames(model_frames, "stage1")
+            self.last_prediction_details["stage1_visual_input_count"] = len(direction_frames)
+            self.last_prediction_details["stage1_visual_mode"] = "direction_only"
 
             stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
-                brake=sensor_data.get('brake', 0)
             )
-            stage1_generated = self._run_prompt_on_frames(model_frames, stage1_prompt)
-            stage1_choice = self._extract_choice(
+            stage1_generated = self._run_prompt_on_frames(direction_frames, stage1_prompt)
+            direction_choice = self._extract_choice(
                 stage1_generated,
-                ["A", "N"],
+                ["LEFT", "CENTER", "RIGHT"],
                 alias_to_choice={
-                    "直線系": "A",
-                    "左回転系": "N",
-                    "右回転系": "N",
-                    "その他": "N",
+                    "左": "LEFT",
+                    "中央": "CENTER",
+                    "右": "RIGHT",
                 },
             )
 
             self.last_prediction_details["stage1_prompt_text"] = stage1_prompt
             self.last_prediction_details["stage1_generated_text"] = stage1_generated
-            self.last_prediction_details["stage1_choice"] = stage1_choice
+            self.last_prediction_details["direction_probe_choice"] = direction_choice
 
-            if stage1_choice == "A":
-                action_label = MACRO_OUTPUT_TO_LABEL["A"]
-                self.last_prediction_details["final_macro_choice"] = "A"
-                self.last_prediction_details["predicted_label"] = action_label
-                logger.info(f"Stage1 chose A -> Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})")
-                return action_label
-
-            if stage1_choice != "N":
-                logger.warning(f"Failed to extract Stage1 choice from model output: {stage1_generated}")
+            if direction_choice is None:
+                logger.warning(f"Failed to extract direction probe from model output: {stage1_generated}")
                 self.last_prediction_details["error"] = "stage1_parse_failed"
                 return None
 
-            stage2_prompt = STAGE2_PROMPT_TEMPLATE.format(
+            speed_frames = self._select_stage_frames(model_frames, "stage2")
+            self.last_prediction_details["stage2_visual_input_count"] = len(speed_frames)
+            self.last_prediction_details["stage2_visual_mode"] = "speed_only"
+
+            stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
-                acc_y=sensor_data.get('acc_y', 0),
-                acc_z=sensor_data.get('acc_z', 0),
                 gyro_z=sensor_data.get('gyro_z', 0),
-                brake=sensor_data.get('brake', 0)
             )
-            stage2_generated = self._run_prompt_on_frames(model_frames, stage2_prompt)
-            stage2_choice = self._extract_choice(
+            stage2_generated = self._run_prompt_on_frames(speed_frames, stage2_prompt)
+            speed_choice = self._extract_choice(
                 stage2_generated,
-                ["B", "C", "D"],
+                ["LONG", "SHORT"],
                 alias_to_choice={
-                    "左回転系": "B",
-                    "右回転系": "C",
-                    "その他": "D",
+                    "長い": "LONG",
+                    "短い": "SHORT",
                 },
             )
 
             self.last_prediction_details["stage2_prompt_text"] = stage2_prompt
             self.last_prediction_details["stage2_generated_text"] = stage2_generated
-            self.last_prediction_details["stage2_choice"] = stage2_choice
+            self.last_prediction_details["speed_probe_choice"] = speed_choice
 
-            if stage2_choice is None:
-                logger.warning(f"Failed to extract Stage2 choice from model output: {stage2_generated}")
+            if speed_choice is None:
+                logger.warning(f"Failed to extract speed probe from model output: {stage2_generated}")
                 self.last_prediction_details["error"] = "stage2_parse_failed"
                 return None
 
-            action_label = MACRO_OUTPUT_TO_LABEL[stage2_choice]
-            self.last_prediction_details["final_macro_choice"] = stage2_choice
+            if speed_choice == "SHORT":
+                initial_macro_choice = "D"
+            elif direction_choice == "CENTER":
+                initial_macro_choice = "A"
+            elif direction_choice == "LEFT":
+                initial_macro_choice = "B"
+            elif direction_choice == "RIGHT":
+                initial_macro_choice = "C"
+            else:
+                logger.warning(
+                    "Unexpected visual probe combination: direction=%s speed=%s",
+                    direction_choice,
+                    speed_choice,
+                )
+                self.last_prediction_details["error"] = "visual_probe_unexpected"
+                return None
+
+            self.last_prediction_details["stage1_choice"] = "A" if initial_macro_choice == "A" else "N"
+            self.last_prediction_details["stage2_route_choice"] = (
+                None if initial_macro_choice == "A"
+                else "D" if initial_macro_choice == "D"
+                else "R"
+            )
+            self.last_prediction_details["stage2_choice"] = None if initial_macro_choice == "A" else initial_macro_choice
+            self.last_prediction_details["stage3_turn_choice"] = initial_macro_choice if initial_macro_choice in {"B", "C"} else None
+            self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
+
+            final_macro_choice = self._apply_macro_graph(
+                initial_macro_choice,
+                sensor_data,
+                self.last_prediction_details["trajectory_features"],
+                stage1_choice=self.last_prediction_details["stage1_choice"],
+                stage2_choice=initial_macro_choice if initial_macro_choice != "A" else None,
+            )
+            action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
             self.last_prediction_details["predicted_label"] = action_label
 
             macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
             if macro_name:
-                logger.info(f"Predicted action label: {action_label} ({macro_name})")
+                logger.info(
+                    f"Visual probes direction={direction_choice}, speed={speed_choice} -> "
+                    f"initial {initial_macro_choice} -> Final macro {final_macro_choice} -> "
+                    f"Predicted action label: {action_label} ({macro_name})"
+                )
             else:
                 logger.info(f"Predicted action label: {action_label}")
             
