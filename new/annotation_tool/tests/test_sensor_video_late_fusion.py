@@ -122,12 +122,40 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertGreater(macro_scores["B"], macro_scores["D"])
 
     def test_stop_and_start_are_grouped_into_macro_a(self):
-        macro_scores, debug = self.annotator._build_sensor_macro_scores(
-            {4: 0.30, 5: 0.25, 0: 0.10},
-            primary_label=4,
+        macro_scores, debug = self.annotator._build_sensor_direct_macro_scores(
+            {"speed": 0.8, "acc_x": 0.05, "gyro_z": 0.0, "brake": 1},
+            {
+                "source": "preferred_window",
+                "speed_delta": -1.0,
+                "speed_slope_kmh_per_s": -0.2,
+                "acc_x_mean": -0.05,
+                "gyro_z_integral": 0.0,
+                "max_abs_gyro_z": 0.01,
+                "heading_delta_deg": 0.0,
+                "low_speed_ratio": 0.9,
+                "standstill_ratio": 0.9,
+            },
         )
         self.assertEqual(debug["primary_macro"], "A")
         self.assertGreater(macro_scores["A"], macro_scores["D"])
+
+    def test_direct_macro_scores_prefer_right_turn_family(self):
+        macro_scores, debug = self.annotator._build_sensor_direct_macro_scores(
+            {"speed": 24.0, "acc_x": 0.0, "gyro_z": -0.14, "blinker_r": 1},
+            {
+                "source": "preferred_window",
+                "speed_delta": 0.0,
+                "speed_slope_kmh_per_s": 0.0,
+                "acc_x_mean": 0.0,
+                "gyro_z_integral": -0.48,
+                "max_abs_gyro_z": 0.20,
+                "heading_delta_deg": -42.0,
+                "low_speed_ratio": 0.0,
+                "standstill_ratio": 0.0,
+            },
+        )
+        self.assertEqual(debug["primary_macro"], "C")
+        self.assertGreater(macro_scores["C"], macro_scores["A"])
 
     def test_combine_sensor_and_video_macro_scores_can_flip_macro(self):
         combined = self.annotator._combine_sensor_and_video_macro_scores(

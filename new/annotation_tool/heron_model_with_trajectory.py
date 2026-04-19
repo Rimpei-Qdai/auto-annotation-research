@@ -1417,6 +1417,112 @@ class HeronAnnotatorWithTrajectory:
             },
         )
 
+    def _build_sensor_direct_macro_scores(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Dict[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Build macro 4-class sensor scores directly without 11-class intermediate labels."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs(gyro_z)))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
+
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+        scores: Dict[str, float] = {code: 0.0 for code in MACRO_OUTPUT_TO_LABEL}
+
+        def add(code: str, amount: float) -> None:
+            scores[code] = round(max(0.0, min(1.0, scores.get(code, 0.0) + amount)), 3)
+
+        debug_reasons: List[str] = []
+
+        # Straight-family prior: stop/start and speed events all belong to A.
+        add("A", 0.20)
+
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            add("A", 0.45)
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                add("A", 0.12)
+                debug_reasons.append("停止付近からの立ち上がりで直進系Aを補強")
+            else:
+                debug_reasons.append("停止状態/停止継続で直進系Aを補強")
+
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            add("A", 0.25)
+            debug_reasons.append("速度上昇が直進系Aを支持")
+        elif speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            add("A", 0.25)
+            debug_reasons.append("減速傾向が直進系Aを支持")
+        elif abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12:
+            add("A", 0.18)
+            debug_reasons.append("速度変化が小さく直進系Aを支持")
+
+        strong_turn = abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18
+        medium_turn = abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0 or max_abs_gyro >= 0.10
+        lane_change_like = speed >= 15.0 and medium_turn
+
+        if strong_turn:
+            turn_code = "B" if signed_rotation > 0 else "C"
+            add(turn_code, 0.55)
+            debug_reasons.append(f"強い回転量が{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+        elif lane_change_like:
+            turn_code = "B" if (blinker_l and not blinker_r) or signed_rotation > 0 else "C"
+            add(turn_code, 0.35)
+            debug_reasons.append(f"中程度の回転と速度から{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+
+        if blinker_l and not blinker_r:
+            add("B", 0.18)
+            debug_reasons.append("左ウィンカーが左回転系Bを補強")
+        elif blinker_r and not blinker_l:
+            add("C", 0.18)
+            debug_reasons.append("右ウィンカーが右回転系Cを補強")
+        elif blinker_l and blinker_r:
+            add("D", 0.25)
+            debug_reasons.append("左右ウィンカー競合でその他Dを補強")
+
+        # Only use D when evidence is weak or contradictory, not for stop/start.
+        top_two = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:2]
+        top_score = top_two[0][1] if top_two else 0.0
+        margin = top_two[0][1] - top_two[1][1] if len(top_two) > 1 else top_score
+        if top_score < 0.35:
+            add("D", 0.25)
+            debug_reasons.append("主要クラスの根拠が弱くその他Dを補強")
+        if margin < 0.08 and top_score < 0.60:
+            add("D", 0.12)
+            debug_reasons.append("クラス間の差が小さくその他Dを補強")
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        primary_macro = ranked[0][0]
+        return (
+            {code: score for code, score in ranked},
+            {
+                "primary_macro": primary_macro,
+                "primary_macro_name": MACRO_OUTPUT_NAMES.get(primary_macro),
+                "scores": dict(ranked),
+                "rule_reasons": debug_reasons,
+                "signed_rotation": signed_rotation,
+                "heading_delta_deg": heading_delta,
+                "max_abs_gyro_z_window": max_abs_gyro,
+                "speed_delta": speed_delta,
+                "speed_slope_kmh_per_s": speed_slope,
+                "temporal_source": source,
+            },
+        )
+
     def _format_macro_candidate_lines(self, macro_scores: Dict[str, float]) -> str:
         ranked = sorted(macro_scores.items(), key=lambda item: (-item[1], item[0]))
         return "\n".join(
@@ -1718,22 +1824,13 @@ class HeronAnnotatorWithTrajectory:
 
         try:
             temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
-            sensor_primary_label, sensor_rule_reason = self._classify_sensor_only_label(
-                sensor_data,
-                temporal_context=temporal_context,
-            )
             summary_images, geometry = self._build_trajectory_summary_images(
                 sensor_data,
                 sample_id=sample_id,
             )
-            fine_candidate_scores, sensor_prior_debug = self._build_sensor_candidate_scores(
+            macro_scores, sensor_macro_debug = self._build_sensor_direct_macro_scores(
                 sensor_data,
                 temporal_context,
-                sensor_primary_label,
-            )
-            macro_scores, macro_debug = self._build_sensor_macro_scores(
-                fine_candidate_scores,
-                sensor_primary_label,
             )
             target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
             candidate_prompt = VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE.format(
@@ -1779,18 +1876,15 @@ class HeronAnnotatorWithTrajectory:
                 **self.runtime_metadata,
                 "prompt_version": PROMPT_VERSION,
                 "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
-                "inference_mode": "sensor_prior_then_video_plus_summary_macro_selection",
+                "inference_mode": "direct_sensor_macro_prior_then_video_plus_summary_macro_selection",
                 "prompt_text": prompt_text,
                 "generated_text": generated_text,
                 "video_macro_choice": video_macro_choice,
-                "sensor_primary_label": sensor_primary_label,
-                "sensor_primary_label_name": ACTION_LABELS.get(sensor_primary_label),
-                "sensor_primary_macro": macro_debug.get("primary_macro"),
-                "sensor_primary_macro_name": macro_debug.get("primary_macro_name"),
-                "sensor_rule_reason": sensor_rule_reason,
+                "sensor_primary_macro": sensor_macro_debug.get("primary_macro"),
+                "sensor_primary_macro_name": sensor_macro_debug.get("primary_macro_name"),
+                "sensor_macro_rule_reasons": sensor_macro_debug.get("rule_reasons"),
                 "sensor_temporal_context": temporal_context,
-                "sensor_prior_debug": sensor_prior_debug,
-                "sensor_fine_candidate_scores": fine_candidate_scores,
+                "sensor_macro_debug": sensor_macro_debug,
                 "sensor_macro_scores": macro_scores,
                 "combined_macro_scores": combined_macro_scores,
                 "fused_macro_before_graph": fused_macro,

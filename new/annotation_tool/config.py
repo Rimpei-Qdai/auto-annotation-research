@@ -73,7 +73,7 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
-PROMPT_VERSION = "sensor_video_late_fusion_v4_macro4_straight_includes_stop_start"
+PROMPT_VERSION = "sensor_video_late_fusion_v5_direct_macro4_with_trajectory"
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
