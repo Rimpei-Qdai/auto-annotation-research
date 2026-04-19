@@ -121,6 +121,14 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertGreater(macro_scores["A"], macro_scores["B"])
         self.assertGreater(macro_scores["B"], macro_scores["D"])
 
+    def test_stop_and_start_are_grouped_into_macro_a(self):
+        macro_scores, debug = self.annotator._build_sensor_macro_scores(
+            {4: 0.30, 5: 0.25, 0: 0.10},
+            primary_label=4,
+        )
+        self.assertEqual(debug["primary_macro"], "A")
+        self.assertGreater(macro_scores["A"], macro_scores["D"])
+
     def test_combine_sensor_and_video_macro_scores_can_flip_macro(self):
         combined = self.annotator._combine_sensor_and_video_macro_scores(
             {"A": 0.55, "B": 0.42, "C": 0.10, "D": 0.05},

@@ -67,16 +67,16 @@ REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
     for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
 }
 FINE_LABEL_TO_MACRO_GROUP = {
-    1: "A", 2: "A", 3: "A",
+    1: "A", 2: "A", 3: "A", 4: "A", 5: "A",
     6: "B", 8: "B",
     7: "C", 9: "C", 10: "C",
-    0: "D", 4: "D", 5: "D",
+    0: "D",
 }
 MACRO_LABEL_EXAMPLES = {
-    "A": "等速走行・加速・減速",
+    "A": "等速走行・加速・減速・停止・発進",
     "B": "左折・左車線変更",
     "C": "右折・右車線変更・転回",
-    "D": "停止・発進・その他",
+    "D": "その他",
 }
 
 
