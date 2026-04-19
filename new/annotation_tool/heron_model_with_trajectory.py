@@ -58,6 +58,7 @@ from config import (
     MAX_NEW_TOKENS_VIDEO_CANDIDATE,
     ACTION_LABELS,
     VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE,
+    VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,16 @@ REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
     for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
 }
 FINE_LABEL_TO_MACRO_GROUP = {
-    1: "A", 2: "A", 3: "A",
+    1: "A", 2: "A", 3: "A", 4: "A", 5: "A",
     6: "B", 8: "B",
     7: "C", 9: "C", 10: "C",
-    0: "D", 4: "D", 5: "D",
+    0: "D",
+}
+MACRO_LABEL_EXAMPLES = {
+    "A": "等速走行・加速・減速・停止・発進",
+    "B": "左折・左車線変更",
+    "C": "右折・右車線変更・転回",
+    "D": "その他",
 }
 
 
@@ -1134,7 +1141,7 @@ class HeronAnnotatorWithTrajectory:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            return_metadata=True,
+            processor_kwargs={"return_metadata": True},
         )
         video_metadata = inputs.pop("video_metadata", None)
         inputs = inputs.to(self.device)
@@ -1384,6 +1391,154 @@ class HeronAnnotatorWithTrajectory:
             for label, score in ranked
         )
 
+    def _build_sensor_macro_scores(
+        self,
+        fine_candidate_scores: Dict[int, float],
+        primary_label: int,
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Aggregate fine-grained sensor candidate scores into macro 4-class scores."""
+        macro_scores: Dict[str, float] = {code: 0.0 for code in MACRO_OUTPUT_TO_LABEL}
+        for label, score in fine_candidate_scores.items():
+            macro_code = FINE_LABEL_TO_MACRO_GROUP.get(label)
+            if macro_code is None:
+                continue
+            macro_scores[macro_code] = round(macro_scores.get(macro_code, 0.0) + float(score), 3)
+
+        primary_macro = FINE_LABEL_TO_MACRO_GROUP.get(primary_label, "D")
+        macro_scores[primary_macro] = round(macro_scores.get(primary_macro, 0.0) + 0.15, 3)
+
+        ranked = sorted(macro_scores.items(), key=lambda item: (-item[1], item[0]))
+        return (
+            {code: score for code, score in ranked},
+            {
+                "primary_macro": primary_macro,
+                "primary_macro_name": MACRO_OUTPUT_NAMES.get(primary_macro),
+                "scores": dict(ranked),
+            },
+        )
+
+    def _build_sensor_direct_macro_scores(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Dict[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Build macro 4-class sensor scores directly without 11-class intermediate labels."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs(gyro_z)))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
+
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+        scores: Dict[str, float] = {code: 0.0 for code in MACRO_OUTPUT_TO_LABEL}
+
+        def add(code: str, amount: float) -> None:
+            scores[code] = round(max(0.0, min(1.0, scores.get(code, 0.0) + amount)), 3)
+
+        debug_reasons: List[str] = []
+
+        # Straight-family prior: stop/start and speed events all belong to A.
+        add("A", 0.20)
+
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            add("A", 0.45)
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                add("A", 0.12)
+                debug_reasons.append("停止付近からの立ち上がりで直進系Aを補強")
+            else:
+                debug_reasons.append("停止状態/停止継続で直進系Aを補強")
+
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            add("A", 0.25)
+            debug_reasons.append("速度上昇が直進系Aを支持")
+        elif speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            add("A", 0.25)
+            debug_reasons.append("減速傾向が直進系Aを支持")
+        elif abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12:
+            add("A", 0.18)
+            debug_reasons.append("速度変化が小さく直進系Aを支持")
+
+        strong_turn = abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18
+        medium_turn = abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0 or max_abs_gyro >= 0.10
+        lane_change_like = speed >= 15.0 and medium_turn
+
+        if strong_turn:
+            turn_code = "B" if signed_rotation > 0 else "C"
+            add(turn_code, 0.55)
+            debug_reasons.append(f"強い回転量が{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+        elif lane_change_like:
+            turn_code = "B" if (blinker_l and not blinker_r) or signed_rotation > 0 else "C"
+            add(turn_code, 0.35)
+            debug_reasons.append(f"中程度の回転と速度から{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+
+        if blinker_l and not blinker_r:
+            add("B", 0.18)
+            debug_reasons.append("左ウィンカーが左回転系Bを補強")
+        elif blinker_r and not blinker_l:
+            add("C", 0.18)
+            debug_reasons.append("右ウィンカーが右回転系Cを補強")
+        elif blinker_l and blinker_r:
+            add("D", 0.25)
+            debug_reasons.append("左右ウィンカー競合でその他Dを補強")
+
+        # Only use D when evidence is weak or contradictory, not for stop/start.
+        top_two = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:2]
+        top_score = top_two[0][1] if top_two else 0.0
+        margin = top_two[0][1] - top_two[1][1] if len(top_two) > 1 else top_score
+        if top_score < 0.35:
+            add("D", 0.25)
+            debug_reasons.append("主要クラスの根拠が弱くその他Dを補強")
+        if margin < 0.08 and top_score < 0.60:
+            add("D", 0.12)
+            debug_reasons.append("クラス間の差が小さくその他Dを補強")
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        primary_macro = ranked[0][0]
+        return (
+            {code: score for code, score in ranked},
+            {
+                "primary_macro": primary_macro,
+                "primary_macro_name": MACRO_OUTPUT_NAMES.get(primary_macro),
+                "scores": dict(ranked),
+                "rule_reasons": debug_reasons,
+                "signed_rotation": signed_rotation,
+                "heading_delta_deg": heading_delta,
+                "max_abs_gyro_z_window": max_abs_gyro,
+                "speed_delta": speed_delta,
+                "speed_slope_kmh_per_s": speed_slope,
+                "temporal_source": source,
+            },
+        )
+
+    def _format_macro_candidate_lines(self, macro_scores: Dict[str, float]) -> str:
+        ranked = sorted(macro_scores.items(), key=lambda item: (-item[1], item[0]))
+        return "\n".join(
+            f"- {code}: {MACRO_OUTPUT_NAMES.get(code, '不明')}（{MACRO_LABEL_EXAMPLES.get(code, '')}） (sensor_score={score:.2f})"
+            for code, score in ranked
+        )
+
+    def _select_summary_images_for_macro_prompt(
+        self,
+        summary_images: List[Image.Image],
+    ) -> List[Image.Image]:
+        """Use only the normalized trajectory summary for macro 4-class prompting."""
+        if not summary_images:
+            return []
+        return [summary_images[-1]]
+
     def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
         import re
 
@@ -1416,8 +1571,22 @@ class HeronAnnotatorWithTrajectory:
             combined[video_choice] = round(combined[video_choice] + VIDEO_CHOICE_BONUS, 3)
         return combined
 
+    def _combine_sensor_and_video_macro_scores(
+        self,
+        macro_scores: Dict[str, float],
+        *,
+        video_choice: Optional[str],
+    ) -> Dict[str, float]:
+        combined = dict(macro_scores)
+        if video_choice is not None and video_choice in combined:
+            combined[video_choice] = round(combined[video_choice] + VIDEO_CHOICE_BONUS, 3)
+        return combined
+
     def _choose_best_label_from_scores(self, score_map: Dict[int, float]) -> int:
         return max(score_map.items(), key=lambda item: (item[1], -item[0]))[0]
+
+    def _choose_best_macro_from_scores(self, score_map: Dict[str, float]) -> str:
+        return max(score_map.items(), key=lambda item: (item[1], item[0]))[0]
 
     def _trajectory_features_for_graph(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
         geometry = self._build_trajectory_geometry(sensor_data)
@@ -1485,6 +1654,43 @@ class HeronAnnotatorWithTrajectory:
             }
 
         return final_graph_label, {
+            "graph": graph_result,
+            "veto_applied": veto_applied,
+            "veto_reason": veto_reason,
+        }
+
+    def _apply_veto_only_graph_macro(
+        self,
+        final_macro: str,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        candidate_scores: Dict[str, float],
+    ) -> Tuple[str, Dict[str, Any]]:
+        stage1_choice = "A" if final_macro == "A" else "N"
+        stage2_choice = None if final_macro == "A" else final_macro
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+
+        veto_applied = False
+        veto_reason = None
+        final_graph_macro = final_macro
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice") and strong_candidate["macro_choice"] != final_macro:
+            target_macro = strong_candidate["macro_choice"]
+            if target_macro in candidate_scores:
+                final_graph_macro = target_macro
+            veto_applied = True
+            veto_reason = {
+                "from_macro": final_macro,
+                "to_macro": target_macro,
+                "strong_candidate": strong_candidate,
+            }
+
+        return final_graph_macro, {
             "graph": graph_result,
             "veto_applied": veto_applied,
             "veto_reason": veto_reason,
@@ -1609,6 +1815,132 @@ class HeronAnnotatorWithTrajectory:
             if clip_path and os.path.exists(clip_path):
                 os.remove(clip_path)
 
+    def _predict_sensor_video_late_fusion_macro(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        start_time: float = 0.0,
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Sensor-temporal mainline + raw-video and trajectory summaries for macro 4-class selection."""
+        clip_info = self._create_centered_video_clip(
+            video_path=video_path,
+            center_time=start_time,
+            window_duration=VIDEO_CLIP_DURATION_SECONDS,
+        )
+        clip_path = clip_info["clip_path"]
+        started_at = time.perf_counter()
+
+        try:
+            temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
+            generated_summary_images, geometry = self._build_trajectory_summary_images(
+                sensor_data,
+                sample_id=sample_id,
+            )
+            input_summary_images = self._select_summary_images_for_macro_prompt(generated_summary_images)
+            macro_scores, sensor_macro_debug = self._build_sensor_direct_macro_scores(
+                sensor_data,
+                temporal_context,
+            )
+            target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
+            candidate_prompt = VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE.format(
+                target_timestamp_text=target_timestamp_text,
+                candidate_lines=self._format_macro_candidate_lines(macro_scores),
+            )
+            prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=candidate_prompt,
+                summary_images=input_summary_images,
+                max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+            )
+            video_macro_choice = self._extract_choice(
+                generated_text,
+                ["A", "B", "C", "D"],
+                alias_to_choice={
+                    "直線系": "A",
+                    "左回転系": "B",
+                    "右回転系": "C",
+                    "その他": "D",
+                },
+            )
+            combined_macro_scores = self._combine_sensor_and_video_macro_scores(
+                macro_scores,
+                video_choice=video_macro_choice,
+            )
+            fused_macro = self._choose_best_macro_from_scores(combined_macro_scores)
+            trajectory_features = self._trajectory_features_from_geometry(geometry, sensor_data)
+            final_macro, graph_debug = self._apply_veto_only_graph_macro(
+                fused_macro,
+                sensor_data,
+                trajectory_features,
+                combined_macro_scores,
+            )
+            final_label = MACRO_OUTPUT_TO_LABEL[final_macro]
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            self.last_prediction_details = {
+                "mode": "sensor_video_late_fusion_4class",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+                **self.runtime_metadata,
+                "prompt_version": PROMPT_VERSION,
+                "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
+                "inference_mode": "direct_sensor_macro_prior_then_video_plus_summary_macro_selection",
+                "prompt_text": prompt_text,
+                "generated_text": generated_text,
+                "video_macro_choice": video_macro_choice,
+                "sensor_primary_macro": sensor_macro_debug.get("primary_macro"),
+                "sensor_primary_macro_name": sensor_macro_debug.get("primary_macro_name"),
+                "sensor_macro_rule_reasons": sensor_macro_debug.get("rule_reasons"),
+                "sensor_temporal_context": temporal_context,
+                "sensor_macro_debug": sensor_macro_debug,
+                "sensor_macro_scores": macro_scores,
+                "combined_macro_scores": combined_macro_scores,
+                "fused_macro_before_graph": fused_macro,
+                "fused_macro_before_graph_name": MACRO_OUTPUT_NAMES.get(fused_macro),
+                "predicted_macro_choice": final_macro,
+                "predicted_macro_name": MACRO_OUTPUT_NAMES.get(final_macro),
+                "predicted_label": final_label,
+                "predicted_label_name": ACTION_LABELS.get(final_label),
+                "trajectory_features": trajectory_features,
+                "generated_trajectory_summary_count": len(generated_summary_images),
+                "trajectory_summary_count": len(input_summary_images),
+                "visual_input_count": 1 + len(input_summary_images),
+                "graph": graph_debug.get("graph"),
+                "graph_veto_applied": graph_debug.get("veto_applied"),
+                "graph_veto_reason": graph_debug.get("veto_reason"),
+                "video_window_start_seconds": clip_info["window_start_seconds"],
+                "video_window_end_seconds": clip_info["window_end_seconds"],
+                "target_center_time_seconds": clip_info["target_center_time_seconds"],
+                "target_seconds_in_clip": clip_info["target_seconds_in_clip"],
+                "target_timestamp_text": target_timestamp_text,
+                "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
+                "video_clip_fps": clip_info["fps"],
+                "video_clip_frame_count": clip_info["clip_frame_count"],
+                "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
+                "source_frame_start": clip_info["source_frame_start"],
+                "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
+                "video_processor_metadata": processor_metadata.get("video_metadata"),
+                "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "summary_image_count": processor_metadata.get("summary_image_count"),
+                "inference_latency_ms": latency_ms,
+                "error": None,
+            }
+            logger.info(
+                "[Sensor-video late fusion 4class] sensor=%s/%s video=%s fused=%s final=%s veto=%s",
+                sensor_macro_debug.get("primary_macro_name"),
+                sensor_macro_debug.get("primary_macro"),
+                video_macro_choice,
+                fused_macro,
+                final_macro,
+                graph_debug.get("veto_applied"),
+            )
+            return final_label
+        finally:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+
     def _apply_macro_graph(
         self,
         initial_macro_choice: str,
@@ -1672,11 +2004,11 @@ class HeronAnnotatorWithTrajectory:
             "sensor_data": dict(sensor_data),
             "annotation_center_time_seconds": start_time,
             "sample_id": sample_id,
-            "mode": "sensor_video_late_fusion_11class",
+            "mode": "sensor_video_late_fusion_4class",
             **self.runtime_metadata,
         }
 
-        return self._predict_sensor_video_late_fusion(
+        return self._predict_sensor_video_late_fusion_macro(
             video_path=video_path,
             sensor_data=sensor_data,
             start_time=start_time,

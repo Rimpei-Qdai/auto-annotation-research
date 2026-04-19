@@ -610,22 +610,20 @@ class MacroGraphVerifier:
             add("B", 0.22, "Stage2 は右回転だが幾何は左方向")
 
         if stage1_choice == "A" and point_like:
-            add("D", 0.08, "Stage1 は直線系だが軌道は極短でその他寄り")
+            add("A", 0.06, "Stage1 は直進系で軌道は極短、停止/発進寄り")
 
         if point_like:
-            add("D", 0.28, "軌道が短く停止・その他寄り")
-            add("A", -0.10, "極短軌道は直線系と矛盾")
+            add("A", 0.22, "軌道が短く停止/発進を含む直進系寄り")
 
         if motion_state == "STOPLIKE":
-            add("D", 0.24, "速度と軌道長から stop-like")
+            add("A", 0.20, "速度と軌道長から停止/発進寄り")
         elif motion_state == "DECEL":
             add("A", 0.10, "減速は直線系にも含まれる")
-            add("D", 0.08, "低速減速はその他寄りでもある")
         elif motion_state in {"ACCEL", "CRUISE"} and turn_sign == "STRAIGHT":
             add("A", 0.14, "直進かつ巡航/加速")
 
         if speed < DEFAULT_SPEED_STOP_THRESHOLD and forward_distance < 3.0:
-            add("D", 0.12, "低速かつ前進距離が短い")
+            add("A", 0.10, "低速かつ前進距離が短く停止/発進寄り")
 
         if lateral_ratio > 0.18 and turn_sign == "LEFT":
             add("B", 0.14, "横偏位比が大きく左回転寄り")
