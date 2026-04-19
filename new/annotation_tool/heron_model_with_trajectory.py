@@ -5,8 +5,12 @@ Supports trajectory drawing on 4 frames for auto-annotation
 """
 
 import os
+import csv
+import bisect
 import logging
 import subprocess
+import tempfile
+import time
 from typing import List, Optional, Dict, Any, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import cv2
@@ -45,12 +49,27 @@ from config import (
     MACRO_OUTPUT_TO_LABEL,
     MACRO_OUTPUT_NAMES,
     PROMPT_VERSION,
+    MAX_NEW_TOKENS_STANDARD,
+    VIDEO_CLIP_DURATION_SECONDS,
+    SENSOR_TEMPORAL_WINDOW_SECONDS,
+    SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+    VIDEO_CANDIDATE_TOP_K,
+    VIDEO_CHOICE_BONUS,
+    MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+    ACTION_LABELS,
+    VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE,
 )
 
 logger = logging.getLogger(__name__)
 REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
     label_id: MACRO_OUTPUT_NAMES[macro_code]
     for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
+}
+FINE_LABEL_TO_MACRO_GROUP = {
+    1: "A", 2: "A", 3: "A",
+    6: "B", 8: "B",
+    7: "C", 9: "C", 10: "C",
+    0: "D", 4: "D", 5: "D",
 }
 
 
@@ -101,6 +120,8 @@ class HeronAnnotatorWithTrajectory:
         self._is_heron = False
         self.last_prediction_details = {}
         self.runtime_metadata = get_runtime_metadata()
+        self._sensor_temporal_samples: Dict[str, List[Dict[str, Any]]] = {}
+        self._sensor_temporal_lookup: Dict[int, Tuple[str, int]] = {}
         logger.info(
             "Annotator runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
             self.runtime_metadata.get("repo_branch"),
@@ -124,6 +145,7 @@ class HeronAnnotatorWithTrajectory:
         
         # Initialize trajectory visualizer
         self._init_trajectory_visualizer()
+        self._init_sensor_temporal_index()
     
     def _init_trajectory_visualizer(self):
         """Initialize trajectory visualization with camera parameters"""
@@ -174,6 +196,159 @@ class HeronAnnotatorWithTrajectory:
             image_size=(width, height)
         )
         logger.info("Trajectory visualizer initialized")
+
+    def _init_sensor_temporal_index(self):
+        """Load nearby sensor rows so the baseline can use temporal context."""
+        sample_csv = os.path.join(_repo_root(), "sample", "annotation_samples.csv")
+        if not os.path.exists(sample_csv):
+            logger.warning(f"Sensor temporal index source not found: {sample_csv}")
+            return
+
+        def _safe_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
+            value = row.get(key, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(row: Dict[str, Any], key: str, default: int = 0) -> int:
+            value = row.get(key, default)
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+        per_taxi: Dict[str, List[Dict[str, Any]]] = {}
+        with open(sample_csv, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                sample_id = _safe_int(row, "sample_id", -1)
+                taxi_id = str(row.get("taxi_id") or "")
+                timestamp = _safe_int(row, "timestamp", 0)
+                if sample_id < 0 or not taxi_id or timestamp <= 0:
+                    continue
+
+                per_taxi.setdefault(taxi_id, []).append({
+                    "sample_id": sample_id,
+                    "timestamp": timestamp,
+                    "speed": _safe_float(row, "speed"),
+                    "acc_x": _safe_float(row, "acc_x"),
+                    "gyro_z": _safe_float(row, "gyro_z"),
+                    "heading": _safe_float(row, "heading"),
+                    "brake": _safe_int(row, "brake"),
+                    "blinker_l": _safe_int(row, "blinker_l"),
+                    "blinker_r": _safe_int(row, "blinker_r"),
+                    "rapidAccelerator": _safe_int(row, "rapidAccelerator"),
+                    "rapidDecelerator": _safe_int(row, "rapidDecelerator"),
+                })
+
+        for taxi_id, samples in per_taxi.items():
+            samples.sort(key=lambda x: x["timestamp"])
+            self._sensor_temporal_samples[taxi_id] = samples
+            for idx, sample in enumerate(samples):
+                self._sensor_temporal_lookup[sample["sample_id"]] = (taxi_id, idx)
+
+        logger.info(
+            "Sensor temporal index initialized: %d taxis / %d samples",
+            len(self._sensor_temporal_samples),
+            len(self._sensor_temporal_lookup),
+        )
+
+    @staticmethod
+    def _signed_heading_delta_deg(start_heading: float, end_heading: float) -> float:
+        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
+        return delta
+
+    def _build_sensor_temporal_context(
+        self,
+        sample_id: Optional[int],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build temporal features from nearby same-taxi sensor rows."""
+        current_speed = float(sensor_data.get("speed", 0.0))
+        current_acc_x = float(sensor_data.get("acc_x", 0.0))
+        current_gyro = float(sensor_data.get("gyro_z", 0.0))
+        base_context: Dict[str, Any] = {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": "snapshot_only",
+            "neighbor_count": 1,
+            "pre_count": 0,
+            "post_count": 0,
+            "speed_pre_mean": current_speed,
+            "speed_post_mean": current_speed,
+            "speed_delta": 0.0,
+            "speed_slope_kmh_per_s": 0.0,
+            "acc_x_mean": current_acc_x,
+            "gyro_z_mean": current_gyro,
+            "gyro_z_integral": 0.0,
+            "max_abs_gyro_z": abs(current_gyro),
+            "heading_delta_deg": 0.0,
+            "low_speed_ratio": 1.0 if current_speed <= 5.0 else 0.0,
+            "standstill_ratio": 1.0 if current_speed <= 1.0 else 0.0,
+        }
+        if sample_id is None or sample_id not in self._sensor_temporal_lookup:
+            return base_context
+
+        taxi_id, idx = self._sensor_temporal_lookup[sample_id]
+        samples = self._sensor_temporal_samples.get(taxi_id, [])
+        if not samples:
+            return base_context
+
+        timestamps = [sample["timestamp"] for sample in samples]
+        center_ts = samples[idx]["timestamp"]
+
+        def _slice(window_seconds: float) -> List[Dict[str, Any]]:
+            lower = center_ts - int(window_seconds * 1000)
+            upper = center_ts + int(window_seconds * 1000)
+            left = bisect.bisect_left(timestamps, lower)
+            right = bisect.bisect_right(timestamps, upper)
+            return samples[left:right]
+
+        selected = _slice(SENSOR_TEMPORAL_WINDOW_SECONDS)
+        source = "preferred_window"
+        if len(selected) < 3:
+            selected = _slice(SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS)
+            source = "expanded_window" if len(selected) >= 3 else "snapshot_only"
+
+        if len(selected) < 2:
+            return base_context
+
+        ordered = sorted(selected, key=lambda row: row["timestamp"])
+        pre = [row for row in ordered if row["timestamp"] < center_ts]
+        post = [row for row in ordered if row["timestamp"] > center_ts]
+
+        duration_seconds = max((ordered[-1]["timestamp"] - ordered[0]["timestamp"]) / 1000.0, 1e-3)
+        speed_pre_mean = np.mean([row["speed"] for row in pre]) if pre else current_speed
+        speed_post_mean = np.mean([row["speed"] for row in post]) if post else current_speed
+        speed_delta = speed_post_mean - speed_pre_mean
+        speed_slope = speed_delta / duration_seconds
+        acc_x_mean = float(np.mean([row["acc_x"] for row in ordered]))
+        gyro_z_mean = float(np.mean([row["gyro_z"] for row in ordered]))
+        gyro_z_integral = gyro_z_mean * duration_seconds
+        max_abs_gyro = max(abs(row["gyro_z"]) for row in ordered)
+        heading_delta = self._signed_heading_delta_deg(ordered[0]["heading"], ordered[-1]["heading"])
+        low_speed_ratio = sum(1 for row in ordered if row["speed"] <= 5.0) / len(ordered)
+        standstill_ratio = sum(1 for row in ordered if row["speed"] <= 1.0) / len(ordered)
+
+        return {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": source,
+            "neighbor_count": len(ordered),
+            "pre_count": len(pre),
+            "post_count": len(post),
+            "speed_pre_mean": float(speed_pre_mean),
+            "speed_post_mean": float(speed_post_mean),
+            "speed_delta": float(speed_delta),
+            "speed_slope_kmh_per_s": float(speed_slope),
+            "acc_x_mean": acc_x_mean,
+            "gyro_z_mean": gyro_z_mean,
+            "gyro_z_integral": float(gyro_z_integral),
+            "max_abs_gyro_z": float(max_abs_gyro),
+            "heading_delta_deg": float(heading_delta),
+            "low_speed_ratio": float(low_speed_ratio),
+            "standstill_ratio": float(standstill_ratio),
+        }
     
     @property
     def model(self):
@@ -708,6 +883,45 @@ class HeronAnnotatorWithTrajectory:
         self.last_prediction_details["visual_input_count"] = len(model_frames)
         return model_frames, geometry
 
+    def _build_trajectory_summary_images(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Build clean trajectory summary images without raw frames."""
+        geometry = self._build_trajectory_geometry(sensor_data)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+
+        if self.save_trajectory_frames and sample_id is not None:
+            os.makedirs(self.trajectory_output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_topdown_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
+            )
+            summary_normalized_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            normalized_summary.save(summary_normalized_path, quality=95)
+
+        return [topdown_summary, normalized_summary], geometry
+
+    def _build_video_plus_summary_content(
+        self,
+        clip_path: str,
+        summary_images: List[Image.Image],
+        prompt_text: str,
+    ) -> List[Dict[str, Any]]:
+        """Build multimodal content with one video, trajectory summaries, and text."""
+        return [
+            {"type": "video", "video": str(clip_path)},
+            *[{"type": "image", "image": image} for image in summary_images],
+            {"type": "text", "text": prompt_text},
+        ]
+
     def _run_prompt_on_frames(
         self,
         frames: List[Image.Image],
@@ -765,6 +979,198 @@ class HeronAnnotatorWithTrajectory:
         )[0].strip()
         return generated_text
 
+    def _compute_video_window_bounds(
+        self,
+        center_time: float,
+        total_duration: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Tuple[float, float]:
+        """Compute a centered time window clipped to the source video duration."""
+        if total_duration <= 0:
+            return 0.0, max(window_duration, 0.0)
+
+        clamped_center = min(max(center_time, 0.0), total_duration)
+        usable_window = min(window_duration, total_duration)
+        half_window = usable_window / 2.0
+
+        window_start = max(0.0, clamped_center - half_window)
+        window_end = min(total_duration, clamped_center + half_window)
+
+        if (window_end - window_start) < usable_window:
+            if window_start <= 0.0:
+                window_end = min(total_duration, usable_window)
+            elif window_end >= total_duration:
+                window_start = max(0.0, total_duration - usable_window)
+
+        return float(window_start), float(window_end)
+
+    def _create_centered_video_clip(
+        self,
+        video_path: str,
+        center_time: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Dict[str, Any]:
+        """Create a temporary clip around the annotation timestamp using the source fps."""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+
+        writer = None
+        clip_path = None
+        frames_written = 0
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps <= 0:
+                fps = 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            total_duration = total_frames / fps if total_frames > 0 else 0.0
+
+            window_start, window_end = self._compute_video_window_bounds(
+                center_time=center_time,
+                total_duration=total_duration,
+                window_duration=window_duration,
+            )
+            start_frame = max(0, int(np.floor(window_start * fps)))
+            end_frame_exclusive = min(total_frames, int(np.ceil(window_end * fps)))
+
+            if end_frame_exclusive <= start_frame:
+                end_frame_exclusive = min(total_frames, start_frame + max(1, int(round(fps))))
+
+            fd, clip_path = tempfile.mkstemp(prefix="sensor_video_clip_", suffix=".mp4")
+            os.close(fd)
+            writer = cv2.VideoWriter(
+                clip_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
+            if not writer.isOpened():
+                raise ValueError(f"Failed to create temporary clip: {clip_path}")
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(start_frame, end_frame_exclusive):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                writer.write(frame)
+                frames_written += 1
+
+            if frames_written == 0:
+                raise ValueError("Failed to write any frames to temporary clip")
+
+            return {
+                "clip_path": clip_path,
+                "target_center_time_seconds": float(center_time),
+                "window_start_seconds": window_start,
+                "window_end_seconds": window_end,
+                "target_seconds_in_clip": max(0.0, float(center_time) - window_start),
+                "clip_duration_seconds": max(0.0, window_end - window_start),
+                "fps": fps,
+                "source_total_duration_seconds": total_duration,
+                "source_total_frames": total_frames,
+                "clip_frame_count": frames_written,
+                "source_frame_start": start_frame,
+                "source_frame_end_exclusive": end_frame_exclusive,
+            }
+        except Exception:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+            raise
+        finally:
+            if writer is not None:
+                writer.release()
+            cap.release()
+
+    def _serialize_video_metadata(self, value: Any) -> Any:
+        """Convert processor video metadata into JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._serialize_video_metadata(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_video_metadata(v) for v in value]
+        if hasattr(value, "__dict__"):
+            return {
+                str(k): self._serialize_video_metadata(v)
+                for k, v in value.__dict__.items()
+                if not k.startswith("_")
+            }
+        return str(value)
+
+    def _run_prompt_on_video_clip(
+        self,
+        clip_path: str,
+        prompt_text: str,
+        summary_images: Optional[List[Image.Image]] = None,
+        max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Run a single prompt on a video clip path."""
+        summary_images = summary_images or []
+        messages = [
+            {
+                "role": "user",
+                "content": self._build_video_plus_summary_content(
+                    clip_path=clip_path,
+                    summary_images=summary_images,
+                    prompt_text=prompt_text,
+                ),
+            }
+        ]
+        text_prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            return_metadata=True,
+        )
+        video_metadata = inputs.pop("video_metadata", None)
+        inputs = inputs.to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_ids = output_ids[:, prompt_length:]
+        if generated_ids.shape[1] == 0:
+            generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        else:
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        metadata = {
+            "video_metadata": self._serialize_video_metadata(video_metadata),
+            "video_grid_thw": inputs.get("video_grid_thw").detach().cpu().tolist() if "video_grid_thw" in inputs else None,
+            "summary_image_count": len(summary_images),
+        }
+        return text_prompt, generated_text, metadata
+
+    def _format_clip_timestamp(self, seconds: float) -> str:
+        """Format clip-relative seconds as MM:SS or MM:SS.s."""
+        seconds = max(0.0, float(seconds))
+        whole_minutes = int(seconds // 60)
+        remaining_seconds = seconds - (whole_minutes * 60)
+        if abs(remaining_seconds - round(remaining_seconds)) < 1e-6:
+            return f"{whole_minutes:02d}:{int(round(remaining_seconds)):02d}"
+        return f"{whole_minutes:02d}:{remaining_seconds:04.1f}"
+
     def _extract_choice(
         self,
         text: str,
@@ -798,6 +1204,410 @@ class HeronAnnotatorWithTrajectory:
                     return choice.upper()
 
         return None
+
+    def _classify_sensor_only_label(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Classify a single 11-class label from sensor values plus temporal context."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        abs_gyro = abs(gyro_z)
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        temporal_context = temporal_context or {}
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs_gyro))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
+
+        reason = {
+            "speed_kmh": speed,
+            "acc_x": acc_x,
+            "gyro_z": gyro_z,
+            "abs_gyro_z": abs_gyro,
+            "brake": brake,
+            "blinker_l": blinker_l,
+            "blinker_r": blinker_r,
+            "rapidAccelerator": rapid_acc,
+            "rapidDecelerator": rapid_decel,
+            "temporal_source": source,
+            "speed_delta": speed_delta,
+            "speed_slope_kmh_per_s": speed_slope,
+            "acc_x_mean": mean_acc_x,
+            "gyro_z_integral": gyro_integral,
+            "max_abs_gyro_z_window": max_abs_gyro,
+            "heading_delta_deg": heading_delta,
+            "low_speed_ratio": low_speed_ratio,
+            "standstill_ratio": standstill_ratio,
+        }
+
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                reason["rule"] = "temporal_standstill_start"
+                return 5, reason
+            reason["rule"] = "temporal_standstill_stop"
+            return 4, reason
+
+        if max_abs_gyro >= 0.45 and speed <= 18.0 and abs(heading_delta) >= 100.0:
+            reason["rule"] = "temporal_uturn"
+            return 10, reason
+
+        if abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18:
+            reason["rule"] = "temporal_turn"
+            return (6 if signed_rotation > 0 else 7), reason
+
+        if (blinker_l or blinker_r or abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0) and speed >= 15.0:
+            if blinker_l and not blinker_r:
+                reason["rule"] = "temporal_lane_change_left"
+                return 8, reason
+            if blinker_r and not blinker_l:
+                reason["rule"] = "temporal_lane_change_right"
+                return 9, reason
+            if abs(signed_rotation) >= 0.16:
+                reason["rule"] = "temporal_lane_change_from_yaw"
+                return (8 if signed_rotation > 0 else 9), reason
+
+        if speed <= 6.0 and (brake or standstill_ratio >= 0.35 or low_speed_ratio >= 0.6) and (speed_delta <= -3.0 or mean_acc_x <= -0.18):
+            reason["rule"] = "temporal_stop_like"
+            return 4, reason
+
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            reason["rule"] = "temporal_acceleration"
+            return 2, reason
+
+        if speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            if speed <= 8.0 and (brake or low_speed_ratio >= 0.5):
+                reason["rule"] = "temporal_slow_decel_stop_like"
+                return 4, reason
+            reason["rule"] = "temporal_deceleration"
+            return 3, reason
+
+        if abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12 and abs(signed_rotation) <= 0.10 and max_abs_gyro <= 0.08:
+            reason["rule"] = "temporal_constant_speed"
+            return 1, reason
+
+        if mean_acc_x < -0.05 or acc_x < -0.10:
+            reason["rule"] = "fallback_temporal_deceleration"
+            return 3, reason
+
+        if mean_acc_x > 0.05 or acc_x > 0.10:
+            reason["rule"] = "fallback_temporal_acceleration"
+            return 2, reason
+
+        reason["rule"] = "fallback_temporal_constant_speed"
+        return 1, reason
+
+    def _build_sensor_candidate_scores(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Dict[str, Any],
+        primary_label: int,
+    ) -> Tuple[Dict[int, float], Dict[str, Any]]:
+        """Build sensor-driven candidate scores for late fusion."""
+        speed = float(sensor_data.get("speed", 0.0))
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", sensor_data.get("acc_x", 0.0)))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs(float(sensor_data.get("gyro_z", 0.0)))))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+
+        scores: Dict[int, float] = {}
+
+        def add(label: int, amount: float) -> None:
+            scores[label] = round(scores.get(label, 0.0) + amount, 3)
+
+        add(primary_label, 0.55)
+
+        if primary_label in {1, 2, 3, 4, 5, 0}:
+            add(1, 0.18)
+            if speed_delta >= 4.0 or speed_slope >= 0.8 or mean_acc_x >= 0.12:
+                add(2, 0.28)
+                if speed <= 6.0 or standstill_ratio >= 0.2:
+                    add(5, 0.22)
+            if speed_delta <= -4.0 or speed_slope <= -0.8 or mean_acc_x <= -0.12:
+                add(3, 0.28)
+                if speed <= 8.0 or brake or low_speed_ratio >= 0.4:
+                    add(4, 0.24)
+            if speed <= 2.0 or standstill_ratio >= 0.35 or (brake and low_speed_ratio >= 0.4):
+                add(4, 0.30)
+            if speed <= 4.0 and speed_delta >= 3.0 and brake == 0:
+                add(5, 0.26)
+            if primary_label == 0:
+                add(0, 0.20)
+        elif primary_label in {6, 8}:
+            add(6, 0.22 if abs(heading_delta) >= 18.0 or max_abs_gyro >= 0.12 else 0.12)
+            add(8, 0.28 if blinker_l or (speed >= 18.0 and abs(heading_delta) < 25.0) else 0.12)
+        elif primary_label in {7, 9, 10}:
+            add(7, 0.22 if abs(heading_delta) >= 18.0 or max_abs_gyro >= 0.12 else 0.12)
+            add(9, 0.28 if blinker_r or (speed >= 18.0 and abs(heading_delta) < 25.0) else 0.12)
+            if abs(heading_delta) >= 90.0 and speed <= 18.0 and max_abs_gyro >= 0.30:
+                add(10, 0.32)
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        top_candidates = [label for label, _ in ranked[:VIDEO_CANDIDATE_TOP_K]]
+        if len(top_candidates) == 1:
+            top_candidates.append(0 if top_candidates[0] != 0 else 1)
+
+        return (
+            {label: scores[label] for label in top_candidates},
+            {
+                "primary_label": primary_label,
+                "primary_name": ACTION_LABELS.get(primary_label),
+                "scores": scores,
+                "selected_candidates": top_candidates,
+            },
+        )
+
+    def _format_candidate_lines(self, candidate_scores: Dict[int, float]) -> str:
+        ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
+        return "\n".join(
+            f"- {label}: {ACTION_LABELS.get(label, '不明')} (sensor_score={score:.2f})"
+            for label, score in ranked
+        )
+
+    def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
+        import re
+
+        if not text:
+            return None
+        allowed = {int(label) for label in allowed_labels}
+        assistant_match = re.search(r'assistant\s*(.*)', text, re.DOTALL | re.IGNORECASE)
+        response_text = assistant_match.group(1).strip() if assistant_match else text[-200:].strip()
+        candidates = []
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        if lines:
+            candidates.append(lines[-1])
+        candidates.append(response_text)
+
+        for candidate in candidates:
+            for match in re.findall(r"\b10\b|\b[0-9]\b", candidate):
+                value = int(match)
+                if value in allowed:
+                    return value
+        return None
+
+    def _combine_sensor_and_video_scores(
+        self,
+        candidate_scores: Dict[int, float],
+        *,
+        video_choice: Optional[int],
+    ) -> Dict[int, float]:
+        combined = dict(candidate_scores)
+        if video_choice is not None and video_choice in combined:
+            combined[video_choice] = round(combined[video_choice] + VIDEO_CHOICE_BONUS, 3)
+        return combined
+
+    def _choose_best_label_from_scores(self, score_map: Dict[int, float]) -> int:
+        return max(score_map.items(), key=lambda item: (item[1], -item[0]))[0]
+
+    def _trajectory_features_for_graph(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        geometry = self._build_trajectory_geometry(sensor_data)
+        trajectory_3d = geometry["trajectory_3d"]
+        return {
+            "visible_count": geometry["visible_count"],
+            "trajectory_points": len(trajectory_3d),
+            "final_x_m": float(trajectory_3d[-1][0]),
+            "final_y_m": float(trajectory_3d[-1][1]),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "speed": float(sensor_data.get("speed", 0.0)),
+        }
+
+    def _trajectory_features_from_geometry(
+        self,
+        geometry: Dict[str, Any],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trajectory_3d = geometry["trajectory_3d"]
+        return {
+            "visible_count": geometry["visible_count"],
+            "trajectory_points": len(trajectory_3d),
+            "final_x_m": float(trajectory_3d[-1][0]),
+            "final_y_m": float(trajectory_3d[-1][1]),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "speed": float(sensor_data.get("speed", 0.0)),
+        }
+
+    def _apply_veto_only_graph(
+        self,
+        final_label: int,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        candidate_scores: Dict[int, float],
+    ) -> Tuple[int, Dict[str, Any]]:
+        initial_macro = FINE_LABEL_TO_MACRO_GROUP.get(final_label, "D")
+        stage1_choice = "A" if initial_macro == "A" else "N"
+        stage2_choice = None if initial_macro == "A" else initial_macro
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+
+        veto_applied = False
+        veto_reason = None
+        final_graph_label = final_label
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice") and strong_candidate["macro_choice"] != initial_macro:
+            target_macro = strong_candidate["macro_choice"]
+            macro_candidates = {
+                label: score for label, score in candidate_scores.items()
+                if FINE_LABEL_TO_MACRO_GROUP.get(label) == target_macro
+            }
+            if macro_candidates:
+                final_graph_label = self._choose_best_label_from_scores(macro_candidates)
+            else:
+                final_graph_label = MACRO_OUTPUT_TO_LABEL[target_macro]
+            veto_applied = True
+            veto_reason = {
+                "from_macro": initial_macro,
+                "to_macro": target_macro,
+                "strong_candidate": strong_candidate,
+            }
+
+        return final_graph_label, {
+            "graph": graph_result,
+            "veto_applied": veto_applied,
+            "veto_reason": veto_reason,
+        }
+
+    def _predict_sensor_video_late_fusion(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        start_time: float = 0.0,
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Sensor-temporal mainline + raw-video candidate selection + veto-only graph."""
+        clip_info = self._create_centered_video_clip(
+            video_path=video_path,
+            center_time=start_time,
+            window_duration=VIDEO_CLIP_DURATION_SECONDS,
+        )
+        clip_path = clip_info["clip_path"]
+        started_at = time.perf_counter()
+
+        try:
+            temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
+            sensor_primary_label, sensor_rule_reason = self._classify_sensor_only_label(
+                sensor_data,
+                temporal_context=temporal_context,
+            )
+            summary_images, geometry = self._build_trajectory_summary_images(
+                sensor_data,
+                sample_id=sample_id,
+            )
+            candidate_scores, sensor_prior_debug = self._build_sensor_candidate_scores(
+                sensor_data,
+                temporal_context,
+                sensor_primary_label,
+            )
+            candidate_labels = list(candidate_scores.keys())
+            target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
+            candidate_prompt = VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE.format(
+                target_timestamp_text=target_timestamp_text,
+                candidate_lines=self._format_candidate_lines(candidate_scores),
+            )
+            prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=candidate_prompt,
+                summary_images=summary_images,
+                max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+            )
+            video_choice = self._extract_numeric_choice(generated_text, candidate_labels)
+            combined_scores = self._combine_sensor_and_video_scores(
+                candidate_scores,
+                video_choice=video_choice,
+            )
+            fused_label = self._choose_best_label_from_scores(combined_scores)
+            trajectory_features = self._trajectory_features_from_geometry(geometry, sensor_data)
+            final_label, graph_debug = self._apply_veto_only_graph(
+                fused_label,
+                sensor_data,
+                trajectory_features,
+                combined_scores,
+            )
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            self.last_prediction_details = {
+                "mode": "sensor_video_late_fusion_11class",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+                **self.runtime_metadata,
+                "prompt_version": PROMPT_VERSION,
+                "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
+                "inference_mode": "sensor_prior_then_video_plus_summary_candidate_selection",
+                "prompt_text": prompt_text,
+                "generated_text": generated_text,
+                "video_choice": video_choice,
+                "sensor_primary_label": sensor_primary_label,
+                "sensor_primary_label_name": ACTION_LABELS.get(sensor_primary_label),
+                "sensor_rule_reason": sensor_rule_reason,
+                "sensor_temporal_context": temporal_context,
+                "sensor_prior_debug": sensor_prior_debug,
+                "candidate_labels": candidate_labels,
+                "candidate_label_names": [ACTION_LABELS.get(label) for label in candidate_labels],
+                "sensor_candidate_scores": candidate_scores,
+                "combined_candidate_scores": combined_scores,
+                "fused_label_before_graph": fused_label,
+                "fused_label_before_graph_name": ACTION_LABELS.get(fused_label),
+                "predicted_label": final_label,
+                "predicted_label_name": ACTION_LABELS.get(final_label),
+                "trajectory_features": trajectory_features,
+                "trajectory_summary_count": len(summary_images),
+                "visual_input_count": 1 + len(summary_images),
+                "graph": graph_debug.get("graph"),
+                "graph_veto_applied": graph_debug.get("veto_applied"),
+                "graph_veto_reason": graph_debug.get("veto_reason"),
+                "video_window_start_seconds": clip_info["window_start_seconds"],
+                "video_window_end_seconds": clip_info["window_end_seconds"],
+                "target_center_time_seconds": clip_info["target_center_time_seconds"],
+                "target_seconds_in_clip": clip_info["target_seconds_in_clip"],
+                "target_timestamp_text": target_timestamp_text,
+                "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
+                "video_clip_fps": clip_info["fps"],
+                "video_clip_frame_count": clip_info["clip_frame_count"],
+                "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
+                "source_frame_start": clip_info["source_frame_start"],
+                "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
+                "video_processor_metadata": processor_metadata.get("video_metadata"),
+                "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "summary_image_count": processor_metadata.get("summary_image_count"),
+                "inference_latency_ms": latency_ms,
+                "error": None,
+            }
+            logger.info(
+                "[Sensor-video late fusion] sensor=%s video=%s fused=%s final=%s veto=%s",
+                sensor_primary_label,
+                video_choice,
+                fused_label,
+                final_label,
+                graph_debug.get("veto_applied"),
+            )
+            return final_label
+        finally:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
 
     def _apply_macro_graph(
         self,
@@ -856,18 +1666,22 @@ class HeronAnnotatorWithTrajectory:
         """
         if not self.is_loaded:
             self.load_model()
-        
-        # use_l2mが指定されていない場合はconfig設定を使用
-        if use_l2m is None:
-            use_l2m = USE_L2M_COT
-        
-        # L2M+CoTパイプラインを使用する場合
-        if use_l2m:
-            logger.info("Using L2M+CoT pipeline for prediction")
-            return self._predict_with_l2m(video_path, sensor_data, start_time, sample_id)
-        
-        # Use multi-frame prediction with trajectory
-        return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
+
+        self.last_prediction_details = {
+            "video_path": video_path,
+            "sensor_data": dict(sensor_data),
+            "annotation_center_time_seconds": start_time,
+            "sample_id": sample_id,
+            "mode": "sensor_video_late_fusion_11class",
+            **self.runtime_metadata,
+        }
+
+        return self._predict_sensor_video_late_fusion(
+            video_path=video_path,
+            sensor_data=sensor_data,
+            start_time=start_time,
+            sample_id=sample_id,
+        )
     
     def _predict_with_l2m(
         self,
