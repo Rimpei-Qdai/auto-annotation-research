@@ -1141,7 +1141,7 @@ class HeronAnnotatorWithTrajectory:
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            return_metadata=True,
+            processor_kwargs={"return_metadata": True},
         )
         video_metadata = inputs.pop("video_metadata", None)
         inputs = inputs.to(self.device)
@@ -1929,8 +1929,8 @@ class HeronAnnotatorWithTrajectory:
             }
             logger.info(
                 "[Sensor-video late fusion 4class] sensor=%s/%s video=%s fused=%s final=%s veto=%s",
-                sensor_primary_label,
-                macro_debug.get("primary_macro"),
+                sensor_macro_debug.get("primary_macro_name"),
+                sensor_macro_debug.get("primary_macro"),
                 video_macro_choice,
                 fused_macro,
                 final_macro,
