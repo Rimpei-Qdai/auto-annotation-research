@@ -97,6 +97,15 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertEqual(content[0]["video"], "/tmp/example.mp4")
         self.assertEqual(content[-1]["text"], "候補から選んでください。")
 
+    def test_macro_prompt_uses_only_normalized_summary_image(self):
+        summary_images = [
+            Image.new("RGB", (32, 32), color=(255, 255, 255)),
+            Image.new("RGB", (32, 32), color=(240, 240, 240)),
+        ]
+        selected = self.annotator._select_summary_images_for_macro_prompt(summary_images)
+        self.assertEqual(len(selected), 1)
+        self.assertIs(selected[0], summary_images[1])
+
     def test_build_trajectory_summary_images_returns_two_images(self):
         summary_images, geometry = self.annotator._build_trajectory_summary_images(
             {

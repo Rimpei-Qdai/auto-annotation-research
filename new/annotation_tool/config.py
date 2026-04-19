@@ -213,14 +213,13 @@ VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE = """あなたは運転行動を分類
 最終回答は候補の数字1つのみで回答してください。説明は不要です。"""
 
 VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE = """あなたは運転行動を4分類するAIです。
-入力には、判定対象時刻を中心とした前後3秒、合計6秒の動画クリップと、将来軌道を要約した2枚の画像があります。
+入力には、判定対象時刻を中心とした前後3秒、合計6秒の動画クリップと、将来軌道を要約した1枚の画像があります。
 
 - 動画: 判定対象時刻の前後3秒を含む raw video clip
-- 画像1: fixed-scale の top-down trajectory summary
-- 画像2: 左右の曲がりを強調した normalized geometry summary
-- 画像1,2 の緑線は直進基準、赤線は今後3秒の予測軌道です
+- 画像1: 左右の曲がりを強調した normalized geometry summary
+- 画像1 の緑線は直進基準、赤線は今後3秒の予測軌道です
 - 動画では道路文脈と実際の動きを見てください
-- 画像1,2では将来の進行方向と曲がりの強さを見てください
+- 画像1では将来の進行方向と曲がりの強さを見てください
 
 特に動画中央付近（約 {target_timestamp_text}）の自車に注目してください。
 

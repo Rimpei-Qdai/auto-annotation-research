@@ -1530,6 +1530,15 @@ class HeronAnnotatorWithTrajectory:
             for code, score in ranked
         )
 
+    def _select_summary_images_for_macro_prompt(
+        self,
+        summary_images: List[Image.Image],
+    ) -> List[Image.Image]:
+        """Use only the normalized trajectory summary for macro 4-class prompting."""
+        if not summary_images:
+            return []
+        return [summary_images[-1]]
+
     def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
         import re
 
@@ -1824,10 +1833,11 @@ class HeronAnnotatorWithTrajectory:
 
         try:
             temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
-            summary_images, geometry = self._build_trajectory_summary_images(
+            generated_summary_images, geometry = self._build_trajectory_summary_images(
                 sensor_data,
                 sample_id=sample_id,
             )
+            input_summary_images = self._select_summary_images_for_macro_prompt(generated_summary_images)
             macro_scores, sensor_macro_debug = self._build_sensor_direct_macro_scores(
                 sensor_data,
                 temporal_context,
@@ -1840,7 +1850,7 @@ class HeronAnnotatorWithTrajectory:
             prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
                 clip_path=clip_path,
                 prompt_text=candidate_prompt,
-                summary_images=summary_images,
+                summary_images=input_summary_images,
                 max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
             )
             video_macro_choice = self._extract_choice(
@@ -1894,8 +1904,9 @@ class HeronAnnotatorWithTrajectory:
                 "predicted_label": final_label,
                 "predicted_label_name": ACTION_LABELS.get(final_label),
                 "trajectory_features": trajectory_features,
-                "trajectory_summary_count": len(summary_images),
-                "visual_input_count": 1 + len(summary_images),
+                "generated_trajectory_summary_count": len(generated_summary_images),
+                "trajectory_summary_count": len(input_summary_images),
+                "visual_input_count": 1 + len(input_summary_images),
                 "graph": graph_debug.get("graph"),
                 "graph_veto_applied": graph_debug.get("veto_applied"),
                 "graph_veto_reason": graph_debug.get("veto_reason"),
