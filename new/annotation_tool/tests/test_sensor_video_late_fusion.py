@@ -1,6 +1,7 @@
 import unittest
 import sys
 from pathlib import Path
+from PIL import Image
 
 ANNOTATION_TOOL_DIR = Path(__file__).resolve().parents[1]
 if str(ANNOTATION_TOOL_DIR) not in sys.path:
@@ -81,6 +82,35 @@ class SensorVideoLateFusionTest(unittest.TestCase):
             [1, 2, 3],
         )
         self.assertEqual(choice, 2)
+
+    def test_video_plus_summary_content_contains_video_two_images_and_text(self):
+        summary_images = [
+            Image.new("RGB", (32, 32), color=(255, 255, 255)),
+            Image.new("RGB", (32, 32), color=(240, 240, 240)),
+        ]
+        content = self.annotator._build_video_plus_summary_content(
+            clip_path="/tmp/example.mp4",
+            summary_images=summary_images,
+            prompt_text="候補から選んでください。",
+        )
+        self.assertEqual([item["type"] for item in content], ["video", "image", "image", "text"])
+        self.assertEqual(content[0]["video"], "/tmp/example.mp4")
+        self.assertEqual(content[-1]["text"], "候補から選んでください。")
+
+    def test_build_trajectory_summary_images_returns_two_images(self):
+        summary_images, geometry = self.annotator._build_trajectory_summary_images(
+            {
+                "speed": 12.0,
+                "acc_x": -0.2,
+                "gyro_z": 0.18,
+            },
+            sample_id=None,
+        )
+        self.assertEqual(len(summary_images), 2)
+        self.assertEqual(summary_images[0].size, (720, 720))
+        self.assertEqual(summary_images[1].size, (720, 720))
+        self.assertIn("visible_count", geometry)
+        self.assertIn("trajectory_3d", geometry)
 
 
 if __name__ == "__main__":

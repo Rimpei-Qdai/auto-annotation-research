@@ -883,6 +883,45 @@ class HeronAnnotatorWithTrajectory:
         self.last_prediction_details["visual_input_count"] = len(model_frames)
         return model_frames, geometry
 
+    def _build_trajectory_summary_images(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Build clean trajectory summary images without raw frames."""
+        geometry = self._build_trajectory_geometry(sensor_data)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+
+        if self.save_trajectory_frames and sample_id is not None:
+            os.makedirs(self.trajectory_output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_topdown_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
+            )
+            summary_normalized_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            normalized_summary.save(summary_normalized_path, quality=95)
+
+        return [topdown_summary, normalized_summary], geometry
+
+    def _build_video_plus_summary_content(
+        self,
+        clip_path: str,
+        summary_images: List[Image.Image],
+        prompt_text: str,
+    ) -> List[Dict[str, Any]]:
+        """Build multimodal content with one video, trajectory summaries, and text."""
+        return [
+            {"type": "video", "video": str(clip_path)},
+            *[{"type": "image", "image": image} for image in summary_images],
+            {"type": "text", "text": prompt_text},
+        ]
+
     def _run_prompt_on_frames(
         self,
         frames: List[Image.Image],
@@ -1068,16 +1107,19 @@ class HeronAnnotatorWithTrajectory:
         self,
         clip_path: str,
         prompt_text: str,
+        summary_images: Optional[List[Image.Image]] = None,
         max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Run a single prompt on a video clip path."""
+        summary_images = summary_images or []
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "video", "video": str(clip_path)},
-                    {"type": "text", "text": prompt_text},
-                ],
+                "content": self._build_video_plus_summary_content(
+                    clip_path=clip_path,
+                    summary_images=summary_images,
+                    prompt_text=prompt_text,
+                ),
             }
         ]
         text_prompt = self.processor.apply_chat_template(
@@ -1116,6 +1158,7 @@ class HeronAnnotatorWithTrajectory:
         metadata = {
             "video_metadata": self._serialize_video_metadata(video_metadata),
             "video_grid_thw": inputs.get("video_grid_thw").detach().cpu().tolist() if "video_grid_thw" in inputs else None,
+            "summary_image_count": len(summary_images),
         }
         return text_prompt, generated_text, metadata
 
@@ -1388,6 +1431,21 @@ class HeronAnnotatorWithTrajectory:
             "speed": float(sensor_data.get("speed", 0.0)),
         }
 
+    def _trajectory_features_from_geometry(
+        self,
+        geometry: Dict[str, Any],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trajectory_3d = geometry["trajectory_3d"]
+        return {
+            "visible_count": geometry["visible_count"],
+            "trajectory_points": len(trajectory_3d),
+            "final_x_m": float(trajectory_3d[-1][0]),
+            "final_y_m": float(trajectory_3d[-1][1]),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "speed": float(sensor_data.get("speed", 0.0)),
+        }
+
     def _apply_veto_only_graph(
         self,
         final_label: int,
@@ -1454,6 +1512,10 @@ class HeronAnnotatorWithTrajectory:
                 sensor_data,
                 temporal_context=temporal_context,
             )
+            summary_images, geometry = self._build_trajectory_summary_images(
+                sensor_data,
+                sample_id=sample_id,
+            )
             candidate_scores, sensor_prior_debug = self._build_sensor_candidate_scores(
                 sensor_data,
                 temporal_context,
@@ -1468,6 +1530,7 @@ class HeronAnnotatorWithTrajectory:
             prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
                 clip_path=clip_path,
                 prompt_text=candidate_prompt,
+                summary_images=summary_images,
                 max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
             )
             video_choice = self._extract_numeric_choice(generated_text, candidate_labels)
@@ -1476,7 +1539,7 @@ class HeronAnnotatorWithTrajectory:
                 video_choice=video_choice,
             )
             fused_label = self._choose_best_label_from_scores(combined_scores)
-            trajectory_features = self._trajectory_features_for_graph(sensor_data)
+            trajectory_features = self._trajectory_features_from_geometry(geometry, sensor_data)
             final_label, graph_debug = self._apply_veto_only_graph(
                 fused_label,
                 sensor_data,
@@ -1492,8 +1555,8 @@ class HeronAnnotatorWithTrajectory:
                 "start_time": start_time,
                 **self.runtime_metadata,
                 "prompt_version": PROMPT_VERSION,
-                "video_input_mode": "raw_video_clip",
-                "inference_mode": "sensor_prior_then_video_candidate_selection",
+                "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
+                "inference_mode": "sensor_prior_then_video_plus_summary_candidate_selection",
                 "prompt_text": prompt_text,
                 "generated_text": generated_text,
                 "video_choice": video_choice,
@@ -1511,6 +1574,8 @@ class HeronAnnotatorWithTrajectory:
                 "predicted_label": final_label,
                 "predicted_label_name": ACTION_LABELS.get(final_label),
                 "trajectory_features": trajectory_features,
+                "trajectory_summary_count": len(summary_images),
+                "visual_input_count": 1 + len(summary_images),
                 "graph": graph_debug.get("graph"),
                 "graph_veto_applied": graph_debug.get("veto_applied"),
                 "graph_veto_reason": graph_debug.get("veto_reason"),
@@ -1527,6 +1592,7 @@ class HeronAnnotatorWithTrajectory:
                 "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
                 "video_processor_metadata": processor_metadata.get("video_metadata"),
                 "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "summary_image_count": processor_metadata.get("summary_image_count"),
                 "inference_latency_ms": latency_ms,
                 "error": None,
             }
