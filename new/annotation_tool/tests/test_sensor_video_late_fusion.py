@@ -112,6 +112,45 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertIn("visible_count", geometry)
         self.assertIn("trajectory_3d", geometry)
 
+    def test_build_sensor_macro_scores_aggregates_fine_candidates(self):
+        macro_scores, debug = self.annotator._build_sensor_macro_scores(
+            {1: 0.30, 3: 0.20, 6: 0.15, 8: 0.10, 4: 0.05},
+            primary_label=3,
+        )
+        self.assertEqual(debug["primary_macro"], "A")
+        self.assertGreater(macro_scores["A"], macro_scores["B"])
+        self.assertGreater(macro_scores["B"], macro_scores["D"])
+
+    def test_combine_sensor_and_video_macro_scores_can_flip_macro(self):
+        combined = self.annotator._combine_sensor_and_video_macro_scores(
+            {"A": 0.55, "B": 0.42, "C": 0.10, "D": 0.05},
+            video_choice="B",
+        )
+        best = self.annotator._choose_best_macro_from_scores(combined)
+        self.assertEqual(best, "B")
+
+    def test_apply_veto_only_graph_macro_changes_macro(self):
+        self.annotator.graph_verifier.build = lambda *args, **kwargs: {
+            "strong_candidate": {"macro_choice": "C", "score": 0.9},
+            "top_candidates": [
+                {"macro_choice": "C", "score": 0.9},
+                {"macro_choice": "A", "score": 0.2},
+            ],
+        }
+        final_macro, debug = self.annotator._apply_veto_only_graph_macro(
+            final_macro="B",
+            sensor_data={"speed": 25.0, "acc_x": 0.0, "gyro_z": -0.2},
+            trajectory_features={
+                "final_x_m": 12.0,
+                "final_y_m": -4.0,
+                "visible_count": 6,
+                "trajectory_points": 30,
+            },
+            candidate_scores={"A": 0.12, "B": 0.55, "C": 0.44, "D": 0.01},
+        )
+        self.assertEqual(final_macro, "C")
+        self.assertTrue(debug["veto_applied"])
+
 
 if __name__ == "__main__":
     unittest.main()

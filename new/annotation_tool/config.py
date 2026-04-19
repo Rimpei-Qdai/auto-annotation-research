@@ -73,7 +73,7 @@ MACRO_OUTPUT_NAMES = {
     "D": "その他",
 }
 
-PROMPT_VERSION = "sensor_video_late_fusion_v2_with_trajectory"
+PROMPT_VERSION = "sensor_video_late_fusion_v3_macro4_with_trajectory"
 
 # Legacy one-shot macro prompt kept for fallback / comparison.
 PROMPT_TEMPLATE = """あなたは運転行動を分析するAIです。
@@ -211,6 +211,34 @@ VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE = """あなたは運転行動を分類
 - 迷ったら、直前直後の動きも含めて最も自然な候補を選んでください
 
 最終回答は候補の数字1つのみで回答してください。説明は不要です。"""
+
+VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE = """あなたは運転行動を4分類するAIです。
+入力には、判定対象時刻を中心とした前後3秒、合計6秒の動画クリップと、将来軌道を要約した2枚の画像があります。
+
+- 動画: 判定対象時刻の前後3秒を含む raw video clip
+- 画像1: fixed-scale の top-down trajectory summary
+- 画像2: 左右の曲がりを強調した normalized geometry summary
+- 画像1,2 の緑線は直進基準、赤線は今後3秒の予測軌道です
+- 動画では道路文脈と実際の動きを見てください
+- 画像1,2では将来の進行方向と曲がりの強さを見てください
+
+特に動画中央付近（約 {target_timestamp_text}）の自車に注目してください。
+
+センサーから絞り込まれた4分類候補は以下です。
+{candidate_lines}
+
+分類定義:
+- A: 直線系（等速走行・加速・減速）
+- B: 左回転系（左折・左車線変更）
+- C: 右回転系（右折・右車線変更・転回）
+- D: その他（停止・発進・その他）
+
+判断ルール:
+- A/B/C/D の中から 1 つだけ選んでください
+- 動画と軌道画像が矛盾するときは、道路文脈は動画、将来の向きは軌道画像を優先して総合判断してください
+- 迷ったら、直前直後の動きも含めて最も自然な分類を選んでください
+
+最終回答は A, B, C, D のいずれか1文字のみで回答してください。説明は不要です。"""
 
 # Model Loading Settings
 MODEL_LOAD_TIMEOUT = 300  # seconds
