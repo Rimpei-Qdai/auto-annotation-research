@@ -196,6 +196,42 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertEqual(final_macro, "C")
         self.assertTrue(debug["veto_applied"])
 
+    def test_precomputed_sensor_window_context_is_preferred_when_available(self):
+        self.annotator._precomputed_sensor_windows = {
+            42: {
+                "sample_id": 42,
+                "center_timestamp": 3000,
+                "quality": "dense_window",
+                "runtime_source": "preferred_window",
+                "temporal_reliable": True,
+                "center_row_offset_ms": 0,
+                "max_gap_ms": 1000,
+                "points": [
+                    {"timestamp": 0, "speed": 10.0, "acc_x": 0.0, "gyro_z": 0.01, "heading": 0.0},
+                    {"timestamp": 1000, "speed": 11.0, "acc_x": 0.1, "gyro_z": 0.02, "heading": 5.0},
+                    {"timestamp": 2000, "speed": 12.0, "acc_x": 0.1, "gyro_z": 0.03, "heading": 10.0},
+                    {"timestamp": 3000, "speed": 13.0, "acc_x": 0.1, "gyro_z": 0.04, "heading": 15.0},
+                    {"timestamp": 4000, "speed": 14.0, "acc_x": 0.2, "gyro_z": 0.05, "heading": 20.0},
+                    {"timestamp": 5000, "speed": 15.0, "acc_x": 0.2, "gyro_z": 0.06, "heading": 25.0},
+                    {"timestamp": 6000, "speed": 16.0, "acc_x": 0.2, "gyro_z": 0.07, "heading": 30.0},
+                ],
+            }
+        }
+        self.annotator._sensor_temporal_lookup = {}
+
+        context = self.annotator._build_sensor_temporal_context(
+            42,
+            {"speed": 13.0, "acc_x": 0.1, "gyro_z": 0.04},
+        )
+
+        self.assertEqual(context["source"], "preferred_window")
+        self.assertEqual(context["window_quality"], "dense_window")
+        self.assertTrue(context["temporal_reliable"])
+        self.assertEqual(context["pre_count"], 3)
+        self.assertEqual(context["post_count"], 3)
+        self.assertGreater(context["speed_delta"], 0.0)
+        self.assertEqual(context["temporal_center_offset_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

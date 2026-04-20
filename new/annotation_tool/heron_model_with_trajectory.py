@@ -22,6 +22,7 @@ from datetime import datetime
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
 from driving_graph import MacroGraphVerifier
+from sensor_window_dataset import default_sensor_window_dataset_path, load_sensor_window_records
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -129,6 +130,7 @@ class HeronAnnotatorWithTrajectory:
         self.runtime_metadata = get_runtime_metadata()
         self._sensor_temporal_samples: Dict[str, List[Dict[str, Any]]] = {}
         self._sensor_temporal_lookup: Dict[int, Tuple[str, int]] = {}
+        self._precomputed_sensor_windows: Dict[int, Dict[str, Any]] = {}
         logger.info(
             "Annotator runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
             self.runtime_metadata.get("repo_branch"),
@@ -153,6 +155,7 @@ class HeronAnnotatorWithTrajectory:
         # Initialize trajectory visualizer
         self._init_trajectory_visualizer()
         self._init_sensor_temporal_index()
+        self._init_precomputed_sensor_windows()
     
     def _init_trajectory_visualizer(self):
         """Initialize trajectory visualization with camera parameters"""
@@ -260,24 +263,32 @@ class HeronAnnotatorWithTrajectory:
             len(self._sensor_temporal_lookup),
         )
 
-    @staticmethod
-    def _signed_heading_delta_deg(start_heading: float, end_heading: float) -> float:
-        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
-        return delta
+    def _init_precomputed_sensor_windows(self):
+        """Load sample-aligned sensor windows when a generated dataset is available."""
+        dataset_path = default_sensor_window_dataset_path(_repo_root())
+        if not os.path.exists(dataset_path):
+            return
 
-    def _build_sensor_temporal_context(
-        self,
-        sample_id: Optional[int],
-        sensor_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Build temporal features from nearby same-taxi sensor rows."""
+        try:
+            self._precomputed_sensor_windows = load_sensor_window_records(dataset_path)
+            logger.info(
+                "Loaded precomputed sensor windows: %d samples from %s",
+                len(self._precomputed_sensor_windows),
+                dataset_path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load precomputed sensor windows from %s: %s", dataset_path, exc)
+
+    def _base_sensor_temporal_context(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
         current_speed = float(sensor_data.get("speed", 0.0))
         current_acc_x = float(sensor_data.get("acc_x", 0.0))
         current_gyro = float(sensor_data.get("gyro_z", 0.0))
-        base_context: Dict[str, Any] = {
+        return {
             "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
             "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
             "source": "snapshot_only",
+            "window_quality": "snapshot_only",
+            "temporal_reliable": False,
             "neighbor_count": 1,
             "pre_count": 0,
             "post_count": 0,
@@ -292,7 +303,118 @@ class HeronAnnotatorWithTrajectory:
             "heading_delta_deg": 0.0,
             "low_speed_ratio": 1.0 if current_speed <= 5.0 else 0.0,
             "standstill_ratio": 1.0 if current_speed <= 1.0 else 0.0,
+            "temporal_center_offset_ms": None,
+            "temporal_max_gap_ms": 0,
         }
+
+    def _summarize_temporal_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        center_ts: int,
+        sensor_data: Dict[str, Any],
+        *,
+        source: str,
+        window_quality: str,
+        temporal_reliable: bool,
+        center_offset_ms: Optional[int] = None,
+        max_gap_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        base_context = self._base_sensor_temporal_context(sensor_data)
+        if not rows:
+            base_context.update({
+                "source": source,
+                "window_quality": window_quality,
+                "temporal_reliable": temporal_reliable,
+            })
+            return base_context
+
+        ordered = sorted(rows, key=lambda row: row["timestamp"])
+        pre = [row for row in ordered if row["timestamp"] < center_ts]
+        post = [row for row in ordered if row["timestamp"] > center_ts]
+        if len(ordered) < 2:
+            base_context.update({
+                "source": source,
+                "window_quality": window_quality,
+                "temporal_reliable": temporal_reliable,
+                "neighbor_count": len(ordered),
+                "pre_count": len(pre),
+                "post_count": len(post),
+                "temporal_center_offset_ms": center_offset_ms,
+                "temporal_max_gap_ms": max_gap_ms or 0,
+            })
+            return base_context
+
+        duration_seconds = max((ordered[-1]["timestamp"] - ordered[0]["timestamp"]) / 1000.0, 1e-3)
+        speed_pre_mean = np.mean([row["speed"] for row in pre]) if pre else base_context["speed_pre_mean"]
+        speed_post_mean = np.mean([row["speed"] for row in post]) if post else base_context["speed_post_mean"]
+        speed_delta = speed_post_mean - speed_pre_mean
+        speed_slope = speed_delta / duration_seconds
+        acc_x_mean = float(np.mean([row["acc_x"] for row in ordered]))
+        gyro_z_mean = float(np.mean([row["gyro_z"] for row in ordered]))
+        gyro_z_integral = gyro_z_mean * duration_seconds
+        max_abs_gyro = max(abs(row["gyro_z"]) for row in ordered)
+        heading_delta = self._signed_heading_delta_deg(ordered[0]["heading"], ordered[-1]["heading"])
+        low_speed_ratio = sum(1 for row in ordered if row["speed"] <= 5.0) / len(ordered)
+        standstill_ratio = sum(1 for row in ordered if row["speed"] <= 1.0) / len(ordered)
+        if max_gap_ms is None:
+            max_gap_ms = max(
+                (
+                    ordered[idx + 1]["timestamp"] - ordered[idx]["timestamp"]
+                    for idx in range(len(ordered) - 1)
+                ),
+                default=0,
+            )
+
+        return {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": source,
+            "window_quality": window_quality,
+            "temporal_reliable": temporal_reliable,
+            "neighbor_count": len(ordered),
+            "pre_count": len(pre),
+            "post_count": len(post),
+            "speed_pre_mean": float(speed_pre_mean),
+            "speed_post_mean": float(speed_post_mean),
+            "speed_delta": float(speed_delta),
+            "speed_slope_kmh_per_s": float(speed_slope),
+            "acc_x_mean": acc_x_mean,
+            "gyro_z_mean": gyro_z_mean,
+            "gyro_z_integral": float(gyro_z_integral),
+            "max_abs_gyro_z": float(max_abs_gyro),
+            "heading_delta_deg": float(heading_delta),
+            "low_speed_ratio": float(low_speed_ratio),
+            "standstill_ratio": float(standstill_ratio),
+            "temporal_center_offset_ms": center_offset_ms,
+            "temporal_max_gap_ms": int(max_gap_ms or 0),
+        }
+
+    @staticmethod
+    def _signed_heading_delta_deg(start_heading: float, end_heading: float) -> float:
+        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
+        return delta
+
+    def _build_sensor_temporal_context(
+        self,
+        sample_id: Optional[int],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build temporal features from nearby same-taxi sensor rows."""
+        base_context = self._base_sensor_temporal_context(sensor_data)
+        if sample_id is not None:
+            record = self._precomputed_sensor_windows.get(sample_id)
+            if record:
+                return self._summarize_temporal_rows(
+                    record.get("points", []),
+                    int(record.get("center_timestamp", 0) or 0),
+                    sensor_data,
+                    source=str(record.get("runtime_source") or "snapshot_only"),
+                    window_quality=str(record.get("quality") or "snapshot_only"),
+                    temporal_reliable=bool(record.get("temporal_reliable", False)),
+                    center_offset_ms=record.get("center_row_offset_ms"),
+                    max_gap_ms=record.get("max_gap_ms"),
+                )
+
         if sample_id is None or sample_id not in self._sensor_temporal_lookup:
             return base_context
 
@@ -319,43 +441,15 @@ class HeronAnnotatorWithTrajectory:
 
         if len(selected) < 2:
             return base_context
-
-        ordered = sorted(selected, key=lambda row: row["timestamp"])
-        pre = [row for row in ordered if row["timestamp"] < center_ts]
-        post = [row for row in ordered if row["timestamp"] > center_ts]
-
-        duration_seconds = max((ordered[-1]["timestamp"] - ordered[0]["timestamp"]) / 1000.0, 1e-3)
-        speed_pre_mean = np.mean([row["speed"] for row in pre]) if pre else current_speed
-        speed_post_mean = np.mean([row["speed"] for row in post]) if post else current_speed
-        speed_delta = speed_post_mean - speed_pre_mean
-        speed_slope = speed_delta / duration_seconds
-        acc_x_mean = float(np.mean([row["acc_x"] for row in ordered]))
-        gyro_z_mean = float(np.mean([row["gyro_z"] for row in ordered]))
-        gyro_z_integral = gyro_z_mean * duration_seconds
-        max_abs_gyro = max(abs(row["gyro_z"]) for row in ordered)
-        heading_delta = self._signed_heading_delta_deg(ordered[0]["heading"], ordered[-1]["heading"])
-        low_speed_ratio = sum(1 for row in ordered if row["speed"] <= 5.0) / len(ordered)
-        standstill_ratio = sum(1 for row in ordered if row["speed"] <= 1.0) / len(ordered)
-
-        return {
-            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
-            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
-            "source": source,
-            "neighbor_count": len(ordered),
-            "pre_count": len(pre),
-            "post_count": len(post),
-            "speed_pre_mean": float(speed_pre_mean),
-            "speed_post_mean": float(speed_post_mean),
-            "speed_delta": float(speed_delta),
-            "speed_slope_kmh_per_s": float(speed_slope),
-            "acc_x_mean": acc_x_mean,
-            "gyro_z_mean": gyro_z_mean,
-            "gyro_z_integral": float(gyro_z_integral),
-            "max_abs_gyro_z": float(max_abs_gyro),
-            "heading_delta_deg": float(heading_delta),
-            "low_speed_ratio": float(low_speed_ratio),
-            "standstill_ratio": float(standstill_ratio),
-        }
+        return self._summarize_temporal_rows(
+            selected,
+            center_ts,
+            sensor_data,
+            source=source,
+            window_quality="dense_window" if source == "preferred_window" else "sparse_window",
+            temporal_reliable=(source == "preferred_window"),
+            center_offset_ms=0,
+        )
     
     @property
     def model(self):
