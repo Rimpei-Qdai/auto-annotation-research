@@ -5,9 +5,14 @@ Supports trajectory drawing on 4 frames for auto-annotation
 """
 
 import os
+import csv
+import bisect
 import logging
+import subprocess
+import tempfile
+import time
 from typing import List, Optional, Dict, Any, Tuple
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
 import torch
@@ -16,7 +21,8 @@ from datetime import datetime
 
 # Import trajectory visualization
 from visual_prompting import TrajectoryVisualizer
-from vlm_runtime import VLMGenerationRuntime
+from driving_graph import MacroGraphVerifier
+from sensor_window_dataset import default_sensor_window_dataset_path, load_sensor_window_records
 
 # Heronモデルはtransformersから直接ロード可能
 HERON_AVAILABLE = True
@@ -36,11 +42,76 @@ from config import (
     NUM_FRAMES_TO_USE,
     USE_MULTI_FRAME,
     PROMPT_TEMPLATE,
+    STAGE1_PROMPT_TEMPLATE,
+    STAGE2_ROUTE_PROMPT_TEMPLATE,
+    STAGE3_TURN_PROMPT_TEMPLATE,
     ENABLE_FLASH_ATTENTION,
-    USE_L2M_COT
+    USE_L2M_COT,
+    MACRO_OUTPUT_TO_LABEL,
+    MACRO_OUTPUT_NAMES,
+    PROMPT_VERSION,
+    MAX_NEW_TOKENS_STANDARD,
+    VIDEO_CLIP_DURATION_SECONDS,
+    SENSOR_TEMPORAL_WINDOW_SECONDS,
+    SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+    VIDEO_CANDIDATE_TOP_K,
+    VIDEO_CHOICE_BONUS,
+    MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+    ACTION_LABELS,
+    VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE,
+    VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE,
 )
 
 logger = logging.getLogger(__name__)
+REPRESENTATIVE_LABEL_TO_MACRO_NAME = {
+    label_id: MACRO_OUTPUT_NAMES[macro_code]
+    for macro_code, label_id in MACRO_OUTPUT_TO_LABEL.items()
+}
+FINE_LABEL_TO_MACRO_GROUP = {
+    1: "A", 2: "A", 3: "A", 4: "A", 5: "A",
+    6: "B", 8: "B",
+    7: "C", 9: "C", 10: "C",
+    0: "D",
+}
+MACRO_LABEL_EXAMPLES = {
+    "A": "等速走行・加速・減速・停止・発進",
+    "B": "左折・左車線変更",
+    "C": "右折・右車線変更・転回",
+    "D": "その他",
+}
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _run_git_command(args: List[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return completed.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def get_runtime_metadata() -> Dict[str, Any]:
+    branch = _run_git_command(["branch", "--show-current"])
+    commit = _run_git_command(["rev-parse", "--short", "HEAD"])
+    dirty = bool(_run_git_command(["status", "--short"]))
+    return {
+        "repo_branch": branch,
+        "repo_commit": commit,
+        "repo_dirty": dirty,
+        "model_id": HERON_MODEL_ID,
+        "prompt_version": PROMPT_VERSION,
+        "use_l2m_cot": USE_L2M_COT,
+    }
 
 
 class HeronAnnotatorWithTrajectory:
@@ -55,13 +126,26 @@ class HeronAnnotatorWithTrajectory:
         self._tokenizer = None
         self._device = None
         self._is_heron = False
-        self._last_l2m_result = None  # predict_action_with_details で参照
-        self._generation_runtime = None
+        self.last_prediction_details = {}
+        self.runtime_metadata = get_runtime_metadata()
+        self._sensor_temporal_samples: Dict[str, List[Dict[str, Any]]] = {}
+        self._sensor_temporal_lookup: Dict[int, Tuple[str, int]] = {}
+        self._precomputed_sensor_windows: Dict[int, Dict[str, Any]] = {}
+        logger.info(
+            "Annotator runtime metadata: branch=%s commit=%s dirty=%s model_id=%s prompt_version=%s use_l2m_cot=%s",
+            self.runtime_metadata.get("repo_branch"),
+            self.runtime_metadata.get("repo_commit"),
+            self.runtime_metadata.get("repo_dirty"),
+            self.runtime_metadata.get("model_id"),
+            self.runtime_metadata.get("prompt_version"),
+            self.runtime_metadata.get("use_l2m_cot"),
+        )
         
         # Trajectory visualization settings
         self.save_trajectory_frames = save_trajectory_frames
         self.trajectory_output_dir = trajectory_output_dir
         self.trajectory_visualizer = None
+        self.graph_verifier = MacroGraphVerifier()
         
         # Create output directory for trajectory frames
         if self.save_trajectory_frames and not os.path.exists(self.trajectory_output_dir):
@@ -70,6 +154,8 @@ class HeronAnnotatorWithTrajectory:
         
         # Initialize trajectory visualizer
         self._init_trajectory_visualizer()
+        self._init_sensor_temporal_index()
+        self._init_precomputed_sensor_windows()
     
     def _init_trajectory_visualizer(self):
         """Initialize trajectory visualization with camera parameters"""
@@ -120,6 +206,250 @@ class HeronAnnotatorWithTrajectory:
             image_size=(width, height)
         )
         logger.info("Trajectory visualizer initialized")
+
+    def _init_sensor_temporal_index(self):
+        """Load nearby sensor rows so the baseline can use temporal context."""
+        sample_csv = os.path.join(_repo_root(), "sample", "annotation_samples.csv")
+        if not os.path.exists(sample_csv):
+            logger.warning(f"Sensor temporal index source not found: {sample_csv}")
+            return
+
+        def _safe_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
+            value = row.get(key, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(row: Dict[str, Any], key: str, default: int = 0) -> int:
+            value = row.get(key, default)
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+        per_taxi: Dict[str, List[Dict[str, Any]]] = {}
+        with open(sample_csv, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                sample_id = _safe_int(row, "sample_id", -1)
+                taxi_id = str(row.get("taxi_id") or "")
+                timestamp = _safe_int(row, "timestamp", 0)
+                if sample_id < 0 or not taxi_id or timestamp <= 0:
+                    continue
+
+                per_taxi.setdefault(taxi_id, []).append({
+                    "sample_id": sample_id,
+                    "timestamp": timestamp,
+                    "speed": _safe_float(row, "speed"),
+                    "acc_x": _safe_float(row, "acc_x"),
+                    "gyro_z": _safe_float(row, "gyro_z"),
+                    "heading": _safe_float(row, "heading"),
+                    "brake": _safe_int(row, "brake"),
+                    "blinker_l": _safe_int(row, "blinker_l"),
+                    "blinker_r": _safe_int(row, "blinker_r"),
+                    "rapidAccelerator": _safe_int(row, "rapidAccelerator"),
+                    "rapidDecelerator": _safe_int(row, "rapidDecelerator"),
+                })
+
+        for taxi_id, samples in per_taxi.items():
+            samples.sort(key=lambda x: x["timestamp"])
+            self._sensor_temporal_samples[taxi_id] = samples
+            for idx, sample in enumerate(samples):
+                self._sensor_temporal_lookup[sample["sample_id"]] = (taxi_id, idx)
+
+        logger.info(
+            "Sensor temporal index initialized: %d taxis / %d samples",
+            len(self._sensor_temporal_samples),
+            len(self._sensor_temporal_lookup),
+        )
+
+    def _init_precomputed_sensor_windows(self):
+        """Load sample-aligned sensor windows when a generated dataset is available."""
+        dataset_path = default_sensor_window_dataset_path(_repo_root())
+        if not os.path.exists(dataset_path):
+            return
+
+        try:
+            self._precomputed_sensor_windows = load_sensor_window_records(dataset_path)
+            logger.info(
+                "Loaded precomputed sensor windows: %d samples from %s",
+                len(self._precomputed_sensor_windows),
+                dataset_path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load precomputed sensor windows from %s: %s", dataset_path, exc)
+
+    def _base_sensor_temporal_context(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        current_speed = float(sensor_data.get("speed", 0.0))
+        current_acc_x = float(sensor_data.get("acc_x", 0.0))
+        current_gyro = float(sensor_data.get("gyro_z", 0.0))
+        return {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": "snapshot_only",
+            "window_quality": "snapshot_only",
+            "temporal_reliable": False,
+            "neighbor_count": 1,
+            "pre_count": 0,
+            "post_count": 0,
+            "speed_pre_mean": current_speed,
+            "speed_post_mean": current_speed,
+            "speed_delta": 0.0,
+            "speed_slope_kmh_per_s": 0.0,
+            "acc_x_mean": current_acc_x,
+            "gyro_z_mean": current_gyro,
+            "gyro_z_integral": 0.0,
+            "max_abs_gyro_z": abs(current_gyro),
+            "heading_delta_deg": 0.0,
+            "low_speed_ratio": 1.0 if current_speed <= 5.0 else 0.0,
+            "standstill_ratio": 1.0 if current_speed <= 1.0 else 0.0,
+            "temporal_center_offset_ms": None,
+            "temporal_max_gap_ms": 0,
+        }
+
+    def _summarize_temporal_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        center_ts: int,
+        sensor_data: Dict[str, Any],
+        *,
+        source: str,
+        window_quality: str,
+        temporal_reliable: bool,
+        center_offset_ms: Optional[int] = None,
+        max_gap_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        base_context = self._base_sensor_temporal_context(sensor_data)
+        if not rows:
+            base_context.update({
+                "source": source,
+                "window_quality": window_quality,
+                "temporal_reliable": temporal_reliable,
+            })
+            return base_context
+
+        ordered = sorted(rows, key=lambda row: row["timestamp"])
+        pre = [row for row in ordered if row["timestamp"] < center_ts]
+        post = [row for row in ordered if row["timestamp"] > center_ts]
+        if len(ordered) < 2:
+            base_context.update({
+                "source": source,
+                "window_quality": window_quality,
+                "temporal_reliable": temporal_reliable,
+                "neighbor_count": len(ordered),
+                "pre_count": len(pre),
+                "post_count": len(post),
+                "temporal_center_offset_ms": center_offset_ms,
+                "temporal_max_gap_ms": max_gap_ms or 0,
+            })
+            return base_context
+
+        duration_seconds = max((ordered[-1]["timestamp"] - ordered[0]["timestamp"]) / 1000.0, 1e-3)
+        speed_pre_mean = np.mean([row["speed"] for row in pre]) if pre else base_context["speed_pre_mean"]
+        speed_post_mean = np.mean([row["speed"] for row in post]) if post else base_context["speed_post_mean"]
+        speed_delta = speed_post_mean - speed_pre_mean
+        speed_slope = speed_delta / duration_seconds
+        acc_x_mean = float(np.mean([row["acc_x"] for row in ordered]))
+        gyro_z_mean = float(np.mean([row["gyro_z"] for row in ordered]))
+        gyro_z_integral = gyro_z_mean * duration_seconds
+        max_abs_gyro = max(abs(row["gyro_z"]) for row in ordered)
+        heading_delta = self._signed_heading_delta_deg(ordered[0]["heading"], ordered[-1]["heading"])
+        low_speed_ratio = sum(1 for row in ordered if row["speed"] <= 5.0) / len(ordered)
+        standstill_ratio = sum(1 for row in ordered if row["speed"] <= 1.0) / len(ordered)
+        if max_gap_ms is None:
+            max_gap_ms = max(
+                (
+                    ordered[idx + 1]["timestamp"] - ordered[idx]["timestamp"]
+                    for idx in range(len(ordered) - 1)
+                ),
+                default=0,
+            )
+
+        return {
+            "window_seconds": SENSOR_TEMPORAL_WINDOW_SECONDS,
+            "fallback_window_seconds": SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS,
+            "source": source,
+            "window_quality": window_quality,
+            "temporal_reliable": temporal_reliable,
+            "neighbor_count": len(ordered),
+            "pre_count": len(pre),
+            "post_count": len(post),
+            "speed_pre_mean": float(speed_pre_mean),
+            "speed_post_mean": float(speed_post_mean),
+            "speed_delta": float(speed_delta),
+            "speed_slope_kmh_per_s": float(speed_slope),
+            "acc_x_mean": acc_x_mean,
+            "gyro_z_mean": gyro_z_mean,
+            "gyro_z_integral": float(gyro_z_integral),
+            "max_abs_gyro_z": float(max_abs_gyro),
+            "heading_delta_deg": float(heading_delta),
+            "low_speed_ratio": float(low_speed_ratio),
+            "standstill_ratio": float(standstill_ratio),
+            "temporal_center_offset_ms": center_offset_ms,
+            "temporal_max_gap_ms": int(max_gap_ms or 0),
+        }
+
+    @staticmethod
+    def _signed_heading_delta_deg(start_heading: float, end_heading: float) -> float:
+        delta = (end_heading - start_heading + 180.0) % 360.0 - 180.0
+        return delta
+
+    def _build_sensor_temporal_context(
+        self,
+        sample_id: Optional[int],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build temporal features from nearby same-taxi sensor rows."""
+        base_context = self._base_sensor_temporal_context(sensor_data)
+        if sample_id is not None:
+            record = self._precomputed_sensor_windows.get(sample_id)
+            if record:
+                return self._summarize_temporal_rows(
+                    record.get("points", []),
+                    int(record.get("center_timestamp", 0) or 0),
+                    sensor_data,
+                    source=str(record.get("runtime_source") or "snapshot_only"),
+                    window_quality=str(record.get("quality") or "snapshot_only"),
+                    temporal_reliable=bool(record.get("temporal_reliable", False)),
+                    center_offset_ms=record.get("center_row_offset_ms"),
+                    max_gap_ms=record.get("max_gap_ms"),
+                )
+
+        if sample_id is None or sample_id not in self._sensor_temporal_lookup:
+            return base_context
+
+        taxi_id, idx = self._sensor_temporal_lookup[sample_id]
+        samples = self._sensor_temporal_samples.get(taxi_id, [])
+        if not samples:
+            return base_context
+
+        timestamps = [sample["timestamp"] for sample in samples]
+        center_ts = samples[idx]["timestamp"]
+
+        def _slice(window_seconds: float) -> List[Dict[str, Any]]:
+            lower = center_ts - int(window_seconds * 1000)
+            upper = center_ts + int(window_seconds * 1000)
+            left = bisect.bisect_left(timestamps, lower)
+            right = bisect.bisect_right(timestamps, upper)
+            return samples[left:right]
+
+        selected = _slice(SENSOR_TEMPORAL_WINDOW_SECONDS)
+        source = "preferred_window"
+        if len(selected) < 3:
+            selected = _slice(SENSOR_TEMPORAL_FALLBACK_WINDOW_SECONDS)
+            source = "expanded_window" if len(selected) >= 3 else "snapshot_only"
+
+        if len(selected) < 2:
+            return base_context
+        return self._summarize_temporal_rows(
+            selected,
+            center_ts,
+            sensor_data,
+            source=source,
+            window_quality="dense_window" if source == "preferred_window" else "sparse_window",
+            temporal_reliable=(source == "preferred_window"),
+            center_offset_ms=0,
+        )
     
     @property
     def model(self):
@@ -144,52 +474,6 @@ class HeronAnnotatorWithTrajectory:
     @property
     def is_loaded(self):
         return self._model is not None and self._processor is not None
-
-    @property
-    def generation_runtime(self) -> VLMGenerationRuntime:
-        if self._generation_runtime is None:
-            raise RuntimeError("Generation runtime is not initialized. Call load_model() first.")
-        return self._generation_runtime
-
-    @property
-    def torch_dtype(self):
-        """Resolve config dtype strings into torch.dtype values."""
-        if isinstance(TORCH_DTYPE, torch.dtype):
-            return TORCH_DTYPE
-
-        if isinstance(TORCH_DTYPE, str):
-            normalized = TORCH_DTYPE.strip().lower()
-            if hasattr(torch, normalized):
-                resolved = getattr(torch, normalized)
-                if isinstance(resolved, torch.dtype):
-                    return resolved
-
-        logger.warning("Unsupported TORCH_DTYPE=%r. Falling back to torch.float16.", TORCH_DTYPE)
-        return torch.float16
-
-    @property
-    def uses_device_map(self) -> bool:
-        if self._generation_runtime is not None:
-            return self._generation_runtime.uses_device_map
-        device_map = getattr(self._model, "hf_device_map", None)
-        return isinstance(device_map, dict) and len(device_map) > 0
-
-    @property
-    def generation_device(self) -> Optional[torch.device]:
-        if self._generation_runtime is not None:
-            return self._generation_runtime.generation_device
-        return self._device
-
-    def prepare_inputs_for_generation(self, inputs):
-        return self.generation_runtime.prepare_inputs_for_generation(inputs)
-
-    def _collect_tensor_devices(self, value):
-        return self.generation_runtime._collect_tensor_devices(value)
-
-    def _collect_model_devices(self):
-        if self._generation_runtime is None:
-            return set()
-        return self._generation_runtime.collect_model_devices()
     
     def load_model(self):
         """Load Heron VLM model and processor"""
@@ -205,37 +489,47 @@ class HeronAnnotatorWithTrajectory:
             
             # Device setup
             if USE_GPU and torch.cuda.is_available():
-                self._device = torch.device("cuda:0")
+                self._device = torch.device("cuda")
                 logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
             else:
                 self._device = torch.device("cpu")
                 logger.info("Using CPU")
             
-            # Check if Qwen2-VL model
+            # Check if Qwen-VL model family
             is_qwen = "qwen" in HERON_MODEL_ID.lower()
-            load_with_explicit_device = self._device.type != "cpu"
-
-            if load_with_explicit_device:
-                logger.info(
-                    "Loading model onto a single target device to avoid mixed CPU/CUDA placement during generation"
-                )
             
             if is_qwen:
-                # Qwen2-VL specific loading
-                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                # Qwen-VL family specific loading
+                if "qwen3-vl" in HERON_MODEL_ID.lower():
+                    try:
+                        from transformers import Qwen3VLForConditionalGeneration
+                    except ImportError as e:
+                        raise RuntimeError(
+                            "Qwen3-VL requires a transformers version with "
+                            "Qwen3VLForConditionalGeneration support "
+                            "(recommended: >=4.57.0)."
+                        ) from e
+                    qwen_loader_cls = Qwen3VLForConditionalGeneration
+                    qwen_family_name = "Qwen3-VL"
+                else:
+                    from transformers import Qwen2VLForConditionalGeneration
+                    qwen_loader_cls = Qwen2VLForConditionalGeneration
+                    qwen_family_name = "Qwen2-VL"
+
+                self._model = qwen_loader_cls.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=self.torch_dtype,
-                    device_map=None
+                    torch_dtype=TORCH_DTYPE,
+                    device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(HERON_MODEL_ID)
-                logger.info("Qwen2-VL model loaded with multi-frame support")
+                logger.info(f"{qwen_family_name} model loaded with multi-frame support (memory optimized)")
             else:
                 # Standard Heron model loading
                 self._model = AutoModelForCausalLM.from_pretrained(
                     HERON_MODEL_ID,
-                    torch_dtype=self.torch_dtype,
-                    trust_remote_code=True
+                    torch_dtype=TORCH_DTYPE,
+                    trust_remote_code=True,
+                    device_map="auto" if USE_GPU else None
                 )
                 self._processor = AutoProcessor.from_pretrained(
                     HERON_MODEL_ID,
@@ -244,20 +538,8 @@ class HeronAnnotatorWithTrajectory:
                 self._is_heron = True
                 logger.info(f"Heron model loaded with multi-frame support")
             
-            if self._device is not None:
+            if not USE_GPU or self._device.type == "cpu":
                 self._model = self._model.to(self._device)
-            self._generation_runtime = VLMGenerationRuntime(
-                model=self._model,
-                processor=self._processor,
-                model_id=HERON_MODEL_ID,
-                target_device=self._device,
-            )
-            self._generation_runtime.validate_model_placement()
-
-            if self.uses_device_map:
-                logger.info(f"Model uses Accelerate device_map: {self._model.hf_device_map}")
-
-            logger.info(f"Generation inputs will be placed on: {self.generation_device}")
             
             self._model.eval()
             logger.info("Model loaded successfully")
@@ -352,24 +634,13 @@ class HeronAnnotatorWithTrajectory:
         if not frames:
             logger.warning("No frames to draw trajectory on")
             return frames
-        
-        # Extract sensor data for trajectory calculation
-        speed = sensor_data.get('speed', 0.0)  # km/h
-        gyro_z = sensor_data.get('gyro_z', 0.0)  # rad/s (yaw rate)
-        
-        # Convert speed to m/s
-        speed_ms = speed / 3.6
-        
-        # Create speed and yaw rate sequences for 3 seconds (30 steps * 0.1s)
-        num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
-        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        
-        # Calculate 3D trajectory using Bicycle Model
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
-        
-        # Project to 2D image coordinates
-        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        speed = geometry["speed"]
+        gyro_z = geometry["gyro_z"]
+        trajectory_3d = geometry["trajectory_3d"]
+        image_points = geometry["image_points"]
+        valid_mask = geometry["valid_mask"]
         
         visible_count = np.sum(valid_mask)
         logger.info(f"Trajectory: {visible_count}/{len(valid_mask)} points visible")
@@ -419,6 +690,1705 @@ class HeronAnnotatorWithTrajectory:
         
         logger.info(f"Drew trajectory on {len(frames_with_trajectory)} frames")
         return frames_with_trajectory
+
+    def _make_synthetic_motion_points(
+        self,
+        sensor_data: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Build a tiny synthetic window so motion summaries can still render."""
+        center_timestamp = 1000
+        center_heading = float(sensor_data.get("heading", 0.0))
+        base_point = {
+            "speed": float(sensor_data.get("speed", 0.0)),
+            "acc_x": float(sensor_data.get("acc_x", 0.0)),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "heading": center_heading,
+            "brake": int(float(sensor_data.get("brake", 0.0))),
+            "blinker_l": int(float(sensor_data.get("blinker_l", 0.0))),
+            "blinker_r": int(float(sensor_data.get("blinker_r", 0.0))),
+        }
+        points: List[Dict[str, Any]] = []
+        for timestamp in [0, center_timestamp, 2000]:
+            point = dict(base_point)
+            point["timestamp"] = timestamp
+            point["offset_ms"] = timestamp - center_timestamp
+            points.append(point)
+        return points, center_timestamp
+
+    def _build_window_relative_trajectories(
+        self,
+        window_points: List[Dict[str, Any]],
+        center_timestamp: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build past/future trajectories from actual dense-window telemetry."""
+        ordered = sorted(window_points, key=lambda item: int(item["timestamp"]))
+        if not ordered:
+            zero = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            return zero, zero
+
+        center_idx = min(
+            range(len(ordered)),
+            key=lambda idx: abs(int(ordered[idx]["timestamp"]) - center_timestamp),
+        )
+        center_heading = float(ordered[center_idx].get("heading", 0.0))
+
+        def _relative_theta_rad(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+            left_delta = self._signed_heading_delta_deg(center_heading, float(left.get("heading", center_heading)))
+            right_delta = self._signed_heading_delta_deg(center_heading, float(right.get("heading", center_heading)))
+            # Telemetry heading increases clockwise, but the summary canvas uses
+            # +Y = left in vehicle coordinates. Negating the heading delta keeps
+            # the rendered trajectory aligned with the LEFT/RIGHT anchors.
+            return float(np.deg2rad(-((left_delta + right_delta) / 2.0)))
+
+        future_points: List[List[float]] = [[0.0, 0.0, 0.0]]
+        x_future = 0.0
+        y_future = 0.0
+        for idx in range(center_idx, len(ordered) - 1):
+            current = ordered[idx]
+            nxt = ordered[idx + 1]
+            dt = (int(nxt["timestamp"]) - int(current["timestamp"])) / 1000.0
+            if dt <= 0.0:
+                continue
+            speed_ms = ((float(current.get("speed", 0.0)) + float(nxt.get("speed", 0.0))) / 2.0) / 3.6
+            theta = _relative_theta_rad(current, nxt)
+            x_future += speed_ms * np.cos(theta) * dt
+            y_future += speed_ms * np.sin(theta) * dt
+            future_points.append([x_future, y_future, 0.0])
+
+        past_points: List[List[float]] = [[0.0, 0.0, 0.0]]
+        x_past = 0.0
+        y_past = 0.0
+        for idx in range(center_idx, 0, -1):
+            previous = ordered[idx - 1]
+            current = ordered[idx]
+            dt = (int(current["timestamp"]) - int(previous["timestamp"])) / 1000.0
+            if dt <= 0.0:
+                continue
+            speed_ms = ((float(previous.get("speed", 0.0)) + float(current.get("speed", 0.0))) / 2.0) / 3.6
+            theta = _relative_theta_rad(previous, current)
+            x_past -= speed_ms * np.cos(theta) * dt
+            y_past -= speed_ms * np.sin(theta) * dt
+            past_points.append([x_past, y_past, 0.0])
+
+        past_points.reverse()
+        return (
+            np.array(past_points, dtype=np.float32),
+            np.array(future_points, dtype=np.float32),
+        )
+
+    def _build_trajectory_geometry(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build 3-second trajectory and summary stats from current sensor values."""
+        speed = sensor_data.get('speed', 0.0)
+        gyro_z = sensor_data.get('gyro_z', 0.0)
+        window_record = self._precomputed_sensor_windows.get(sample_id) if sample_id is not None else None
+
+        if window_record and window_record.get("points"):
+            window_points = []
+            center_timestamp = int(window_record.get("center_timestamp") or 0)
+            for raw_point in window_record.get("points", []):
+                point = dict(raw_point)
+                point["timestamp"] = int(point.get("timestamp", 0))
+                point["offset_ms"] = point["timestamp"] - center_timestamp
+                window_points.append(point)
+        else:
+            window_points, center_timestamp = self._make_synthetic_motion_points(sensor_data)
+
+        if window_record and window_points:
+            past_trajectory_3d, trajectory_3d = self._build_window_relative_trajectories(
+                window_points,
+                center_timestamp,
+            )
+            if len(trajectory_3d) < 2:
+                past_trajectory_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+                speed_ms = speed / 3.6
+                num_steps = 30
+                speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+                yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+                trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+                trajectory_source = "sensor_extrapolation"
+            else:
+                trajectory_source = "precomputed_window"
+        else:
+            speed_ms = speed / 3.6
+            num_steps = 30
+            speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+            yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+            trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+            past_trajectory_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            trajectory_source = "sensor_extrapolation"
+
+        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+
+        return {
+            "speed": speed,
+            "gyro_z": gyro_z,
+            "trajectory_3d": trajectory_3d,
+            "future_trajectory_3d": trajectory_3d,
+            "past_trajectory_3d": past_trajectory_3d,
+            "image_points": image_points,
+            "valid_mask": valid_mask,
+            "visible_count": int(np.sum(valid_mask)),
+            "window_points": window_points,
+            "center_timestamp": center_timestamp,
+            "trajectory_source": trajectory_source,
+            "window_quality": str(window_record.get("quality") or "snapshot_only") if window_record else "snapshot_only",
+            "temporal_reliable": bool(window_record.get("temporal_reliable", False)) if window_record else False,
+        }
+
+    def _trajectory_to_canvas_points(
+        self,
+        trajectory_3d: np.ndarray,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+        max_forward_m: float,
+        max_side_m: float,
+    ) -> List[Tuple[int, int]]:
+        """Project trajectory to a clean 2D summary canvas with fixed orientation."""
+        center_x = width // 2
+        origin_y = height - margin
+        points: List[Tuple[int, int]] = []
+        for x, y, _ in trajectory_3d:
+            # Vehicle-frame +Y means "left", so positive lateral offset must appear
+            # on the left side of the summary image to match the prompt semantics.
+            px = center_x - int((y / max_side_m) * (width * 0.32))
+            py = origin_y - int((x / max_forward_m) * (height - 2 * margin))
+            points.append((px, py))
+        return points
+
+    def _load_summary_font(self, size: int) -> ImageFont.ImageFont:
+        """Load a readable font for summary-side anchors."""
+        for name in ["DejaVuSans-Bold.ttf", "Arial Bold.ttf", "Arial.ttf"]:
+            try:
+                return ImageFont.truetype(name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    def _draw_direction_anchors(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        width: int,
+        height: int,
+        margin: int,
+    ) -> None:
+        """Draw explicit left/right anchors so VLM can bind geometry to direction."""
+        left_color = (50, 90, 220)
+        right_color = (220, 130, 30)
+        font = self._load_summary_font(28)
+
+        # Side tint is intentionally subtle: it anchors direction without competing
+        # with the trajectory itself.
+        draw.rectangle([0, 0, margin - 10, height], fill=(238, 244, 255))
+        draw.rectangle([width - margin + 10, 0, width, height], fill=(255, 244, 232))
+
+        left_y = margin - 10
+        right_y = margin - 10
+        draw.text((36, left_y), "LEFT", fill=left_color, font=font)
+        right_text = "RIGHT"
+        bbox = draw.textbbox((0, 0), right_text, font=font)
+        right_w = bbox[2] - bbox[0]
+        draw.text((width - 36 - right_w, right_y), right_text, fill=right_color, font=font)
+
+        # Arrow markers reinforce orientation even if the text is not fully parsed.
+        left_arrow = [(margin - 18, margin + 18), (18, margin + 18), (34, margin + 6), (34, margin + 30)]
+        right_arrow = [(width - margin + 18, margin + 18), (width - 18, margin + 18), (width - 34, margin + 6), (width - 34, margin + 30)]
+        draw.line(left_arrow[:2], fill=left_color, width=10)
+        draw.polygon([left_arrow[1], left_arrow[2], left_arrow[3]], fill=left_color)
+        draw.line(right_arrow[:2], fill=right_color, width=10)
+        draw.polygon([right_arrow[1], right_arrow[2], right_arrow[3]], fill=right_color)
+
+    def _draw_endpoint_arrow(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a clear arrowhead at the final trajectory direction."""
+        if len(points) < 2:
+            return
+
+        (x1, y1), (x2, y2) = points[-2], points[-1]
+        dx = x2 - x1
+        dy = y2 - y1
+        norm = float(np.hypot(dx, dy))
+        if norm < 1e-3:
+            return
+
+        ux, uy = dx / norm, dy / norm
+        px, py = -uy, ux
+        tip = np.array([x2, y2], dtype=np.float32)
+        base = tip - np.array([ux, uy], dtype=np.float32) * 24.0
+        wing = np.array([px, py], dtype=np.float32) * 10.0
+        left = tuple((base + wing).astype(int))
+        right = tuple((base - wing).astype(int))
+        tip_t = tuple(tip.astype(int))
+        draw.polygon([tip_t, left, right], fill=(245, 180, 0), outline=(0, 0, 0))
+
+    def _draw_summary_trajectory(
+        self,
+        draw: ImageDraw.ImageDraw,
+        points: List[Tuple[int, int]],
+    ) -> None:
+        """Draw a high-contrast trajectory with start/end emphasis."""
+        if not points:
+            return
+
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 0, 0), width=14)
+            draw.line(points, fill=(220, 30, 30), width=8)
+
+            marker_indices = sorted(
+                set(
+                    [
+                        max(0, len(points) // 3),
+                        max(0, (2 * len(points)) // 3),
+                    ]
+                )
+            )
+            for marker_idx in marker_indices:
+                mx, my = points[marker_idx]
+                draw.ellipse(
+                    [mx - 8, my - 8, mx + 8, my + 8],
+                    fill=(255, 255, 255),
+                    outline=(0, 0, 0),
+                    width=2,
+                )
+        else:
+            px, py = points[0]
+            draw.ellipse(
+                [px - 8, py - 8, px + 8, py + 8],
+                fill=(220, 30, 30),
+                outline=(0, 0, 0),
+                width=2,
+            )
+
+        sx, sy = points[0]
+        draw.ellipse(
+            [sx - 10, sy - 10, sx + 10, sy + 10],
+            fill=(255, 255, 255),
+            outline=(0, 0, 0),
+            width=3,
+        )
+
+        ex, ey = points[-1]
+        draw.ellipse(
+            [ex - 9, ey - 9, ex + 9, ey + 9],
+            fill=(245, 180, 0),
+            outline=(0, 0, 0),
+            width=2,
+        )
+        self._draw_endpoint_arrow(draw, points)
+
+    def _render_topdown_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a fixed-scale bird's-eye summary image."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+        max_forward_m = 35.0
+        max_side_m = 14.0
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        draw.line(
+            [(center_x, origin_y), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
+
+        points = self._trajectory_to_canvas_points(
+            trajectory_3d,
+            width=width,
+            height=height,
+            margin=margin,
+            max_forward_m=max_forward_m,
+            max_side_m=max_side_m,
+        )
+        self._draw_summary_trajectory(draw, points)
+
+        return canvas
+
+    def _render_normalized_summary(self, trajectory_3d: np.ndarray) -> Image.Image:
+        """Render a shape-normalized summary to emphasize left/right sign and curvature."""
+        width, height = 720, 720
+        margin = 60
+        center_x = width // 2
+        origin_y = height - margin
+
+        max_forward = max(float(np.max(trajectory_3d[:, 0])), 1.0)
+        max_side = max(float(np.max(np.abs(trajectory_3d[:, 1]))), 1.5)
+
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        self._draw_direction_anchors(draw, width=width, height=height, margin=margin)
+
+        draw.line(
+            [(margin, origin_y), (width - margin, origin_y)],
+            fill=(220, 220, 220),
+            width=3,
+        )
+        draw.line(
+            [(center_x, origin_y), (center_x, margin)],
+            fill=(40, 180, 40),
+            width=6,
+        )
+        draw.rectangle(
+            [margin, margin, width - margin, origin_y],
+            outline=(230, 230, 230),
+            width=2,
+        )
+
+        points = self._trajectory_to_canvas_points(
+            trajectory_3d,
+            width=width,
+            height=height,
+            margin=margin,
+            max_forward_m=max_forward,
+            max_side_m=max_side,
+        )
+        self._draw_summary_trajectory(draw, points)
+
+        return canvas
+
+    def _draw_series_panel(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        box: Tuple[int, int, int, int],
+        times: List[float],
+        values: List[float],
+        label: str,
+        line_color: Tuple[int, int, int],
+        fill_color: Tuple[int, int, int],
+        center_time: float = 0.0,
+        force_zero_line: bool = False,
+    ) -> None:
+        """Draw a single timeline panel."""
+        left, top, right, bottom = box
+        draw.rounded_rectangle(box, radius=18, outline=(225, 225, 225), width=2, fill=(252, 252, 252))
+        font = self._load_summary_font(22)
+        small_font = self._load_summary_font(16)
+        draw.text((left + 18, top + 12), label, fill=(30, 30, 30), font=font)
+
+        chart_left = left + 20
+        chart_top = top + 48
+        chart_right = right - 20
+        chart_bottom = bottom - 20
+        draw.rectangle([chart_left, chart_top, chart_right, chart_bottom], outline=(235, 235, 235), width=1)
+
+        if not times or not values:
+            return
+
+        min_time = min(times)
+        max_time = max(times)
+        if abs(max_time - min_time) < 1e-6:
+            min_time -= 1.0
+            max_time += 1.0
+
+        min_value = min(values)
+        max_value = max(values)
+        if abs(max_value - min_value) < 1e-6:
+            pad = max(1.0, abs(max_value) * 0.1 + 0.5)
+            min_value -= pad
+            max_value += pad
+
+        if force_zero_line:
+            min_value = min(min_value, 0.0)
+            max_value = max(max_value, 0.0)
+
+        def _x_at(time_value: float) -> int:
+            ratio = (time_value - min_time) / (max_time - min_time)
+            return int(chart_left + ratio * (chart_right - chart_left))
+
+        def _y_at(value: float) -> int:
+            ratio = (value - min_value) / (max_value - min_value)
+            return int(chart_bottom - ratio * (chart_bottom - chart_top))
+
+        center_x = _x_at(center_time)
+        draw.line([(center_x, chart_top), (center_x, chart_bottom)], fill=(180, 180, 180), width=2)
+        draw.text((center_x + 6, chart_top + 4), "NOW", fill=(120, 120, 120), font=small_font)
+
+        if force_zero_line and min_value <= 0.0 <= max_value:
+            zero_y = _y_at(0.0)
+            draw.line([(chart_left, zero_y), (chart_right, zero_y)], fill=(215, 215, 215), width=2)
+
+        draw.line([(chart_left, chart_bottom), (chart_right, chart_bottom)], fill=(235, 235, 235), width=1)
+        draw.text((chart_left, chart_bottom + 2), f"{min_value:.1f}", fill=(130, 130, 130), font=small_font)
+        max_text = f"{max_value:.1f}"
+        max_bbox = draw.textbbox((0, 0), max_text, font=small_font)
+        draw.text((chart_right - (max_bbox[2] - max_bbox[0]), chart_top - 18), max_text, fill=(130, 130, 130), font=small_font)
+
+        polyline = [(_x_at(time_value), _y_at(value)) for time_value, value in zip(times, values)]
+        if len(polyline) >= 2:
+            draw.line(polyline, fill=fill_color, width=10)
+            draw.line(polyline, fill=line_color, width=5)
+        elif polyline:
+            px, py = polyline[0]
+            draw.ellipse([px - 6, py - 6, px + 6, py + 6], fill=line_color, outline=(0, 0, 0), width=1)
+
+        for px, py in [polyline[0], polyline[-1]] if polyline else []:
+            draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(255, 255, 255), outline=line_color, width=2)
+
+    def _draw_binary_event_panel(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        box: Tuple[int, int, int, int],
+        times: List[float],
+        brake_values: List[int],
+        left_values: List[int],
+        right_values: List[int],
+        center_time: float = 0.0,
+    ) -> None:
+        """Draw a simple timeline panel for brake / blinker events."""
+        left, top, right, bottom = box
+        draw.rounded_rectangle(box, radius=18, outline=(225, 225, 225), width=2, fill=(252, 252, 252))
+        font = self._load_summary_font(22)
+        small_font = self._load_summary_font(16)
+        draw.text((left + 18, top + 12), "Brake / Blinker", fill=(30, 30, 30), font=font)
+
+        chart_left = left + 20
+        chart_top = top + 48
+        chart_right = right - 20
+        chart_bottom = bottom - 20
+        draw.rectangle([chart_left, chart_top, chart_right, chart_bottom], outline=(235, 235, 235), width=1)
+
+        if not times:
+            return
+
+        min_time = min(times)
+        max_time = max(times)
+        if abs(max_time - min_time) < 1e-6:
+            min_time -= 1.0
+            max_time += 1.0
+
+        def _x_at(time_value: float) -> int:
+            ratio = (time_value - min_time) / (max_time - min_time)
+            return int(chart_left + ratio * (chart_right - chart_left))
+
+        center_x = _x_at(center_time)
+        draw.line([(center_x, chart_top), (center_x, chart_bottom)], fill=(180, 180, 180), width=2)
+        draw.text((center_x + 6, chart_top + 4), "NOW", fill=(120, 120, 120), font=small_font)
+
+        lanes = [
+            ("BRAKE", brake_values, (210, 60, 60)),
+            ("LEFT", left_values, (60, 90, 220)),
+            ("RIGHT", right_values, (220, 130, 30)),
+        ]
+        lane_height = (chart_bottom - chart_top) // len(lanes)
+        for lane_idx, (label, values, color) in enumerate(lanes):
+            lane_top = chart_top + lane_idx * lane_height + 8
+            lane_bottom = chart_top + (lane_idx + 1) * lane_height - 8
+            draw.text((chart_left + 4, lane_top - 2), label, fill=color, font=small_font)
+            draw.line([(chart_left, lane_bottom), (chart_right, lane_bottom)], fill=(238, 238, 238), width=1)
+            for time_value, active in zip(times, values):
+                if not active:
+                    continue
+                x = _x_at(time_value)
+                draw.rectangle([x - 4, lane_top + 14, x + 4, lane_bottom - 4], fill=color)
+
+    def _render_motion_summary(
+        self,
+        geometry: Dict[str, Any],
+    ) -> Image.Image:
+        """Render a timeline-style motion summary from dense telemetry points."""
+        width, height = 720, 720
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._load_summary_font(28)
+        subtitle_font = self._load_summary_font(18)
+
+        draw.text((28, 18), "Motion Summary", fill=(25, 25, 25), font=title_font)
+        source_text = f"source={geometry.get('trajectory_source', 'sensor_extrapolation')} | quality={geometry.get('window_quality', 'snapshot_only')}"
+        draw.text((28, 54), source_text, fill=(110, 110, 110), font=subtitle_font)
+
+        points = geometry.get("window_points") or []
+        center_timestamp = int(geometry.get("center_timestamp") or 0)
+        ordered_points = sorted(points, key=lambda item: int(item["timestamp"]))
+        times = [round((int(point["timestamp"]) - center_timestamp) / 1000.0, 3) for point in ordered_points]
+        speeds = [float(point.get("speed", 0.0)) for point in ordered_points]
+        yaws = [float(point.get("gyro_z", 0.0)) for point in ordered_points]
+        brakes = [int(float(point.get("brake", 0.0))) for point in ordered_points]
+        lefts = [int(float(point.get("blinker_l", 0.0))) for point in ordered_points]
+        rights = [int(float(point.get("blinker_r", 0.0))) for point in ordered_points]
+
+        self._draw_series_panel(
+            draw,
+            box=(24, 92, width - 24, 282),
+            times=times,
+            values=speeds,
+            label="Speed (km/h)",
+            line_color=(30, 120, 40),
+            fill_color=(134, 204, 122),
+        )
+        self._draw_series_panel(
+            draw,
+            box=(24, 302, width - 24, 492),
+            times=times,
+            values=yaws,
+            label="Yaw Rate (rad/s)",
+            line_color=(180, 70, 0),
+            fill_color=(245, 180, 110),
+            force_zero_line=True,
+        )
+        self._draw_binary_event_panel(
+            draw,
+            box=(24, 512, width - 24, height - 24),
+            times=times,
+            brake_values=brakes,
+            left_values=lefts,
+            right_values=rights,
+        )
+
+        return canvas
+
+    def prepare_visual_inputs(
+        self,
+        frames: List[Image.Image],
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Prepare raw frames plus two clean trajectory summary images for VLM input."""
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+
+        if self.save_trajectory_frames and sample_id is not None:
+            os.makedirs(self.trajectory_output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_topdown_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
+            )
+            summary_normalized_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            normalized_summary.save(summary_normalized_path, quality=95)
+
+        logger.info(
+            f"Trajectory summary: {geometry['visible_count']}/{len(geometry['valid_mask'])} points visible"
+        )
+        model_frames = list(frames[:4]) + [topdown_summary, normalized_summary]
+        self.last_prediction_details["visual_input_count"] = len(model_frames)
+        return model_frames, geometry
+
+    def _build_trajectory_summary_images(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Build clean trajectory summary images without raw frames."""
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+
+        if self.save_trajectory_frames and sample_id is not None:
+            os.makedirs(self.trajectory_output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_topdown_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_topdown_{timestamp}.jpg",
+            )
+            summary_normalized_path = os.path.join(
+                self.trajectory_output_dir,
+                f"sample_{sample_id:03d}_trajectory_summary_normalized_{timestamp}.jpg",
+            )
+            topdown_summary.save(summary_topdown_path, quality=95)
+            normalized_summary.save(summary_normalized_path, quality=95)
+
+        return [topdown_summary, normalized_summary], geometry
+
+    def _build_macro_summary_images(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Build the stronger macro-VLM visual bundle: geometry + motion."""
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+        motion_summary = self._render_motion_summary(geometry)
+        return [topdown_summary, normalized_summary, motion_summary], geometry
+
+    def _build_video_plus_summary_content(
+        self,
+        clip_path: str,
+        summary_images: List[Image.Image],
+        prompt_text: str,
+    ) -> List[Dict[str, Any]]:
+        """Build multimodal content with one video, trajectory summaries, and text."""
+        return [
+            {"type": "video", "video": str(clip_path)},
+            *[{"type": "image", "image": image} for image in summary_images],
+            {"type": "text", "text": prompt_text},
+        ]
+
+    def _run_prompt_on_frames(
+        self,
+        frames: List[Image.Image],
+        prompt_text: str
+    ) -> str:
+        """Run a single prompt against the current VLM backend."""
+        is_qwen = "qwen" in HERON_MODEL_ID.lower()
+
+        if is_qwen:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": frame} for frame in frames],
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
+            text_prompt = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self.processor(
+                text=[text_prompt],
+                images=frames,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+        else:
+            inputs = self.processor(
+                text=prompt_text,
+                images=frames,
+                return_tensors="pt",
+            ).to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=24,
+                do_sample=False,
+                temperature=0.0,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+
+        if hasattr(inputs, "input_ids") and inputs.input_ids is not None:
+            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+        else:
+            generated_ids = output_ids
+
+        generated_text = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0].strip()
+        return generated_text
+
+    def _compute_video_window_bounds(
+        self,
+        center_time: float,
+        total_duration: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Tuple[float, float]:
+        """Compute a centered time window clipped to the source video duration."""
+        if total_duration <= 0:
+            return 0.0, max(window_duration, 0.0)
+
+        clamped_center = min(max(center_time, 0.0), total_duration)
+        usable_window = min(window_duration, total_duration)
+        half_window = usable_window / 2.0
+
+        window_start = max(0.0, clamped_center - half_window)
+        window_end = min(total_duration, clamped_center + half_window)
+
+        if (window_end - window_start) < usable_window:
+            if window_start <= 0.0:
+                window_end = min(total_duration, usable_window)
+            elif window_end >= total_duration:
+                window_start = max(0.0, total_duration - usable_window)
+
+        return float(window_start), float(window_end)
+
+    def _create_centered_video_clip(
+        self,
+        video_path: str,
+        center_time: float,
+        window_duration: float = VIDEO_CLIP_DURATION_SECONDS,
+    ) -> Dict[str, Any]:
+        """Create a temporary clip around the annotation timestamp using the source fps."""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+
+        writer = None
+        clip_path = None
+        frames_written = 0
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps <= 0:
+                fps = 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            total_duration = total_frames / fps if total_frames > 0 else 0.0
+
+            window_start, window_end = self._compute_video_window_bounds(
+                center_time=center_time,
+                total_duration=total_duration,
+                window_duration=window_duration,
+            )
+            start_frame = max(0, int(np.floor(window_start * fps)))
+            end_frame_exclusive = min(total_frames, int(np.ceil(window_end * fps)))
+
+            if end_frame_exclusive <= start_frame:
+                end_frame_exclusive = min(total_frames, start_frame + max(1, int(round(fps))))
+
+            fd, clip_path = tempfile.mkstemp(prefix="sensor_video_clip_", suffix=".mp4")
+            os.close(fd)
+            writer = cv2.VideoWriter(
+                clip_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
+            if not writer.isOpened():
+                raise ValueError(f"Failed to create temporary clip: {clip_path}")
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(start_frame, end_frame_exclusive):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                writer.write(frame)
+                frames_written += 1
+
+            if frames_written == 0:
+                raise ValueError("Failed to write any frames to temporary clip")
+
+            return {
+                "clip_path": clip_path,
+                "target_center_time_seconds": float(center_time),
+                "window_start_seconds": window_start,
+                "window_end_seconds": window_end,
+                "target_seconds_in_clip": max(0.0, float(center_time) - window_start),
+                "clip_duration_seconds": max(0.0, window_end - window_start),
+                "fps": fps,
+                "source_total_duration_seconds": total_duration,
+                "source_total_frames": total_frames,
+                "clip_frame_count": frames_written,
+                "source_frame_start": start_frame,
+                "source_frame_end_exclusive": end_frame_exclusive,
+            }
+        except Exception:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+            raise
+        finally:
+            if writer is not None:
+                writer.release()
+            cap.release()
+
+    def _serialize_video_metadata(self, value: Any) -> Any:
+        """Convert processor video metadata into JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._serialize_video_metadata(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_video_metadata(v) for v in value]
+        if hasattr(value, "__dict__"):
+            return {
+                str(k): self._serialize_video_metadata(v)
+                for k, v in value.__dict__.items()
+                if not k.startswith("_")
+            }
+        return str(value)
+
+    def _run_prompt_on_video_clip(
+        self,
+        clip_path: str,
+        prompt_text: str,
+        summary_images: Optional[List[Image.Image]] = None,
+        max_new_tokens: int = MAX_NEW_TOKENS_STANDARD,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Run a single prompt on a video clip path."""
+        summary_images = summary_images or []
+        messages = [
+            {
+                "role": "user",
+                "content": self._build_video_plus_summary_content(
+                    clip_path=clip_path,
+                    summary_images=summary_images,
+                    prompt_text=prompt_text,
+                ),
+            }
+        ]
+        text_prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            processor_kwargs={"return_metadata": True},
+        )
+        video_metadata = inputs.pop("video_metadata", None)
+        inputs = inputs.to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+
+        prompt_length = inputs["input_ids"].shape[1]
+        generated_ids = output_ids[:, prompt_length:]
+        if generated_ids.shape[1] == 0:
+            generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        else:
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        metadata = {
+            "video_metadata": self._serialize_video_metadata(video_metadata),
+            "video_grid_thw": inputs.get("video_grid_thw").detach().cpu().tolist() if "video_grid_thw" in inputs else None,
+            "summary_image_count": len(summary_images),
+        }
+        return text_prompt, generated_text, metadata
+
+    def _format_clip_timestamp(self, seconds: float) -> str:
+        """Format clip-relative seconds as MM:SS or MM:SS.s."""
+        seconds = max(0.0, float(seconds))
+        whole_minutes = int(seconds // 60)
+        remaining_seconds = seconds - (whole_minutes * 60)
+        if abs(remaining_seconds - round(remaining_seconds)) < 1e-6:
+            return f"{whole_minutes:02d}:{int(round(remaining_seconds)):02d}"
+        return f"{whole_minutes:02d}:{remaining_seconds:04.1f}"
+
+    def _extract_choice(
+        self,
+        text: str,
+        valid_choices: List[str],
+        alias_to_choice: Optional[Dict[str, str]] = None
+    ) -> Optional[str]:
+        """Extract a stage choice from short generated text."""
+        import re
+
+        alias_to_choice = alias_to_choice or {}
+        response_text = text.strip()
+        if not response_text:
+            return None
+
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        candidates = []
+        if lines:
+            candidates.append(lines[-1])
+        candidates.append(response_text[-80:])
+
+        upper_choices = [choice.upper() for choice in valid_choices]
+        for candidate in candidates:
+            candidate_upper = candidate.upper().strip()
+            if candidate_upper in upper_choices:
+                return candidate_upper
+            for choice in upper_choices:
+                if re.search(rf'\b{re.escape(choice)}\b', candidate_upper):
+                    return choice
+            for alias, choice in alias_to_choice.items():
+                if alias in candidate:
+                    return choice.upper()
+
+        return None
+
+    def _classify_sensor_only_label(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Classify a single 11-class label from sensor values plus temporal context."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        abs_gyro = abs(gyro_z)
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        temporal_context = temporal_context or {}
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs_gyro))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
+
+        reason = {
+            "speed_kmh": speed,
+            "acc_x": acc_x,
+            "gyro_z": gyro_z,
+            "abs_gyro_z": abs_gyro,
+            "brake": brake,
+            "blinker_l": blinker_l,
+            "blinker_r": blinker_r,
+            "rapidAccelerator": rapid_acc,
+            "rapidDecelerator": rapid_decel,
+            "temporal_source": source,
+            "speed_delta": speed_delta,
+            "speed_slope_kmh_per_s": speed_slope,
+            "acc_x_mean": mean_acc_x,
+            "gyro_z_integral": gyro_integral,
+            "max_abs_gyro_z_window": max_abs_gyro,
+            "heading_delta_deg": heading_delta,
+            "low_speed_ratio": low_speed_ratio,
+            "standstill_ratio": standstill_ratio,
+        }
+
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                reason["rule"] = "temporal_standstill_start"
+                return 5, reason
+            reason["rule"] = "temporal_standstill_stop"
+            return 4, reason
+
+        if max_abs_gyro >= 0.45 and speed <= 18.0 and abs(heading_delta) >= 100.0:
+            reason["rule"] = "temporal_uturn"
+            return 10, reason
+
+        if abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18:
+            reason["rule"] = "temporal_turn"
+            return (6 if signed_rotation > 0 else 7), reason
+
+        if (blinker_l or blinker_r or abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0) and speed >= 15.0:
+            if blinker_l and not blinker_r:
+                reason["rule"] = "temporal_lane_change_left"
+                return 8, reason
+            if blinker_r and not blinker_l:
+                reason["rule"] = "temporal_lane_change_right"
+                return 9, reason
+            if abs(signed_rotation) >= 0.16:
+                reason["rule"] = "temporal_lane_change_from_yaw"
+                return (8 if signed_rotation > 0 else 9), reason
+
+        if speed <= 6.0 and (brake or standstill_ratio >= 0.35 or low_speed_ratio >= 0.6) and (speed_delta <= -3.0 or mean_acc_x <= -0.18):
+            reason["rule"] = "temporal_stop_like"
+            return 4, reason
+
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            reason["rule"] = "temporal_acceleration"
+            return 2, reason
+
+        if speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            if speed <= 8.0 and (brake or low_speed_ratio >= 0.5):
+                reason["rule"] = "temporal_slow_decel_stop_like"
+                return 4, reason
+            reason["rule"] = "temporal_deceleration"
+            return 3, reason
+
+        if abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12 and abs(signed_rotation) <= 0.10 and max_abs_gyro <= 0.08:
+            reason["rule"] = "temporal_constant_speed"
+            return 1, reason
+
+        if mean_acc_x < -0.05 or acc_x < -0.10:
+            reason["rule"] = "fallback_temporal_deceleration"
+            return 3, reason
+
+        if mean_acc_x > 0.05 or acc_x > 0.10:
+            reason["rule"] = "fallback_temporal_acceleration"
+            return 2, reason
+
+        reason["rule"] = "fallback_temporal_constant_speed"
+        return 1, reason
+
+    def _build_sensor_candidate_scores(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Dict[str, Any],
+        primary_label: int,
+    ) -> Tuple[Dict[int, float], Dict[str, Any]]:
+        """Build sensor-driven candidate scores for late fusion."""
+        speed = float(sensor_data.get("speed", 0.0))
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", sensor_data.get("acc_x", 0.0)))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs(float(sensor_data.get("gyro_z", 0.0)))))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+
+        scores: Dict[int, float] = {}
+
+        def add(label: int, amount: float) -> None:
+            scores[label] = round(scores.get(label, 0.0) + amount, 3)
+
+        add(primary_label, 0.55)
+
+        if primary_label in {1, 2, 3, 4, 5, 0}:
+            add(1, 0.18)
+            if speed_delta >= 4.0 or speed_slope >= 0.8 or mean_acc_x >= 0.12:
+                add(2, 0.28)
+                if speed <= 6.0 or standstill_ratio >= 0.2:
+                    add(5, 0.22)
+            if speed_delta <= -4.0 or speed_slope <= -0.8 or mean_acc_x <= -0.12:
+                add(3, 0.28)
+                if speed <= 8.0 or brake or low_speed_ratio >= 0.4:
+                    add(4, 0.24)
+            if speed <= 2.0 or standstill_ratio >= 0.35 or (brake and low_speed_ratio >= 0.4):
+                add(4, 0.30)
+            if speed <= 4.0 and speed_delta >= 3.0 and brake == 0:
+                add(5, 0.26)
+            if primary_label == 0:
+                add(0, 0.20)
+        elif primary_label in {6, 8}:
+            add(6, 0.22 if abs(heading_delta) >= 18.0 or max_abs_gyro >= 0.12 else 0.12)
+            add(8, 0.28 if blinker_l or (speed >= 18.0 and abs(heading_delta) < 25.0) else 0.12)
+        elif primary_label in {7, 9, 10}:
+            add(7, 0.22 if abs(heading_delta) >= 18.0 or max_abs_gyro >= 0.12 else 0.12)
+            add(9, 0.28 if blinker_r or (speed >= 18.0 and abs(heading_delta) < 25.0) else 0.12)
+            if abs(heading_delta) >= 90.0 and speed <= 18.0 and max_abs_gyro >= 0.30:
+                add(10, 0.32)
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        top_candidates = [label for label, _ in ranked[:VIDEO_CANDIDATE_TOP_K]]
+        if len(top_candidates) == 1:
+            top_candidates.append(0 if top_candidates[0] != 0 else 1)
+
+        return (
+            {label: scores[label] for label in top_candidates},
+            {
+                "primary_label": primary_label,
+                "primary_name": ACTION_LABELS.get(primary_label),
+                "scores": scores,
+                "selected_candidates": top_candidates,
+            },
+        )
+
+    def _format_candidate_lines(self, candidate_scores: Dict[int, float]) -> str:
+        ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
+        return "\n".join(
+            f"- {label}: {ACTION_LABELS.get(label, '不明')} (sensor_score={score:.2f})"
+            for label, score in ranked
+        )
+
+    def _build_sensor_macro_scores(
+        self,
+        fine_candidate_scores: Dict[int, float],
+        primary_label: int,
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Aggregate fine-grained sensor candidate scores into macro 4-class scores."""
+        macro_scores: Dict[str, float] = {code: 0.0 for code in MACRO_OUTPUT_TO_LABEL}
+        for label, score in fine_candidate_scores.items():
+            macro_code = FINE_LABEL_TO_MACRO_GROUP.get(label)
+            if macro_code is None:
+                continue
+            macro_scores[macro_code] = round(macro_scores.get(macro_code, 0.0) + float(score), 3)
+
+        primary_macro = FINE_LABEL_TO_MACRO_GROUP.get(primary_label, "D")
+        macro_scores[primary_macro] = round(macro_scores.get(primary_macro, 0.0) + 0.15, 3)
+
+        ranked = sorted(macro_scores.items(), key=lambda item: (-item[1], item[0]))
+        return (
+            {code: score for code, score in ranked},
+            {
+                "primary_macro": primary_macro,
+                "primary_macro_name": MACRO_OUTPUT_NAMES.get(primary_macro),
+                "scores": dict(ranked),
+            },
+        )
+
+    def _build_sensor_direct_macro_scores(
+        self,
+        sensor_data: Dict[str, Any],
+        temporal_context: Dict[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        """Build macro 4-class sensor scores directly without 11-class intermediate labels."""
+        speed = float(sensor_data.get("speed", 0.0))
+        acc_x = float(sensor_data.get("acc_x", 0.0))
+        gyro_z = float(sensor_data.get("gyro_z", 0.0))
+        brake = int(float(sensor_data.get("brake", 0.0)))
+        blinker_l = int(float(sensor_data.get("blinker_l", 0.0)))
+        blinker_r = int(float(sensor_data.get("blinker_r", 0.0)))
+        rapid_acc = int(float(sensor_data.get("rapidAccelerator", 0.0)))
+        rapid_decel = int(float(sensor_data.get("rapidDecelerator", 0.0)))
+
+        speed_delta = float(temporal_context.get("speed_delta", 0.0))
+        speed_slope = float(temporal_context.get("speed_slope_kmh_per_s", 0.0))
+        mean_acc_x = float(temporal_context.get("acc_x_mean", acc_x))
+        gyro_integral = float(temporal_context.get("gyro_z_integral", 0.0))
+        max_abs_gyro = float(temporal_context.get("max_abs_gyro_z", abs(gyro_z)))
+        heading_delta = float(temporal_context.get("heading_delta_deg", 0.0))
+        low_speed_ratio = float(temporal_context.get("low_speed_ratio", 1.0 if speed <= 5.0 else 0.0))
+        standstill_ratio = float(temporal_context.get("standstill_ratio", 1.0 if speed <= 1.0 else 0.0))
+        source = temporal_context.get("source", "snapshot_only")
+
+        signed_rotation = gyro_integral if abs(gyro_integral) >= 0.05 else heading_delta / 45.0
+        scores: Dict[str, float] = {code: 0.0 for code in MACRO_OUTPUT_TO_LABEL}
+
+        def add(code: str, amount: float) -> None:
+            scores[code] = round(max(0.0, min(1.0, scores.get(code, 0.0) + amount)), 3)
+
+        debug_reasons: List[str] = []
+
+        # Straight-family prior: stop/start and speed events all belong to A.
+        add("A", 0.20)
+
+        if speed <= 1.5 or standstill_ratio >= 0.6:
+            add("A", 0.45)
+            if (speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or acc_x >= 0.22) and brake == 0:
+                add("A", 0.12)
+                debug_reasons.append("停止付近からの立ち上がりで直進系Aを補強")
+            else:
+                debug_reasons.append("停止状態/停止継続で直進系Aを補強")
+
+        if speed_delta >= 6.0 or speed_slope >= 1.2 or rapid_acc or (mean_acc_x >= 0.18 and speed >= 5.0):
+            add("A", 0.25)
+            debug_reasons.append("速度上昇が直進系Aを支持")
+        elif speed_delta <= -6.0 or speed_slope <= -1.2 or rapid_decel or brake or (mean_acc_x <= -0.22 and speed >= 8.0):
+            add("A", 0.25)
+            debug_reasons.append("減速傾向が直進系Aを支持")
+        elif abs(speed_delta) <= 4.0 and abs(speed_slope) <= 0.8 and abs(mean_acc_x) <= 0.12:
+            add("A", 0.18)
+            debug_reasons.append("速度変化が小さく直進系Aを支持")
+
+        strong_turn = abs(signed_rotation) >= 0.45 or abs(heading_delta) >= 35.0 or max_abs_gyro >= 0.18
+        medium_turn = abs(signed_rotation) >= 0.16 or abs(heading_delta) >= 8.0 or max_abs_gyro >= 0.10
+        lane_change_like = speed >= 15.0 and medium_turn
+
+        if strong_turn:
+            turn_code = "B" if signed_rotation > 0 else "C"
+            add(turn_code, 0.55)
+            debug_reasons.append(f"強い回転量が{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+        elif lane_change_like:
+            turn_code = "B" if (blinker_l and not blinker_r) or signed_rotation > 0 else "C"
+            add(turn_code, 0.35)
+            debug_reasons.append(f"中程度の回転と速度から{MACRO_OUTPUT_NAMES.get(turn_code)}を支持")
+
+        if blinker_l and not blinker_r:
+            add("B", 0.18)
+            debug_reasons.append("左ウィンカーが左回転系Bを補強")
+        elif blinker_r and not blinker_l:
+            add("C", 0.18)
+            debug_reasons.append("右ウィンカーが右回転系Cを補強")
+        elif blinker_l and blinker_r:
+            add("D", 0.25)
+            debug_reasons.append("左右ウィンカー競合でその他Dを補強")
+
+        # Only use D when evidence is weak or contradictory, not for stop/start.
+        top_two = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:2]
+        top_score = top_two[0][1] if top_two else 0.0
+        margin = top_two[0][1] - top_two[1][1] if len(top_two) > 1 else top_score
+        if top_score < 0.35:
+            add("D", 0.25)
+            debug_reasons.append("主要クラスの根拠が弱くその他Dを補強")
+        if margin < 0.08 and top_score < 0.60:
+            add("D", 0.12)
+            debug_reasons.append("クラス間の差が小さくその他Dを補強")
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        primary_macro = ranked[0][0]
+        return (
+            {code: score for code, score in ranked},
+            {
+                "primary_macro": primary_macro,
+                "primary_macro_name": MACRO_OUTPUT_NAMES.get(primary_macro),
+                "scores": dict(ranked),
+                "rule_reasons": debug_reasons,
+                "signed_rotation": signed_rotation,
+                "heading_delta_deg": heading_delta,
+                "max_abs_gyro_z_window": max_abs_gyro,
+                "speed_delta": speed_delta,
+                "speed_slope_kmh_per_s": speed_slope,
+                "temporal_source": source,
+            },
+        )
+
+    def _format_macro_candidate_lines(self, macro_scores: Dict[str, float]) -> str:
+        ranked = sorted(macro_scores.items(), key=lambda item: (-item[1], item[0]))
+        return "\n".join(
+            f"- {code}: {MACRO_OUTPUT_NAMES.get(code, '不明')}（{MACRO_LABEL_EXAMPLES.get(code, '')}） (sensor_score={score:.2f})"
+            for code, score in ranked
+        )
+
+    def _select_summary_images_for_macro_prompt(
+        self,
+        summary_images: List[Image.Image],
+    ) -> List[Image.Image]:
+        """Use only the normalized geometry summary for macro 4-class prompting."""
+        if len(summary_images) >= 2:
+            return [summary_images[1]]
+        if summary_images:
+            return [summary_images[-1]]
+        return []
+
+    def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
+        import re
+
+        if not text:
+            return None
+        allowed = {int(label) for label in allowed_labels}
+        assistant_match = re.search(r'assistant\s*(.*)', text, re.DOTALL | re.IGNORECASE)
+        response_text = assistant_match.group(1).strip() if assistant_match else text[-200:].strip()
+        candidates = []
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        if lines:
+            candidates.append(lines[-1])
+        candidates.append(response_text)
+
+        for candidate in candidates:
+            for match in re.findall(r"\b10\b|\b[0-9]\b", candidate):
+                value = int(match)
+                if value in allowed:
+                    return value
+        return None
+
+    def _combine_sensor_and_video_scores(
+        self,
+        candidate_scores: Dict[int, float],
+        *,
+        video_choice: Optional[int],
+    ) -> Dict[int, float]:
+        combined = dict(candidate_scores)
+        if video_choice is not None and video_choice in combined:
+            combined[video_choice] = round(combined[video_choice] + VIDEO_CHOICE_BONUS, 3)
+        return combined
+
+    def _combine_sensor_and_video_macro_scores(
+        self,
+        macro_scores: Dict[str, float],
+        *,
+        video_choice: Optional[str],
+    ) -> Dict[str, float]:
+        combined = dict(macro_scores)
+        if video_choice is not None and video_choice in combined:
+            combined[video_choice] = round(combined[video_choice] + VIDEO_CHOICE_BONUS, 3)
+        return combined
+
+    def _choose_best_label_from_scores(self, score_map: Dict[int, float]) -> int:
+        return max(score_map.items(), key=lambda item: (item[1], -item[0]))[0]
+
+    def _choose_best_macro_from_scores(self, score_map: Dict[str, float]) -> str:
+        return max(score_map.items(), key=lambda item: (item[1], item[0]))[0]
+
+    def _trajectory_features_for_graph(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        geometry = self._build_trajectory_geometry(sensor_data)
+        trajectory_3d = geometry["trajectory_3d"]
+        return {
+            "visible_count": geometry["visible_count"],
+            "trajectory_points": len(trajectory_3d),
+            "final_x_m": float(trajectory_3d[-1][0]),
+            "final_y_m": float(trajectory_3d[-1][1]),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "speed": float(sensor_data.get("speed", 0.0)),
+        }
+
+    def _trajectory_features_from_geometry(
+        self,
+        geometry: Dict[str, Any],
+        sensor_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trajectory_3d = geometry["trajectory_3d"]
+        return {
+            "visible_count": geometry["visible_count"],
+            "trajectory_points": len(trajectory_3d),
+            "final_x_m": float(trajectory_3d[-1][0]),
+            "final_y_m": float(trajectory_3d[-1][1]),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "speed": float(sensor_data.get("speed", 0.0)),
+        }
+
+    def _apply_veto_only_graph(
+        self,
+        final_label: int,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        candidate_scores: Dict[int, float],
+    ) -> Tuple[int, Dict[str, Any]]:
+        initial_macro = FINE_LABEL_TO_MACRO_GROUP.get(final_label, "D")
+        stage1_choice = "A" if initial_macro == "A" else "N"
+        stage2_choice = None if initial_macro == "A" else initial_macro
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+
+        veto_applied = False
+        veto_reason = None
+        final_graph_label = final_label
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice") and strong_candidate["macro_choice"] != initial_macro:
+            target_macro = strong_candidate["macro_choice"]
+            macro_candidates = {
+                label: score for label, score in candidate_scores.items()
+                if FINE_LABEL_TO_MACRO_GROUP.get(label) == target_macro
+            }
+            if macro_candidates:
+                final_graph_label = self._choose_best_label_from_scores(macro_candidates)
+            else:
+                final_graph_label = MACRO_OUTPUT_TO_LABEL[target_macro]
+            veto_applied = True
+            veto_reason = {
+                "from_macro": initial_macro,
+                "to_macro": target_macro,
+                "strong_candidate": strong_candidate,
+            }
+
+        return final_graph_label, {
+            "graph": graph_result,
+            "veto_applied": veto_applied,
+            "veto_reason": veto_reason,
+        }
+
+    def _apply_veto_only_graph_macro(
+        self,
+        final_macro: str,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        candidate_scores: Dict[str, float],
+    ) -> Tuple[str, Dict[str, Any]]:
+        stage1_choice = "A" if final_macro == "A" else "N"
+        stage2_choice = None if final_macro == "A" else final_macro
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+
+        veto_applied = False
+        veto_reason = None
+        final_graph_macro = final_macro
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice") and strong_candidate["macro_choice"] != final_macro:
+            target_macro = strong_candidate["macro_choice"]
+            if target_macro in candidate_scores:
+                final_graph_macro = target_macro
+            veto_applied = True
+            veto_reason = {
+                "from_macro": final_macro,
+                "to_macro": target_macro,
+                "strong_candidate": strong_candidate,
+            }
+
+        return final_graph_macro, {
+            "graph": graph_result,
+            "veto_applied": veto_applied,
+            "veto_reason": veto_reason,
+        }
+
+    def _predict_sensor_video_late_fusion(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        start_time: float = 0.0,
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Sensor-temporal mainline + raw-video candidate selection + veto-only graph."""
+        clip_info = self._create_centered_video_clip(
+            video_path=video_path,
+            center_time=start_time,
+            window_duration=VIDEO_CLIP_DURATION_SECONDS,
+        )
+        clip_path = clip_info["clip_path"]
+        started_at = time.perf_counter()
+
+        try:
+            temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
+            sensor_primary_label, sensor_rule_reason = self._classify_sensor_only_label(
+                sensor_data,
+                temporal_context=temporal_context,
+            )
+            summary_images, geometry = self._build_trajectory_summary_images(
+                sensor_data,
+                sample_id=sample_id,
+            )
+            candidate_scores, sensor_prior_debug = self._build_sensor_candidate_scores(
+                sensor_data,
+                temporal_context,
+                sensor_primary_label,
+            )
+            candidate_labels = list(candidate_scores.keys())
+            target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
+            candidate_prompt = VIDEO_CANDIDATE_SELECTION_PROMPT_TEMPLATE.format(
+                target_timestamp_text=target_timestamp_text,
+                candidate_lines=self._format_candidate_lines(candidate_scores),
+            )
+            prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=candidate_prompt,
+                summary_images=summary_images,
+                max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+            )
+            video_choice = self._extract_numeric_choice(generated_text, candidate_labels)
+            combined_scores = self._combine_sensor_and_video_scores(
+                candidate_scores,
+                video_choice=video_choice,
+            )
+            fused_label = self._choose_best_label_from_scores(combined_scores)
+            trajectory_features = self._trajectory_features_from_geometry(geometry, sensor_data)
+            final_label, graph_debug = self._apply_veto_only_graph(
+                fused_label,
+                sensor_data,
+                trajectory_features,
+                combined_scores,
+            )
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            self.last_prediction_details = {
+                "mode": "sensor_video_late_fusion_11class",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+                **self.runtime_metadata,
+                "prompt_version": PROMPT_VERSION,
+                "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
+                "inference_mode": "sensor_prior_then_video_plus_summary_candidate_selection",
+                "prompt_text": prompt_text,
+                "generated_text": generated_text,
+                "video_choice": video_choice,
+                "sensor_primary_label": sensor_primary_label,
+                "sensor_primary_label_name": ACTION_LABELS.get(sensor_primary_label),
+                "sensor_rule_reason": sensor_rule_reason,
+                "sensor_temporal_context": temporal_context,
+                "sensor_prior_debug": sensor_prior_debug,
+                "candidate_labels": candidate_labels,
+                "candidate_label_names": [ACTION_LABELS.get(label) for label in candidate_labels],
+                "sensor_candidate_scores": candidate_scores,
+                "combined_candidate_scores": combined_scores,
+                "fused_label_before_graph": fused_label,
+                "fused_label_before_graph_name": ACTION_LABELS.get(fused_label),
+                "predicted_label": final_label,
+                "predicted_label_name": ACTION_LABELS.get(final_label),
+                "trajectory_features": trajectory_features,
+                "trajectory_summary_count": len(summary_images),
+                "visual_input_count": 1 + len(summary_images),
+                "graph": graph_debug.get("graph"),
+                "graph_veto_applied": graph_debug.get("veto_applied"),
+                "graph_veto_reason": graph_debug.get("veto_reason"),
+                "video_window_start_seconds": clip_info["window_start_seconds"],
+                "video_window_end_seconds": clip_info["window_end_seconds"],
+                "target_center_time_seconds": clip_info["target_center_time_seconds"],
+                "target_seconds_in_clip": clip_info["target_seconds_in_clip"],
+                "target_timestamp_text": target_timestamp_text,
+                "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
+                "video_clip_fps": clip_info["fps"],
+                "video_clip_frame_count": clip_info["clip_frame_count"],
+                "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
+                "source_frame_start": clip_info["source_frame_start"],
+                "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
+                "video_processor_metadata": processor_metadata.get("video_metadata"),
+                "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "summary_image_count": processor_metadata.get("summary_image_count"),
+                "inference_latency_ms": latency_ms,
+                "error": None,
+            }
+            logger.info(
+                "[Sensor-video late fusion] sensor=%s video=%s fused=%s final=%s veto=%s",
+                sensor_primary_label,
+                video_choice,
+                fused_label,
+                final_label,
+                graph_debug.get("veto_applied"),
+            )
+            return final_label
+        finally:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+
+    def _predict_sensor_video_late_fusion_macro(
+        self,
+        video_path: str,
+        sensor_data: Dict[str, Any],
+        start_time: float = 0.0,
+        sample_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Sensor-temporal mainline + raw-video and trajectory summaries for macro 4-class selection."""
+        clip_info = self._create_centered_video_clip(
+            video_path=video_path,
+            center_time=start_time,
+            window_duration=VIDEO_CLIP_DURATION_SECONDS,
+        )
+        clip_path = clip_info["clip_path"]
+        started_at = time.perf_counter()
+
+        try:
+            temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
+            generated_summary_images, geometry = self._build_macro_summary_images(
+                sensor_data,
+                sample_id=sample_id,
+            )
+            input_summary_images = self._select_summary_images_for_macro_prompt(generated_summary_images)
+            macro_scores, sensor_macro_debug = self._build_sensor_direct_macro_scores(
+                sensor_data,
+                temporal_context,
+            )
+            target_timestamp_text = self._format_clip_timestamp(clip_info["target_seconds_in_clip"])
+            candidate_prompt = VIDEO_MACRO_CANDIDATE_SELECTION_PROMPT_TEMPLATE.format(
+                target_timestamp_text=target_timestamp_text,
+                candidate_lines=self._format_macro_candidate_lines(macro_scores),
+            )
+            prompt_text, generated_text, processor_metadata = self._run_prompt_on_video_clip(
+                clip_path=clip_path,
+                prompt_text=candidate_prompt,
+                summary_images=input_summary_images,
+                max_new_tokens=MAX_NEW_TOKENS_VIDEO_CANDIDATE,
+            )
+            video_macro_choice = self._extract_choice(
+                generated_text,
+                ["A", "B", "C", "D"],
+                alias_to_choice={
+                    "直線系": "A",
+                    "左回転系": "B",
+                    "右回転系": "C",
+                    "その他": "D",
+                },
+            )
+            combined_macro_scores = self._combine_sensor_and_video_macro_scores(
+                macro_scores,
+                video_choice=video_macro_choice,
+            )
+            fused_macro = self._choose_best_macro_from_scores(combined_macro_scores)
+            trajectory_features = self._trajectory_features_from_geometry(geometry, sensor_data)
+            final_macro, graph_debug = self._apply_veto_only_graph_macro(
+                fused_macro,
+                sensor_data,
+                trajectory_features,
+                combined_macro_scores,
+            )
+            final_label = MACRO_OUTPUT_TO_LABEL[final_macro]
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+            self.last_prediction_details = {
+                "mode": "sensor_video_late_fusion_4class",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+                **self.runtime_metadata,
+                "prompt_version": PROMPT_VERSION,
+                "video_input_mode": "raw_video_clip_plus_trajectory_summaries",
+                "inference_mode": "direct_sensor_macro_prior_then_video_plus_summary_macro_selection",
+                "prompt_text": prompt_text,
+                "generated_text": generated_text,
+                "video_macro_choice": video_macro_choice,
+                "sensor_primary_macro": sensor_macro_debug.get("primary_macro"),
+                "sensor_primary_macro_name": sensor_macro_debug.get("primary_macro_name"),
+                "sensor_macro_rule_reasons": sensor_macro_debug.get("rule_reasons"),
+                "sensor_temporal_context": temporal_context,
+                "sensor_macro_debug": sensor_macro_debug,
+                "sensor_macro_scores": macro_scores,
+                "combined_macro_scores": combined_macro_scores,
+                "fused_macro_before_graph": fused_macro,
+                "fused_macro_before_graph_name": MACRO_OUTPUT_NAMES.get(fused_macro),
+                "predicted_macro_choice": final_macro,
+                "predicted_macro_name": MACRO_OUTPUT_NAMES.get(final_macro),
+                "predicted_label": final_label,
+                "predicted_label_name": ACTION_LABELS.get(final_label),
+                "trajectory_features": trajectory_features,
+                "generated_trajectory_summary_count": len(generated_summary_images),
+                "trajectory_summary_count": len(input_summary_images),
+                "trajectory_summary_types": ["normalized"][:len(input_summary_images)],
+                "trajectory_source": geometry.get("trajectory_source"),
+                "visual_input_count": 1 + len(input_summary_images),
+                "graph": graph_debug.get("graph"),
+                "graph_veto_applied": graph_debug.get("veto_applied"),
+                "graph_veto_reason": graph_debug.get("veto_reason"),
+                "video_window_start_seconds": clip_info["window_start_seconds"],
+                "video_window_end_seconds": clip_info["window_end_seconds"],
+                "target_center_time_seconds": clip_info["target_center_time_seconds"],
+                "target_seconds_in_clip": clip_info["target_seconds_in_clip"],
+                "target_timestamp_text": target_timestamp_text,
+                "video_clip_duration_seconds": clip_info["clip_duration_seconds"],
+                "video_clip_fps": clip_info["fps"],
+                "video_clip_frame_count": clip_info["clip_frame_count"],
+                "source_total_duration_seconds": clip_info["source_total_duration_seconds"],
+                "source_frame_start": clip_info["source_frame_start"],
+                "source_frame_end_exclusive": clip_info["source_frame_end_exclusive"],
+                "video_processor_metadata": processor_metadata.get("video_metadata"),
+                "video_grid_thw": processor_metadata.get("video_grid_thw"),
+                "summary_image_count": processor_metadata.get("summary_image_count"),
+                "inference_latency_ms": latency_ms,
+                "error": None,
+            }
+            logger.info(
+                "[Sensor-video late fusion 4class] sensor=%s/%s video=%s fused=%s final=%s veto=%s",
+                sensor_macro_debug.get("primary_macro_name"),
+                sensor_macro_debug.get("primary_macro"),
+                video_macro_choice,
+                fused_macro,
+                final_macro,
+                graph_debug.get("veto_applied"),
+            )
+            return final_label
+        finally:
+            if clip_path and os.path.exists(clip_path):
+                os.remove(clip_path)
+
+    def _apply_macro_graph(
+        self,
+        initial_macro_choice: str,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        *,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> str:
+        graph_result = self.graph_verifier.build(
+            sensor_data,
+            trajectory_features,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+        # Keep both keys so analysis scripts do not miss graph output.
+        self.last_prediction_details["macro_graph"] = graph_result
+        self.last_prediction_details["graph"] = graph_result
+        self.last_prediction_details["initial_macro_choice"] = initial_macro_choice
+
+        strong_candidate = graph_result.get("strong_candidate")
+        if strong_candidate and strong_candidate.get("macro_choice"):
+            final_macro_choice = strong_candidate["macro_choice"]
+            overridden = final_macro_choice != initial_macro_choice
+            self.last_prediction_details["graph_override"] = overridden
+            self.last_prediction_details["graph_overrode"] = overridden
+            self.last_prediction_details["final_macro_choice"] = final_macro_choice
+            return final_macro_choice
+
+        self.last_prediction_details["graph_override"] = False
+        self.last_prediction_details["graph_overrode"] = False
+        self.last_prediction_details["final_macro_choice"] = initial_macro_choice
+        return initial_macro_choice
     
     def predict_action(
         self,
@@ -443,18 +2413,22 @@ class HeronAnnotatorWithTrajectory:
         """
         if not self.is_loaded:
             self.load_model()
-        
-        # use_l2mが指定されていない場合はconfig設定を使用
-        if use_l2m is None:
-            use_l2m = USE_L2M_COT
-        
-        # L2M+CoTパイプラインを使用する場合
-        if use_l2m:
-            logger.info("Using L2M+CoT pipeline for prediction")
-            return self._predict_with_l2m(video_path, sensor_data, start_time, sample_id)
-        
-        # Use multi-frame prediction with trajectory
-        return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
+
+        self.last_prediction_details = {
+            "video_path": video_path,
+            "sensor_data": dict(sensor_data),
+            "annotation_center_time_seconds": start_time,
+            "sample_id": sample_id,
+            "mode": "sensor_video_late_fusion_4class",
+            **self.runtime_metadata,
+        }
+
+        return self._predict_sensor_video_late_fusion_macro(
+            video_path=video_path,
+            sensor_data=sensor_data,
+            start_time=start_time,
+            sample_id=sample_id,
+        )
     
     def _predict_with_l2m(
         self,
@@ -491,37 +2465,27 @@ class HeronAnnotatorWithTrajectory:
             frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
             
             # Create L2M pipeline
-            pipeline = L2MCoTPipeline(self.generation_runtime)
+            pipeline = L2MCoTPipeline(self)
             
             # Run L2M analysis with trajectory-enhanced frames
             result = pipeline.analyze_with_l2m(frames_with_trajectory, sensor_data)
-
-            # 詳細結果を保持（predict_action_with_details から参照できるよう）
-            self._last_l2m_result = result
-
-            if result.get('status') == 'failed' or result.get('final_category') is None:
-                logger.warning(
-                    "[L2M+CoT] Invalid result detected. Treating prediction as failure. error=%s",
-                    result.get('error', 'unknown'),
-                )
-                return None
             
             # Extract final category
-            final_category = result.get('final_category')
+            final_category = result.get('final_category', 0)
             confidence = result.get('confidence', 0.5)
-
+            
             logger.info(f"[L2M+CoT] *** FINAL RESULT: category={final_category}, confidence={confidence:.2f} ***")
             logger.info(f"[L2M+CoT] Level 1: {result['level1'].get('road_shape', 'N/A')}, {result['level1'].get('trajectory_relation', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 2: {result['level2'].get('acceleration_cause', 'N/A')}, {result['level2'].get('speed_trend', 'N/A')}")
             logger.info(f"[L2M+CoT] Level 3: {result['level3'].get('category_name', 'N/A')}")
             logger.info(f"[L2M+CoT] *** RETURNING: {final_category} ***")
-
+            
             return final_category
-
+            
         except Exception as e:
             logger.error(f"L2M+CoT prediction FAILED with exception: {e}", exc_info=True)
+            # フォールバック: 通常の推論を試す
             logger.warning("!!! FALLBACK to standard prediction !!!")
-            self._last_l2m_result = None
             return self._predict_multi_frame_with_trajectory(video_path, sensor_data, start_time, sample_id)
     
     def _predict_multi_frame_with_trajectory(
@@ -535,6 +2499,14 @@ class HeronAnnotatorWithTrajectory:
         Predict using multiple frames with trajectory visualization
         """
         try:
+            self.last_prediction_details = {
+                "mode": "qwen3_vl_stagewise",
+                "sample_id": sample_id,
+                "video_path": video_path,
+                "start_time": start_time,
+                **self.runtime_metadata,
+            }
+
             # Extract 4 frames from video
             frames, frame_indices = self.extract_frames_from_video(
                 video_path, 
@@ -548,42 +2520,165 @@ class HeronAnnotatorWithTrajectory:
                 return None
             
             logger.info(f"[Multi-frame with trajectory] Using {len(frames)} frames at indices {frame_indices}")
-            
-            # Draw trajectory on all 4 frames
-            frames_with_trajectory = self.draw_trajectory_on_frames(frames, sensor_data, sample_id)
-            
-            # Format prompt with sensor data
-            prompt_text = PROMPT_TEMPLATE.format(
+
+            model_frames, geometry = self.prepare_visual_inputs(frames, sensor_data, sample_id)
+            self.last_prediction_details["frame_indices"] = frame_indices
+            self.last_prediction_details["trajectory_features"] = {
+                "visible_count": geometry["visible_count"],
+                "trajectory_points": len(geometry["trajectory_3d"]),
+                "final_x_m": float(geometry["trajectory_3d"][-1][0]),
+                "final_y_m": float(geometry["trajectory_3d"][-1][1]),
+                "gyro_z": float(sensor_data.get('gyro_z', 0.0)),
+                "speed": float(sensor_data.get('speed', 0.0)),
+            }
+
+            stage1_prompt = STAGE1_PROMPT_TEMPLATE.format(
                 speed=sensor_data.get('speed', 0),
                 acc_x=sensor_data.get('acc_x', 0),
                 acc_y=sensor_data.get('acc_y', 0),
                 acc_z=sensor_data.get('acc_z', 0),
-                brake=sensor_data.get('brake', 0)
+                gyro_z=sensor_data.get('gyro_z', 0),
             )
-            
-            generated_text = self.generation_runtime.generate_text(
-                frames_with_trajectory,
-                prompt_text,
-                max_new_tokens=100,
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
+            stage1_generated = self._run_prompt_on_frames(model_frames, stage1_prompt)
+            stage1_choice = self._extract_choice(
+                stage1_generated,
+                ["A", "N"],
+                alias_to_choice={
+                    "直線系": "A",
+                    "左回転系": "N",
+                    "右回転系": "N",
+                    "その他": "N",
+                },
             )
-            
-            logger.info(f"Model output: {generated_text}")
-            
-            # Extract action label from response
-            action_label = self._extract_action_label(generated_text)
-            
-            if action_label is not None:
-                logger.info(f"Predicted action label: {action_label}")
+
+            self.last_prediction_details["stage1_prompt_text"] = stage1_prompt
+            self.last_prediction_details["stage1_generated_text"] = stage1_generated
+            self.last_prediction_details["stage1_choice"] = stage1_choice
+
+            if stage1_choice == "A":
+                final_macro_choice = self._apply_macro_graph(
+                    "A",
+                    sensor_data,
+                    self.last_prediction_details["trajectory_features"],
+                    stage1_choice=stage1_choice,
+                    stage2_choice=None,
+                )
+                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
+                self.last_prediction_details["predicted_label"] = action_label
+                logger.info(
+                    f"Stage1 chose A -> Final macro {final_macro_choice} -> "
+                    f"Predicted action label: {action_label} ({REPRESENTATIVE_LABEL_TO_MACRO_NAME[action_label]})"
+                )
+                return action_label
+
+            if stage1_choice != "N":
+                logger.warning(f"Failed to extract Stage1 choice from model output: {stage1_generated}")
+                self.last_prediction_details["error"] = "stage1_parse_failed"
+                return None
+
+            stage2_prompt = STAGE2_ROUTE_PROMPT_TEMPLATE.format(
+                speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
+                acc_y=sensor_data.get('acc_y', 0),
+                acc_z=sensor_data.get('acc_z', 0),
+                gyro_z=sensor_data.get('gyro_z', 0),
+            )
+            stage2_generated = self._run_prompt_on_frames(model_frames, stage2_prompt)
+            stage2_route_choice = self._extract_choice(
+                stage2_generated,
+                ["R", "D"],
+                alias_to_choice={
+                    "回転系": "R",
+                    "その他": "D",
+                },
+            )
+
+            self.last_prediction_details["stage2_prompt_text"] = stage2_prompt
+            self.last_prediction_details["stage2_generated_text"] = stage2_generated
+            self.last_prediction_details["stage2_route_choice"] = stage2_route_choice
+
+            if stage2_route_choice is None:
+                logger.warning(f"Failed to extract Stage2 choice from model output: {stage2_generated}")
+                self.last_prediction_details["error"] = "stage2_parse_failed"
+                return None
+
+            if stage2_route_choice == "D":
+                self.last_prediction_details["stage2_choice"] = "D"
+                final_macro_choice = self._apply_macro_graph(
+                    "D",
+                    sensor_data,
+                    self.last_prediction_details["trajectory_features"],
+                    stage1_choice=stage1_choice,
+                    stage2_choice="D",
+                )
+                action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
+                self.last_prediction_details["predicted_label"] = action_label
+
+                macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
+                if macro_name:
+                    logger.info(
+                        f"Stage2 chose D -> Final macro {final_macro_choice} -> "
+                        f"Predicted action label: {action_label} ({macro_name})"
+                    )
+                else:
+                    logger.info(f"Predicted action label: {action_label}")
+                return action_label
+
+            if stage2_route_choice != "R":
+                logger.warning(f"Unexpected Stage2 route choice from model output: {stage2_generated}")
+                self.last_prediction_details["error"] = "stage2_route_unexpected"
+                return None
+
+            stage3_prompt = STAGE3_TURN_PROMPT_TEMPLATE.format(
+                speed=sensor_data.get('speed', 0),
+                acc_x=sensor_data.get('acc_x', 0),
+                acc_y=sensor_data.get('acc_y', 0),
+                acc_z=sensor_data.get('acc_z', 0),
+                gyro_z=sensor_data.get('gyro_z', 0),
+            )
+            stage3_generated = self._run_prompt_on_frames(model_frames, stage3_prompt)
+            stage3_choice = self._extract_choice(
+                stage3_generated,
+                ["B", "C"],
+                alias_to_choice={
+                    "左回転系": "B",
+                    "右回転系": "C",
+                },
+            )
+
+            self.last_prediction_details["stage3_prompt_text"] = stage3_prompt
+            self.last_prediction_details["stage3_generated_text"] = stage3_generated
+            self.last_prediction_details["stage3_turn_choice"] = stage3_choice
+            self.last_prediction_details["stage2_choice"] = stage3_choice
+
+            if stage3_choice is None:
+                logger.warning(f"Failed to extract Stage3 choice from model output: {stage3_generated}")
+                self.last_prediction_details["error"] = "stage3_parse_failed"
+                return None
+
+            final_macro_choice = self._apply_macro_graph(
+                stage3_choice,
+                sensor_data,
+                self.last_prediction_details["trajectory_features"],
+                stage1_choice=stage1_choice,
+                stage2_choice=stage3_choice,
+            )
+            action_label = MACRO_OUTPUT_TO_LABEL[final_macro_choice]
+            self.last_prediction_details["predicted_label"] = action_label
+
+            macro_name = REPRESENTATIVE_LABEL_TO_MACRO_NAME.get(action_label)
+            if macro_name:
+                logger.info(
+                    f"Stage3 chose {stage3_choice} -> Final macro {final_macro_choice} -> "
+                    f"Predicted action label: {action_label} ({macro_name})"
+                )
             else:
-                logger.warning("Failed to extract action label from model output")
+                logger.info(f"Predicted action label: {action_label}")
             
             return action_label
             
         except Exception as e:
+            self.last_prediction_details["error"] = str(e)
             logger.error(f"Error in multi-frame trajectory prediction: {e}", exc_info=True)
             return None
     
@@ -595,7 +2690,7 @@ class HeronAnnotatorWithTrajectory:
             text: Model generated text
         
         Returns:
-            Action label (0-10) or None if extraction fails
+            Representative 11-class label for the macro category or None
         """
         import re
         
@@ -604,45 +2699,40 @@ class HeronAnnotatorWithTrajectory:
         if assistant_match:
             response_text = assistant_match.group(1).strip()
         else:
-            # Fallback: use full text if no assistant marker found
-            response_text = text
-        
-        # Look for patterns like "action: 2", "label: 5", or just a number
-        patterns = [
-            r'action[:\s]+(\d+)',
-            r'label[:\s]+(\d+)',
-            r'prediction[:\s]+(\d+)',
-            r'class[:\s]+(\d+)',
-            r'(\d+)'  # Last resort: any digit
+            # Fallback: use only the tail to avoid re-matching prompt contents
+            response_text = text[-200:].strip()
+
+        normalized = response_text.strip()
+        normalized_upper = normalized.upper()
+
+        macro_patterns = [
+            (r'^\s*A\s*$', "A"),
+            (r'^\s*B\s*$', "B"),
+            (r'^\s*C\s*$', "C"),
+            (r'^\s*D\s*$', "D"),
+            (r'\bA\b', "A"),
+            (r'\bB\b', "B"),
+            (r'\bC\b', "C"),
+            (r'\bD\b', "D"),
         ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, response_text.lower())
-            if match:
-                action_label = int(match.group(1))
-                if 0 <= action_label <= 10:
-                    return action_label
-        
+
+        for pattern, macro_code in macro_patterns:
+            if re.search(pattern, normalized_upper):
+                return MACRO_OUTPUT_TO_LABEL[macro_code]
+
+        japanese_aliases = [
+            ("直線系", "A"),
+            ("左回転系", "B"),
+            ("右回転系", "C"),
+            ("その他", "D"),
+        ]
+
+        for alias, macro_code in japanese_aliases:
+            if alias in normalized:
+                return MACRO_OUTPUT_TO_LABEL[macro_code]
+
         return None
     
-    def predict_action_with_details(
-        self,
-        video_path: str,
-        sensor_data: Dict[str, Any],
-        start_time: float = 0.0,
-        sample_id: Optional[int] = None
-    ) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
-        """
-        predict_action と同じだが、L2M の中間推論結果も返す。
-
-        Returns:
-            (predicted_label, l2m_details) のタプル。
-            l2m_details は level1/level2/level3 の辞書。L2M未使用時は None。
-        """
-        self._last_l2m_result = None
-        label = self.predict_action(video_path, sensor_data, start_time, sample_id)
-        return label, self._last_l2m_result
-
     def predict_batch(
         self,
         samples: List[Dict[str, Any]],

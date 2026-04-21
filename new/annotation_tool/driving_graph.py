@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from config import ACTION_LABELS, GYRO_THRESHOLD, SPEED_STOP_THRESHOLD
+from config import ACTION_LABELS
+
+
+DEFAULT_GYRO_THRESHOLD = 0.08
+DEFAULT_SPEED_STOP_THRESHOLD = 3.0
 
 
 class DrivingConceptGraphBuilder:
@@ -73,7 +77,7 @@ class DrivingConceptGraphBuilder:
         direction_change = level1_result.get("direction_change", "STRAIGHT")
         visual_shift = level1_result.get("visual_shift", "NO_SHIFT")
 
-        if speed < SPEED_STOP_THRESHOLD and brake > 0:
+        if speed < DEFAULT_SPEED_STOP_THRESHOLD and brake > 0:
             speed_state = "STOPPED"
         elif speed < self.START_SPEED_THRESHOLD and (
             speed_diff > self.SPEED_DIFF_THRESHOLD or speed_trend == "INCREASING"
@@ -102,9 +106,9 @@ class DrivingConceptGraphBuilder:
         else:
             signal_state = "OFF"
 
-        if gyro_z > GYRO_THRESHOLD or visual_shift == "SHIFT_LEFT":
+        if gyro_z > DEFAULT_GYRO_THRESHOLD or visual_shift == "SHIFT_LEFT":
             trajectory_direction = "LEFT"
-        elif gyro_z < -GYRO_THRESHOLD or visual_shift == "SHIFT_RIGHT":
+        elif gyro_z < -DEFAULT_GYRO_THRESHOLD or visual_shift == "SHIFT_RIGHT":
             trajectory_direction = "RIGHT"
         elif direction_change == "TURNING":
             if road_shape == "CURVE_LEFT":
@@ -116,9 +120,9 @@ class DrivingConceptGraphBuilder:
         else:
             trajectory_direction = "STRAIGHT"
 
-        if abs(gyro_z) > GYRO_THRESHOLD * 1.8 or direction_change == "TURNING":
+        if abs(gyro_z) > DEFAULT_GYRO_THRESHOLD * 1.8 or direction_change == "TURNING":
             turn_intensity = "HIGH"
-        elif abs(gyro_z) > GYRO_THRESHOLD * 0.8 or visual_shift != "NO_SHIFT":
+        elif abs(gyro_z) > DEFAULT_GYRO_THRESHOLD * 0.8 or visual_shift != "NO_SHIFT":
             turn_intensity = "MEDIUM"
         else:
             turn_intensity = "LOW"
@@ -137,7 +141,7 @@ class DrivingConceptGraphBuilder:
         else:
             intersection_state = "UNKNOWN"
 
-        if speed < SPEED_STOP_THRESHOLD and brake > 0:
+        if speed < DEFAULT_SPEED_STOP_THRESHOLD and brake > 0:
             stop_likelihood = "HIGH"
         elif speed < self.START_SPEED_THRESHOLD:
             stop_likelihood = "MEDIUM"
@@ -249,7 +253,7 @@ class DrivingConceptGraphBuilder:
             add(2, 0.70, "速度差分またはトレンドが加速")
         if speed_state == "DECELERATING":
             add(3, 0.70, "速度差分またはトレンドが減速")
-        if brake > 0 and speed > SPEED_STOP_THRESHOLD:
+        if brake > 0 and speed > DEFAULT_SPEED_STOP_THRESHOLD:
             add(3, 0.20, "ブレーキONで減速候補を補強")
 
         if speed_state == "CONSTANT" and direction == "STRAIGHT":
@@ -378,3 +382,284 @@ class DrivingConceptGraphBuilder:
                 f"(score={candidate['score']:.2f}) -> {reasons}"
             )
         return "\n".join(lines)
+
+
+class MacroGraphVerifier:
+    """Graph-style verifier / reranker for macro 4-way classification."""
+
+    STRONG_SUPPORT_THRESHOLD = 0.62
+    STRONG_MARGIN_THRESHOLD = 0.10
+
+    def build(
+        self,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+        *,
+        stage1_choice: str | None = None,
+        stage2_choice: str | None = None,
+    ) -> Dict[str, Any]:
+        observations = self._extract_observations(sensor_data, trajectory_features)
+        edges = self._build_edges(observations, stage1_choice=stage1_choice, stage2_choice=stage2_choice)
+        label_support, label_reasons = self._score_labels(
+            observations,
+            stage1_choice=stage1_choice,
+            stage2_choice=stage2_choice,
+        )
+        top_candidates = self._build_top_candidates(label_support, label_reasons)
+        strong_candidate = self._select_strong_candidate(top_candidates)
+        return {
+            "observations": observations,
+            "edges": edges,
+            "label_support": label_support,
+            "label_reasons": label_reasons,
+            "top_candidates": top_candidates,
+            "strong_candidate": strong_candidate,
+        }
+
+    def _extract_observations(
+        self,
+        sensor_data: Dict[str, Any],
+        trajectory_features: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        speed = float(sensor_data.get("speed", 0.0) or 0.0)
+        acc_x = float(sensor_data.get("acc_x", 0.0) or 0.0)
+        gyro_z = float(sensor_data.get("gyro_z", 0.0) or 0.0)
+
+        forward_distance = float(trajectory_features.get("final_x_m", 0.0) or 0.0)
+        lateral_offset = float(trajectory_features.get("final_y_m", 0.0) or 0.0)
+        visible_count = int(trajectory_features.get("visible_count", 0) or 0)
+        trajectory_points = int(trajectory_features.get("trajectory_points", 0) or 0)
+
+        denom = max(abs(forward_distance), 1.0)
+        lateral_ratio = abs(lateral_offset) / denom
+        point_like = (forward_distance < 2.5 and visible_count <= 1) or forward_distance < 1.5
+        moving_straight_like = (
+            speed >= 8.0
+            and forward_distance >= 6.0
+            and visible_count >= 4
+            and lateral_ratio < 0.08
+            and abs(gyro_z) < 0.08
+        )
+
+        if point_like or (speed < 2.0 and forward_distance < 4.0):
+            motion_state = "STOPLIKE"
+        elif acc_x < -0.35:
+            motion_state = "DECEL"
+        elif acc_x > 0.35:
+            motion_state = "ACCEL"
+        else:
+            motion_state = "CRUISE"
+
+        if lateral_offset > 1.2 or gyro_z > DEFAULT_GYRO_THRESHOLD:
+            turn_sign = "LEFT"
+        elif lateral_offset < -1.2 or gyro_z < -DEFAULT_GYRO_THRESHOLD:
+            turn_sign = "RIGHT"
+        else:
+            turn_sign = "STRAIGHT"
+
+        if lateral_ratio >= 0.14 or abs(gyro_z) >= 0.12:
+            turn_strength = "HIGH"
+        elif lateral_ratio >= 0.07 or abs(gyro_z) >= 0.05:
+            turn_strength = "MEDIUM"
+        else:
+            turn_strength = "LOW"
+
+        return {
+            "speed": speed,
+            "acc_x": acc_x,
+            "gyro_z": gyro_z,
+            "forward_distance": round(forward_distance, 3),
+            "lateral_offset": round(lateral_offset, 3),
+            "lateral_ratio": round(lateral_ratio, 3),
+            "visible_count": visible_count,
+            "trajectory_points": trajectory_points,
+            "point_like": point_like,
+            "moving_straight_like": moving_straight_like,
+            "motion_state": motion_state,
+            "turn_sign": turn_sign,
+            "turn_strength": turn_strength,
+        }
+
+    def _build_edges(
+        self,
+        observations: Dict[str, Any],
+        *,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> List[Dict[str, str]]:
+        edges: List[Dict[str, str]] = []
+
+        if observations["turn_strength"] in {"MEDIUM", "HIGH"} and observations["turn_sign"] != "STRAIGHT":
+            edges.append(
+                {
+                    "source": "trajectory_geometry",
+                    "target": "turn_hypothesis",
+                    "type": "supports",
+                    "reason": "横偏位またはヨーレートが回転系を支持",
+                }
+            )
+
+        if observations["point_like"] or observations["motion_state"] == "STOPLIKE":
+            edges.append(
+                {
+                    "source": "motion_state",
+                    "target": "other_hypothesis",
+                    "type": "supports",
+                    "reason": "低速かつ短い軌道がその他系を支持",
+                }
+            )
+
+        if observations["moving_straight_like"]:
+            edges.append(
+                {
+                    "source": "trajectory_geometry",
+                    "target": "straight_hypothesis",
+                    "type": "supports",
+                    "reason": "十分な前進距離と低い横偏位が直線移動を支持",
+                }
+            )
+
+        if stage1_choice == "A" and observations["turn_strength"] == "HIGH":
+            edges.append(
+                {
+                    "source": "stage1_choice",
+                    "target": "turn_hypothesis",
+                    "type": "contradicts",
+                    "reason": "VLMは直線系だが幾何は強い回転を示す",
+                }
+            )
+
+        if stage2_choice in {"B", "C"} and observations["turn_sign"] == "STRAIGHT":
+            edges.append(
+                {
+                    "source": "stage2_choice",
+                    "target": "straight_hypothesis",
+                    "type": "contradicts",
+                    "reason": "VLMは回転系だが幾何の左右方向が弱い",
+                }
+            )
+
+        return edges
+
+    def _score_labels(
+        self,
+        observations: Dict[str, Any],
+        *,
+        stage1_choice: str | None,
+        stage2_choice: str | None,
+    ) -> tuple[Dict[str, float], Dict[str, List[str]]]:
+        label_support = {label: 0.0 for label in ["A", "B", "C", "D"]}
+        label_reasons = {label: [] for label in ["A", "B", "C", "D"]}
+
+        def add(label: str, amount: float, reason: str) -> None:
+            label_support[label] = min(1.0, max(0.0, label_support[label] + amount))
+            label_reasons[label].append(reason)
+
+        turn_sign = observations["turn_sign"]
+        turn_strength = observations["turn_strength"]
+        motion_state = observations["motion_state"]
+        speed = observations["speed"]
+        forward_distance = observations["forward_distance"]
+        lateral_ratio = observations["lateral_ratio"]
+        point_like = observations["point_like"]
+        moving_straight_like = observations["moving_straight_like"]
+
+        if stage1_choice == "A":
+            add("A", 0.32, "Stage1 が直線系を選択")
+        elif stage1_choice == "N":
+            add("B", 0.05, "Stage1 が非直線系を選択")
+            add("C", 0.05, "Stage1 が非直線系を選択")
+            add("D", 0.05, "Stage1 が非直線系を選択")
+
+        if stage2_choice in {"B", "C", "D"}:
+            add(stage2_choice, 0.22, f"Stage2 が {stage2_choice} を選択")
+
+        if stage2_choice == "D" and moving_straight_like:
+            add("A", 0.26, "Stage2 はその他だが幾何は直線移動")
+            add("D", -0.10, "十分な前進距離がその他寄り判定と矛盾")
+
+        if turn_sign == "LEFT":
+            add("B", 0.28 if turn_strength == "HIGH" else 0.18, "軌道終点またはヨーレートが左方向")
+            add("A", -0.08, "左方向変化は直線系と矛盾")
+        elif turn_sign == "RIGHT":
+            add("C", 0.28 if turn_strength == "HIGH" else 0.18, "軌道終点またはヨーレートが右方向")
+            add("A", -0.08, "右方向変化は直線系と矛盾")
+        else:
+            add("A", 0.18, "左右方向変化が弱い")
+
+        if turn_strength == "HIGH":
+            add("B" if turn_sign == "LEFT" else "C" if turn_sign == "RIGHT" else "A", 0.18, "回転強度が高い")
+        elif turn_strength == "LOW":
+            add("A", 0.12, "回転強度が低い")
+
+        if moving_straight_like:
+            add("A", 0.32, "速度・可視点数・前進距離が直線移動を支持")
+            add("D", -0.14, "十分に動いているためその他へは倒しにくい")
+
+        if not point_like and forward_distance >= 5.0 and observations["visible_count"] >= 4:
+            add("A", 0.15, "軌道が十分に伸びており直線移動と整合")
+
+        if stage1_choice == "A" and turn_strength == "HIGH" and turn_sign == "LEFT":
+            add("B", 0.24, "Stage1 は直線系だが幾何は強い左回転")
+        elif stage1_choice == "A" and turn_strength == "HIGH" and turn_sign == "RIGHT":
+            add("C", 0.24, "Stage1 は直線系だが幾何は強い右回転")
+
+        if stage2_choice == "B" and turn_sign == "RIGHT" and turn_strength in {"MEDIUM", "HIGH"}:
+            add("C", 0.22, "Stage2 は左回転だが幾何は右方向")
+        elif stage2_choice == "C" and turn_sign == "LEFT" and turn_strength in {"MEDIUM", "HIGH"}:
+            add("B", 0.22, "Stage2 は右回転だが幾何は左方向")
+
+        if stage1_choice == "A" and point_like:
+            add("A", 0.06, "Stage1 は直進系で軌道は極短、停止/発進寄り")
+
+        if point_like:
+            add("A", 0.22, "軌道が短く停止/発進を含む直進系寄り")
+
+        if motion_state == "STOPLIKE":
+            add("A", 0.20, "速度と軌道長から停止/発進寄り")
+        elif motion_state == "DECEL":
+            add("A", 0.10, "減速は直線系にも含まれる")
+        elif motion_state in {"ACCEL", "CRUISE"} and turn_sign == "STRAIGHT":
+            add("A", 0.14, "直進かつ巡航/加速")
+
+        if speed < DEFAULT_SPEED_STOP_THRESHOLD and forward_distance < 3.0:
+            add("A", 0.10, "低速かつ前進距離が短く停止/発進寄り")
+
+        if lateral_ratio > 0.18 and turn_sign == "LEFT":
+            add("B", 0.14, "横偏位比が大きく左回転寄り")
+        elif lateral_ratio > 0.18 and turn_sign == "RIGHT":
+            add("C", 0.14, "横偏位比が大きく右回転寄り")
+
+        for label in label_support:
+            label_support[label] = round(max(0.0, min(1.0, label_support[label])), 3)
+
+        return label_support, label_reasons
+
+    def _build_top_candidates(
+        self,
+        label_support: Dict[str, float],
+        label_reasons: Dict[str, List[str]],
+    ) -> List[Dict[str, Any]]:
+        ranked = sorted(label_support.items(), key=lambda item: item[1], reverse=True)
+        top_candidates = []
+        for label, score in ranked[:4]:
+            top_candidates.append(
+                {
+                    "macro_choice": label,
+                    "score": score,
+                    "reasons": label_reasons.get(label, [])[:3],
+                }
+            )
+        return top_candidates
+
+    def _select_strong_candidate(self, top_candidates: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+        if not top_candidates:
+            return None
+        top = top_candidates[0]
+        second_score = top_candidates[1]["score"] if len(top_candidates) > 1 else 0.0
+        if (
+            top["score"] >= self.STRONG_SUPPORT_THRESHOLD
+            and (top["score"] - second_score) >= self.STRONG_MARGIN_THRESHOLD
+        ):
+            return top
+        return None
