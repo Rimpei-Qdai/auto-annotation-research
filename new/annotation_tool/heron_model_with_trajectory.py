@@ -634,24 +634,13 @@ class HeronAnnotatorWithTrajectory:
         if not frames:
             logger.warning("No frames to draw trajectory on")
             return frames
-        
-        # Extract sensor data for trajectory calculation
-        speed = sensor_data.get('speed', 0.0)  # km/h
-        gyro_z = sensor_data.get('gyro_z', 0.0)  # rad/s (yaw rate)
-        
-        # Convert speed to m/s
-        speed_ms = speed / 3.6
-        
-        # Create speed and yaw rate sequences for 3 seconds (30 steps * 0.1s)
-        num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
-        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        
-        # Calculate 3D trajectory using Bicycle Model
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
-        
-        # Project to 2D image coordinates
-        image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
+
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        speed = geometry["speed"]
+        gyro_z = geometry["gyro_z"]
+        trajectory_3d = geometry["trajectory_3d"]
+        image_points = geometry["image_points"]
+        valid_mask = geometry["valid_mask"]
         
         visible_count = np.sum(valid_mask)
         logger.info(f"Trajectory: {visible_count}/{len(valid_mask)} points visible")
@@ -702,28 +691,149 @@ class HeronAnnotatorWithTrajectory:
         logger.info(f"Drew trajectory on {len(frames_with_trajectory)} frames")
         return frames_with_trajectory
 
+    def _make_synthetic_motion_points(
+        self,
+        sensor_data: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Build a tiny synthetic window so motion summaries can still render."""
+        center_timestamp = 1000
+        center_heading = float(sensor_data.get("heading", 0.0))
+        base_point = {
+            "speed": float(sensor_data.get("speed", 0.0)),
+            "acc_x": float(sensor_data.get("acc_x", 0.0)),
+            "gyro_z": float(sensor_data.get("gyro_z", 0.0)),
+            "heading": center_heading,
+            "brake": int(float(sensor_data.get("brake", 0.0))),
+            "blinker_l": int(float(sensor_data.get("blinker_l", 0.0))),
+            "blinker_r": int(float(sensor_data.get("blinker_r", 0.0))),
+        }
+        points: List[Dict[str, Any]] = []
+        for timestamp in [0, center_timestamp, 2000]:
+            point = dict(base_point)
+            point["timestamp"] = timestamp
+            point["offset_ms"] = timestamp - center_timestamp
+            points.append(point)
+        return points, center_timestamp
+
+    def _build_window_relative_trajectories(
+        self,
+        window_points: List[Dict[str, Any]],
+        center_timestamp: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build past/future trajectories from actual dense-window telemetry."""
+        ordered = sorted(window_points, key=lambda item: int(item["timestamp"]))
+        if not ordered:
+            zero = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            return zero, zero
+
+        center_idx = min(
+            range(len(ordered)),
+            key=lambda idx: abs(int(ordered[idx]["timestamp"]) - center_timestamp),
+        )
+        center_heading = float(ordered[center_idx].get("heading", 0.0))
+
+        def _relative_theta_rad(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+            left_delta = self._signed_heading_delta_deg(center_heading, float(left.get("heading", center_heading)))
+            right_delta = self._signed_heading_delta_deg(center_heading, float(right.get("heading", center_heading)))
+            return float(np.deg2rad((left_delta + right_delta) / 2.0))
+
+        future_points: List[List[float]] = [[0.0, 0.0, 0.0]]
+        x_future = 0.0
+        y_future = 0.0
+        for idx in range(center_idx, len(ordered) - 1):
+            current = ordered[idx]
+            nxt = ordered[idx + 1]
+            dt = (int(nxt["timestamp"]) - int(current["timestamp"])) / 1000.0
+            if dt <= 0.0:
+                continue
+            speed_ms = ((float(current.get("speed", 0.0)) + float(nxt.get("speed", 0.0))) / 2.0) / 3.6
+            theta = _relative_theta_rad(current, nxt)
+            x_future += speed_ms * np.cos(theta) * dt
+            y_future += speed_ms * np.sin(theta) * dt
+            future_points.append([x_future, y_future, 0.0])
+
+        past_points: List[List[float]] = [[0.0, 0.0, 0.0]]
+        x_past = 0.0
+        y_past = 0.0
+        for idx in range(center_idx, 0, -1):
+            previous = ordered[idx - 1]
+            current = ordered[idx]
+            dt = (int(current["timestamp"]) - int(previous["timestamp"])) / 1000.0
+            if dt <= 0.0:
+                continue
+            speed_ms = ((float(previous.get("speed", 0.0)) + float(current.get("speed", 0.0))) / 2.0) / 3.6
+            theta = _relative_theta_rad(previous, current)
+            x_past -= speed_ms * np.cos(theta) * dt
+            y_past -= speed_ms * np.sin(theta) * dt
+            past_points.append([x_past, y_past, 0.0])
+
+        past_points.reverse()
+        return (
+            np.array(past_points, dtype=np.float32),
+            np.array(future_points, dtype=np.float32),
+        )
+
     def _build_trajectory_geometry(
         self,
-        sensor_data: Dict[str, Any]
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Build 3-second trajectory and summary stats from current sensor values."""
         speed = sensor_data.get('speed', 0.0)
         gyro_z = sensor_data.get('gyro_z', 0.0)
-        speed_ms = speed / 3.6
+        window_record = self._precomputed_sensor_windows.get(sample_id) if sample_id is not None else None
 
-        num_steps = 30
-        speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
-        yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
-        trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+        if window_record and window_record.get("points"):
+            window_points = []
+            center_timestamp = int(window_record.get("center_timestamp") or 0)
+            for raw_point in window_record.get("points", []):
+                point = dict(raw_point)
+                point["timestamp"] = int(point.get("timestamp", 0))
+                point["offset_ms"] = point["timestamp"] - center_timestamp
+                window_points.append(point)
+        else:
+            window_points, center_timestamp = self._make_synthetic_motion_points(sensor_data)
+
+        if window_record and window_points:
+            past_trajectory_3d, trajectory_3d = self._build_window_relative_trajectories(
+                window_points,
+                center_timestamp,
+            )
+            if len(trajectory_3d) < 2:
+                past_trajectory_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+                speed_ms = speed / 3.6
+                num_steps = 30
+                speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+                yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+                trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+                trajectory_source = "sensor_extrapolation"
+            else:
+                trajectory_source = "precomputed_window"
+        else:
+            speed_ms = speed / 3.6
+            num_steps = 30
+            speed_seq = np.full(num_steps, speed_ms, dtype=np.float32)
+            yaw_rate_seq = np.full(num_steps, gyro_z, dtype=np.float32)
+            trajectory_3d = self.trajectory_visualizer.calculate_trajectory(speed_seq, yaw_rate_seq)
+            past_trajectory_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            trajectory_source = "sensor_extrapolation"
+
         image_points, valid_mask = self.trajectory_visualizer.project_3d_to_2d(trajectory_3d)
 
         return {
             "speed": speed,
             "gyro_z": gyro_z,
             "trajectory_3d": trajectory_3d,
+            "future_trajectory_3d": trajectory_3d,
+            "past_trajectory_3d": past_trajectory_3d,
             "image_points": image_points,
             "valid_mask": valid_mask,
             "visible_count": int(np.sum(valid_mask)),
+            "window_points": window_points,
+            "center_timestamp": center_timestamp,
+            "trajectory_source": trajectory_source,
+            "window_quality": str(window_record.get("quality") or "snapshot_only") if window_record else "snapshot_only",
+            "temporal_reliable": bool(window_record.get("temporal_reliable", False)) if window_record else False,
         }
 
     def _trajectory_to_canvas_points(
@@ -952,6 +1062,198 @@ class HeronAnnotatorWithTrajectory:
 
         return canvas
 
+    def _draw_series_panel(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        box: Tuple[int, int, int, int],
+        times: List[float],
+        values: List[float],
+        label: str,
+        line_color: Tuple[int, int, int],
+        fill_color: Tuple[int, int, int],
+        center_time: float = 0.0,
+        force_zero_line: bool = False,
+    ) -> None:
+        """Draw a single timeline panel."""
+        left, top, right, bottom = box
+        draw.rounded_rectangle(box, radius=18, outline=(225, 225, 225), width=2, fill=(252, 252, 252))
+        font = self._load_summary_font(22)
+        small_font = self._load_summary_font(16)
+        draw.text((left + 18, top + 12), label, fill=(30, 30, 30), font=font)
+
+        chart_left = left + 20
+        chart_top = top + 48
+        chart_right = right - 20
+        chart_bottom = bottom - 20
+        draw.rectangle([chart_left, chart_top, chart_right, chart_bottom], outline=(235, 235, 235), width=1)
+
+        if not times or not values:
+            return
+
+        min_time = min(times)
+        max_time = max(times)
+        if abs(max_time - min_time) < 1e-6:
+            min_time -= 1.0
+            max_time += 1.0
+
+        min_value = min(values)
+        max_value = max(values)
+        if abs(max_value - min_value) < 1e-6:
+            pad = max(1.0, abs(max_value) * 0.1 + 0.5)
+            min_value -= pad
+            max_value += pad
+
+        if force_zero_line:
+            min_value = min(min_value, 0.0)
+            max_value = max(max_value, 0.0)
+
+        def _x_at(time_value: float) -> int:
+            ratio = (time_value - min_time) / (max_time - min_time)
+            return int(chart_left + ratio * (chart_right - chart_left))
+
+        def _y_at(value: float) -> int:
+            ratio = (value - min_value) / (max_value - min_value)
+            return int(chart_bottom - ratio * (chart_bottom - chart_top))
+
+        center_x = _x_at(center_time)
+        draw.line([(center_x, chart_top), (center_x, chart_bottom)], fill=(180, 180, 180), width=2)
+        draw.text((center_x + 6, chart_top + 4), "NOW", fill=(120, 120, 120), font=small_font)
+
+        if force_zero_line and min_value <= 0.0 <= max_value:
+            zero_y = _y_at(0.0)
+            draw.line([(chart_left, zero_y), (chart_right, zero_y)], fill=(215, 215, 215), width=2)
+
+        draw.line([(chart_left, chart_bottom), (chart_right, chart_bottom)], fill=(235, 235, 235), width=1)
+        draw.text((chart_left, chart_bottom + 2), f"{min_value:.1f}", fill=(130, 130, 130), font=small_font)
+        max_text = f"{max_value:.1f}"
+        max_bbox = draw.textbbox((0, 0), max_text, font=small_font)
+        draw.text((chart_right - (max_bbox[2] - max_bbox[0]), chart_top - 18), max_text, fill=(130, 130, 130), font=small_font)
+
+        polyline = [(_x_at(time_value), _y_at(value)) for time_value, value in zip(times, values)]
+        if len(polyline) >= 2:
+            draw.line(polyline, fill=fill_color, width=10)
+            draw.line(polyline, fill=line_color, width=5)
+        elif polyline:
+            px, py = polyline[0]
+            draw.ellipse([px - 6, py - 6, px + 6, py + 6], fill=line_color, outline=(0, 0, 0), width=1)
+
+        for px, py in [polyline[0], polyline[-1]] if polyline else []:
+            draw.ellipse([px - 5, py - 5, px + 5, py + 5], fill=(255, 255, 255), outline=line_color, width=2)
+
+    def _draw_binary_event_panel(
+        self,
+        draw: ImageDraw.ImageDraw,
+        *,
+        box: Tuple[int, int, int, int],
+        times: List[float],
+        brake_values: List[int],
+        left_values: List[int],
+        right_values: List[int],
+        center_time: float = 0.0,
+    ) -> None:
+        """Draw a simple timeline panel for brake / blinker events."""
+        left, top, right, bottom = box
+        draw.rounded_rectangle(box, radius=18, outline=(225, 225, 225), width=2, fill=(252, 252, 252))
+        font = self._load_summary_font(22)
+        small_font = self._load_summary_font(16)
+        draw.text((left + 18, top + 12), "Brake / Blinker", fill=(30, 30, 30), font=font)
+
+        chart_left = left + 20
+        chart_top = top + 48
+        chart_right = right - 20
+        chart_bottom = bottom - 20
+        draw.rectangle([chart_left, chart_top, chart_right, chart_bottom], outline=(235, 235, 235), width=1)
+
+        if not times:
+            return
+
+        min_time = min(times)
+        max_time = max(times)
+        if abs(max_time - min_time) < 1e-6:
+            min_time -= 1.0
+            max_time += 1.0
+
+        def _x_at(time_value: float) -> int:
+            ratio = (time_value - min_time) / (max_time - min_time)
+            return int(chart_left + ratio * (chart_right - chart_left))
+
+        center_x = _x_at(center_time)
+        draw.line([(center_x, chart_top), (center_x, chart_bottom)], fill=(180, 180, 180), width=2)
+        draw.text((center_x + 6, chart_top + 4), "NOW", fill=(120, 120, 120), font=small_font)
+
+        lanes = [
+            ("BRAKE", brake_values, (210, 60, 60)),
+            ("LEFT", left_values, (60, 90, 220)),
+            ("RIGHT", right_values, (220, 130, 30)),
+        ]
+        lane_height = (chart_bottom - chart_top) // len(lanes)
+        for lane_idx, (label, values, color) in enumerate(lanes):
+            lane_top = chart_top + lane_idx * lane_height + 8
+            lane_bottom = chart_top + (lane_idx + 1) * lane_height - 8
+            draw.text((chart_left + 4, lane_top - 2), label, fill=color, font=small_font)
+            draw.line([(chart_left, lane_bottom), (chart_right, lane_bottom)], fill=(238, 238, 238), width=1)
+            for time_value, active in zip(times, values):
+                if not active:
+                    continue
+                x = _x_at(time_value)
+                draw.rectangle([x - 4, lane_top + 14, x + 4, lane_bottom - 4], fill=color)
+
+    def _render_motion_summary(
+        self,
+        geometry: Dict[str, Any],
+    ) -> Image.Image:
+        """Render a timeline-style motion summary from dense telemetry points."""
+        width, height = 720, 720
+        canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._load_summary_font(28)
+        subtitle_font = self._load_summary_font(18)
+
+        draw.text((28, 18), "Motion Summary", fill=(25, 25, 25), font=title_font)
+        source_text = f"source={geometry.get('trajectory_source', 'sensor_extrapolation')} | quality={geometry.get('window_quality', 'snapshot_only')}"
+        draw.text((28, 54), source_text, fill=(110, 110, 110), font=subtitle_font)
+
+        points = geometry.get("window_points") or []
+        center_timestamp = int(geometry.get("center_timestamp") or 0)
+        ordered_points = sorted(points, key=lambda item: int(item["timestamp"]))
+        times = [round((int(point["timestamp"]) - center_timestamp) / 1000.0, 3) for point in ordered_points]
+        speeds = [float(point.get("speed", 0.0)) for point in ordered_points]
+        yaws = [float(point.get("gyro_z", 0.0)) for point in ordered_points]
+        brakes = [int(float(point.get("brake", 0.0))) for point in ordered_points]
+        lefts = [int(float(point.get("blinker_l", 0.0))) for point in ordered_points]
+        rights = [int(float(point.get("blinker_r", 0.0))) for point in ordered_points]
+
+        self._draw_series_panel(
+            draw,
+            box=(24, 92, width - 24, 282),
+            times=times,
+            values=speeds,
+            label="Speed (km/h)",
+            line_color=(30, 120, 40),
+            fill_color=(134, 204, 122),
+        )
+        self._draw_series_panel(
+            draw,
+            box=(24, 302, width - 24, 492),
+            times=times,
+            values=yaws,
+            label="Yaw Rate (rad/s)",
+            line_color=(180, 70, 0),
+            fill_color=(245, 180, 110),
+            force_zero_line=True,
+        )
+        self._draw_binary_event_panel(
+            draw,
+            box=(24, 512, width - 24, height - 24),
+            times=times,
+            brake_values=brakes,
+            left_values=lefts,
+            right_values=rights,
+        )
+
+        return canvas
+
     def prepare_visual_inputs(
         self,
         frames: List[Image.Image],
@@ -959,7 +1261,7 @@ class HeronAnnotatorWithTrajectory:
         sample_id: Optional[int] = None
     ) -> Tuple[List[Image.Image], Dict[str, Any]]:
         """Prepare raw frames plus two clean trajectory summary images for VLM input."""
-        geometry = self._build_trajectory_geometry(sensor_data)
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
         topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
         normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
 
@@ -990,7 +1292,7 @@ class HeronAnnotatorWithTrajectory:
         sample_id: Optional[int] = None,
     ) -> Tuple[List[Image.Image], Dict[str, Any]]:
         """Build clean trajectory summary images without raw frames."""
-        geometry = self._build_trajectory_geometry(sensor_data)
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
         topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
         normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
 
@@ -1009,6 +1311,18 @@ class HeronAnnotatorWithTrajectory:
             normalized_summary.save(summary_normalized_path, quality=95)
 
         return [topdown_summary, normalized_summary], geometry
+
+    def _build_macro_summary_images(
+        self,
+        sensor_data: Dict[str, Any],
+        sample_id: Optional[int] = None,
+    ) -> Tuple[List[Image.Image], Dict[str, Any]]:
+        """Build the stronger macro-VLM visual bundle: geometry + motion."""
+        geometry = self._build_trajectory_geometry(sensor_data, sample_id=sample_id)
+        topdown_summary = self._render_topdown_summary(geometry["trajectory_3d"])
+        normalized_summary = self._render_normalized_summary(geometry["trajectory_3d"])
+        motion_summary = self._render_motion_summary(geometry)
+        return [topdown_summary, normalized_summary, motion_summary], geometry
 
     def _build_video_plus_summary_content(
         self,
@@ -1628,10 +1942,8 @@ class HeronAnnotatorWithTrajectory:
         self,
         summary_images: List[Image.Image],
     ) -> List[Image.Image]:
-        """Use only the normalized trajectory summary for macro 4-class prompting."""
-        if not summary_images:
-            return []
-        return [summary_images[-1]]
+        """Use geometry plus motion summaries for macro 4-class prompting."""
+        return list(summary_images)
 
     def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
         import re
@@ -1927,7 +2239,7 @@ class HeronAnnotatorWithTrajectory:
 
         try:
             temporal_context = self._build_sensor_temporal_context(sample_id, sensor_data)
-            generated_summary_images, geometry = self._build_trajectory_summary_images(
+            generated_summary_images, geometry = self._build_macro_summary_images(
                 sensor_data,
                 sample_id=sample_id,
             )
@@ -2000,6 +2312,8 @@ class HeronAnnotatorWithTrajectory:
                 "trajectory_features": trajectory_features,
                 "generated_trajectory_summary_count": len(generated_summary_images),
                 "trajectory_summary_count": len(input_summary_images),
+                "trajectory_summary_types": ["topdown", "normalized", "motion"][:len(input_summary_images)],
+                "trajectory_source": geometry.get("trajectory_source"),
                 "visual_input_count": 1 + len(input_summary_images),
                 "graph": graph_debug.get("graph"),
                 "graph_veto_applied": graph_debug.get("veto_applied"),

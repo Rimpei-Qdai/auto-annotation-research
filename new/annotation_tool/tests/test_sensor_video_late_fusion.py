@@ -97,14 +97,17 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertEqual(content[0]["video"], "/tmp/example.mp4")
         self.assertEqual(content[-1]["text"], "候補から選んでください。")
 
-    def test_macro_prompt_uses_only_normalized_summary_image(self):
+    def test_macro_prompt_uses_all_summary_images(self):
         summary_images = [
             Image.new("RGB", (32, 32), color=(255, 255, 255)),
             Image.new("RGB", (32, 32), color=(240, 240, 240)),
+            Image.new("RGB", (32, 32), color=(220, 220, 220)),
         ]
         selected = self.annotator._select_summary_images_for_macro_prompt(summary_images)
-        self.assertEqual(len(selected), 1)
-        self.assertIs(selected[0], summary_images[1])
+        self.assertEqual(len(selected), 3)
+        self.assertIs(selected[0], summary_images[0])
+        self.assertIs(selected[1], summary_images[1])
+        self.assertIs(selected[2], summary_images[2])
 
     def test_build_trajectory_summary_images_returns_two_images(self):
         summary_images, geometry = self.annotator._build_trajectory_summary_images(
@@ -120,6 +123,22 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertEqual(summary_images[1].size, (720, 720))
         self.assertIn("visible_count", geometry)
         self.assertIn("trajectory_3d", geometry)
+
+    def test_build_macro_summary_images_returns_three_images(self):
+        summary_images, geometry = self.annotator._build_macro_summary_images(
+            {
+                "speed": 12.0,
+                "acc_x": -0.2,
+                "gyro_z": 0.18,
+                "brake": 1,
+                "blinker_l": 1,
+            },
+            sample_id=None,
+        )
+        self.assertEqual(len(summary_images), 3)
+        self.assertTrue(all(image.size == (720, 720) for image in summary_images))
+        self.assertIn("window_points", geometry)
+        self.assertIn("trajectory_source", geometry)
 
     def test_build_sensor_macro_scores_aggregates_fine_candidates(self):
         macro_scores, debug = self.annotator._build_sensor_macro_scores(
@@ -231,6 +250,43 @@ class SensorVideoLateFusionTest(unittest.TestCase):
         self.assertEqual(context["post_count"], 3)
         self.assertGreater(context["speed_delta"], 0.0)
         self.assertEqual(context["temporal_center_offset_ms"], 0)
+
+    def test_precomputed_sensor_window_geometry_is_used_for_macro_summaries(self):
+        self.annotator._precomputed_sensor_windows = {
+            42: {
+                "sample_id": 42,
+                "center_timestamp": 3000,
+                "quality": "dense_window",
+                "runtime_source": "preferred_window",
+                "temporal_reliable": True,
+                "center_row_offset_ms": 0,
+                "max_gap_ms": 100,
+                "points": [
+                    {"timestamp": 0, "speed": 10.0, "acc_x": 0.0, "gyro_z": 0.00, "heading": 0.0, "brake": 0, "blinker_l": 0, "blinker_r": 0},
+                    {"timestamp": 1000, "speed": 11.0, "acc_x": 0.1, "gyro_z": 0.02, "heading": 5.0, "brake": 0, "blinker_l": 0, "blinker_r": 0},
+                    {"timestamp": 2000, "speed": 12.0, "acc_x": 0.1, "gyro_z": 0.04, "heading": 12.0, "brake": 0, "blinker_l": 0, "blinker_r": 0},
+                    {"timestamp": 3000, "speed": 13.0, "acc_x": 0.1, "gyro_z": 0.05, "heading": 20.0, "brake": 0, "blinker_l": 0, "blinker_r": 1},
+                    {"timestamp": 4000, "speed": 14.0, "acc_x": 0.2, "gyro_z": 0.06, "heading": 30.0, "brake": 0, "blinker_l": 0, "blinker_r": 1},
+                    {"timestamp": 5000, "speed": 15.0, "acc_x": 0.2, "gyro_z": 0.07, "heading": 42.0, "brake": 0, "blinker_l": 0, "blinker_r": 1},
+                    {"timestamp": 6000, "speed": 16.0, "acc_x": 0.2, "gyro_z": 0.08, "heading": 58.0, "brake": 0, "blinker_l": 0, "blinker_r": 1},
+                ],
+            }
+        }
+
+        summary_images, geometry = self.annotator._build_macro_summary_images(
+            {
+                "speed": 13.0,
+                "acc_x": 0.1,
+                "gyro_z": 0.05,
+                "blinker_r": 1,
+            },
+            sample_id=42,
+        )
+
+        self.assertEqual(len(summary_images), 3)
+        self.assertEqual(geometry["trajectory_source"], "precomputed_window")
+        self.assertEqual(geometry["window_quality"], "dense_window")
+        self.assertGreater(len(geometry["future_trajectory_3d"]), 2)
 
 
 if __name__ == "__main__":
