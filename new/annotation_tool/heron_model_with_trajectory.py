@@ -735,7 +735,10 @@ class HeronAnnotatorWithTrajectory:
         def _relative_theta_rad(left: Dict[str, Any], right: Dict[str, Any]) -> float:
             left_delta = self._signed_heading_delta_deg(center_heading, float(left.get("heading", center_heading)))
             right_delta = self._signed_heading_delta_deg(center_heading, float(right.get("heading", center_heading)))
-            return float(np.deg2rad((left_delta + right_delta) / 2.0))
+            # Telemetry heading increases clockwise, but the summary canvas uses
+            # +Y = left in vehicle coordinates. Negating the heading delta keeps
+            # the rendered trajectory aligned with the LEFT/RIGHT anchors.
+            return float(np.deg2rad(-((left_delta + right_delta) / 2.0)))
 
         future_points: List[List[float]] = [[0.0, 0.0, 0.0]]
         x_future = 0.0
@@ -1942,8 +1945,12 @@ class HeronAnnotatorWithTrajectory:
         self,
         summary_images: List[Image.Image],
     ) -> List[Image.Image]:
-        """Use geometry plus motion summaries for macro 4-class prompting."""
-        return list(summary_images)
+        """Use only the normalized geometry summary for macro 4-class prompting."""
+        if len(summary_images) >= 2:
+            return [summary_images[1]]
+        if summary_images:
+            return [summary_images[-1]]
+        return []
 
     def _extract_numeric_choice(self, text: str, allowed_labels: List[int]) -> Optional[int]:
         import re
@@ -2312,7 +2319,7 @@ class HeronAnnotatorWithTrajectory:
                 "trajectory_features": trajectory_features,
                 "generated_trajectory_summary_count": len(generated_summary_images),
                 "trajectory_summary_count": len(input_summary_images),
-                "trajectory_summary_types": ["topdown", "normalized", "motion"][:len(input_summary_images)],
+                "trajectory_summary_types": ["normalized"][:len(input_summary_images)],
                 "trajectory_source": geometry.get("trajectory_source"),
                 "visual_input_count": 1 + len(input_summary_images),
                 "graph": graph_debug.get("graph"),
